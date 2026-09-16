@@ -110,6 +110,7 @@ public:
 	QString                printf_output_file          = "_kyty.txt";
 	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
 	bool                   renderdoc_enabled           = false;
+	bool                   amd_cpu_enabled             = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -138,6 +139,7 @@ public:
 		printf_output_file          = other.printf_output_file;
 		profiler_direction          = other.profiler_direction;
 		renderdoc_enabled           = other.renderdoc_enabled;
+		amd_cpu_enabled             = other.amd_cpu_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
@@ -183,6 +185,7 @@ public:
 		KYTY_CFG_SET(printf_output_file);
 		KYTY_CFG_SET(profiler_direction);
 		KYTY_CFG_SET(renderdoc_enabled);
+		KYTY_CFG_SET(amd_cpu_enabled);
 #if defined(_WIN32)
 		KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -225,6 +228,7 @@ public:
 		KYTY_CFG_GET(printf_output_file);
 		KYTY_CFG_GET(profiler_direction);
 		KYTY_CFG_GET(renderdoc_enabled);
+		amd_cpu_enabled = s->value("amd_cpu_enabled", false).toBool();
 #if defined(_WIN32)
 		red_zone_protection_enabled =
 		    s->value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();
