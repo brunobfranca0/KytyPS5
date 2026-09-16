@@ -1,8 +1,11 @@
 #ifndef KYTY_LOADER_X64_INSTRUCTION_EMULATOR_H_
 #define KYTY_LOADER_X64_INSTRUCTION_EMULATOR_H_
 
+#include <cstdint>
+
 namespace Loader::X64InstructionEmulator {
 
+uint64_t           PatchReciprocalSquareRoots(uint64_t address, uint64_t size);
 [[nodiscard]] bool TryEmulate(void* native_context);
 
 // A guest debug break, int 0x41 (the game's assertion handler breaks into an attached debugger with
