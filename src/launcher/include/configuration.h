@@ -97,6 +97,7 @@ public:
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   readback_linear_images      = false;
+	bool                   tessellation_enabled        = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -126,6 +127,7 @@ public:
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		readback_linear_images      = other.readback_linear_images;
+		tessellation_enabled        = other.tessellation_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -172,6 +174,7 @@ public:
 		KYTY_CFG_SET(gpu_index);
 		KYTY_CFG_SET(fullscreen_enabled);
 		KYTY_CFG_SET(readback_linear_images);
+		KYTY_CFG_SET(tessellation_enabled);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -212,6 +215,7 @@ public:
 		}
 		KYTY_CFG_GET(fullscreen_enabled);
 		KYTY_CFG_GET(readback_linear_images);
+		KYTY_CFG_GET(tessellation_enabled);
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
