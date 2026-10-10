@@ -17,6 +17,7 @@
 #include "vulkan-recording.h"
 #endif
 #include "frame-gen.h"
+#include "local/fsr3-fg.h"
 
 #include <algorithm>
 #include <array>
@@ -310,6 +311,9 @@ public:
 	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
 	// Where RecordPresentCommands put the frame in the swapchain image.
 	[[nodiscard]] vk::Rect2D PresentRegion() const noexcept { return m_present_region; }
+	[[nodiscard]] vk::SwapchainKHR Handle() const noexcept { return m_handle; }
+	// The FSR 3 frame generation swapchain (KYTY_FSR3_FG) stands in for the swapchain.
+	[[nodiscard]] bool IsFsr3() const noexcept { return m_fsr3; }
 
 private:
 	void Destroy();
@@ -326,6 +330,7 @@ private:
 	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
 	uint32_t                    m_frame_index = 0;
 	vk::Rect2D                  m_present_region {};
+	bool                        m_fsr3 = false;
 };
 
 struct Presenter::Impl {
@@ -557,13 +562,17 @@ void Swapchain::Create() {
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
 	create_info.clipped          = VK_TRUE;
-	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
-	                     "vkCreateSwapchainKHR");
+	m_fsr3 = Fsr3::CreateSwapchain(graphics, create_info, &m_handle);
+	if (!m_fsr3) {
+		RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
+		                     "vkCreateSwapchainKHR");
+	}
 	EXIT_IF(m_handle == nullptr);
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
-		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
+		    return m_fsr3 ? Fsr3::GetSwapchainImages(graphics, m_handle, count, images)
+		                  : graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
 
@@ -640,8 +649,13 @@ void Swapchain::Destroy() {
 		}
 	}
 	if (m_handle != nullptr) {
-		graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		if (m_fsr3) {
+			Fsr3::DestroySwapchain(graphics, m_handle);
+		} else {
+			graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		}
 	}
+	m_fsr3 = false;
 
 	m_handle      = nullptr;
 	m_format      = vk::Format::eUndefined;
@@ -672,9 +686,10 @@ void Swapchain::Recreate(bool surface_lost) {
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	const auto result =
+	    m_fsr3 ? Fsr3::AcquireNextImage(m_window.graphic_ctx, m_handle, m_image_acquired[m_frame_index], &m_image_index)
+	           : m_window.graphic_ctx.device.acquireNextImageKHR(m_handle, std::numeric_limits<uint64_t>::max(),
+	                                                             m_image_acquired[m_frame_index], nullptr, &m_image_index);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -836,7 +851,11 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 
 	vk::Result result;
-	if (auto& graphics = m_window.graphic_ctx; graphics.present_queue != nullptr) {
+	if (m_fsr3) {
+		// The frame generation swapchain queues it (its threads pace and present; its submissions take the
+		// graphics queue's lock themselves).
+		result = Fsr3::QueuePresent(m_window.graphic_ctx, present);
+	} else if (auto& graphics = m_window.graphic_ctx; graphics.present_queue != nullptr) {
 		// Its own queue: a present blocked in the kernel does not hold up other submissions.
 		Common::LockGuard lock(graphics.present_queue_mutex);
 		result = graphics.present_queue.presentKHR(&present);
@@ -885,7 +904,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
 	frame->fg.valid = false;
-	if (FrameGen::Enabled()) {
+	if (FrameGen::Capturing()) {
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
 		                        buffer, frame->fg);
 	}
@@ -925,7 +944,7 @@ bool Presenter::PresentSkippedIfDue() {
 	// A game above the display's rate had every frame that came within a refresh of the one before turned away, and
 	// the refresh after it showed nothing new when the next frame was late (a 69 fps game on a 60 Hz display: 52
 	// frames a second shown). Each refresh shows the latest frame now. (Frame generation paces its own frames.)
-	if (!m_impl->skipped_unshown || FrameGen::Enabled() || !m_impl->PresentDue(false)) return false;
+	if (!m_impl->skipped_unshown || FrameGen::Enabled() || Fsr3::Active() || !m_impl->PresentDue(false)) return false;
 	auto* frame = PrepareLastFrame();
 	if (frame == nullptr) {
 		m_impl->skipped_unshown = false; // (the GPU thread took it for a newer frame)
@@ -1028,6 +1047,12 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			FrameGen::BeforePresent(frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
 			                        swapchain.Extent(), swapchain.PresentRegion(), swapchain.Format(),
 			                        swapchain.ImageCount());
+		}
+		if (swapchain.IsFsr3()) {
+			// KYTY_FSR3_FG: this frame's depth and motion vectors (none: a menu, a loading screen, a movie, an idle
+			// refresh of the last frame; generation off for it).
+			Fsr3::BeforePresent(m_impl->window.graphic_ctx, frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
+			                    swapchain.Handle(), swapchain.Extent(), swapchain.Format());
 		}
 		status = swapchain.Present();
 		if (generate) {

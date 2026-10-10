@@ -39,6 +39,7 @@ jobs:
           $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { "KytyPS5-$env:GITHUB_REF_NAME" } else {
             "KytyPS5-$((Get-Date).ToUniversalTime().ToString('yyyyMMdd'))-$($env:GITHUB_SHA.Substring(0, 8))" }
           if ('${{ inputs.pgo_generate }}' -eq 'true') { $name = "$name-pgogen" }
+          if ($env:GITHUB_REF_NAME -eq 'fsr3-prueba') { $name = "$name-fsr3" }
           "package=$name" >> $env:GITHUB_OUTPUT
 
       # The tested compiler (LLVM 23.1.2 crashed compiling agc.cpp; others are untested).
@@ -86,6 +87,17 @@ jobs:
           & $profdata show tools\pgo\kyty-merged.profdata | Select-Object -First 6
           Move-Item -Force tools\pgo\kyty-merged.profdata tools\pgo\kyty.profdata
 
+      # AMD FidelityFX API, FSR 3.1.4 frame generation (src/local/fsr3-fg.cpp, KYTY_FSR3_FG): AMD's prebuilt,
+      # signed amd_fidelityfx_vk.dll (MIT license) from the SDK's v1.1.4 tag, packaged next to the emulator.
+      - name: FidelityFX DLL
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force _Build\deps\ffx | Out-Null
+          $base = 'https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v1.1.4'
+          Invoke-WebRequest "$base/PrebuiltSignedDLL/amd_fidelityfx_vk.dll" -OutFile _Build\deps\ffx\amd_fidelityfx_vk.dll
+          Invoke-WebRequest "$base/LICENSE.txt" -OutFile _Build\deps\ffx\FidelityFX-LICENSE.txt
+          Get-ChildItem _Build\deps\ffx | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
+
       # For other PCs: x86-64-v3 (AVX2), not the runner CPU's -march=native.
       - name: Build
         shell: cmd
@@ -111,6 +123,8 @@ jobs:
           # The linker map of this exact build: render-thread profiles (live `prof`) are symbolized against it.
           Get-ChildItem "$build\kyty_emulator_*.map" -ErrorAction SilentlyContinue | Select-Object -First 1 |
             ForEach-Object { Copy-Item $_.FullName "$out\kyty_emulator.map" }
+          # FSR 3 frame generation (KYTY_FSR3_FG): AMD's FidelityFX API DLL and its license.
+          Copy-Item _Build\deps\ffx\amd_fidelityfx_vk.dll, _Build\deps\ffx\FidelityFX-LICENSE.txt $out
           # The profile this build was optimized with (merged with the training runs, see "PGO profile").
           if (Test-Path tools\pgo\kyty.profdata) { Copy-Item tools\pgo\kyty.profdata "$out\kyty.profdata" }
           # The render-pass states the precompile program makes the seed file with: the first launch lists the
@@ -186,5 +200,5 @@ jobs:
             gh release upload "$tag" "$PACKAGE.zip" --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "$PACKAGE" --notes "$notes" $([[ "$PACKAGE" == *-pgogen ]] && echo --latest=false || echo --latest)
+              --title "$PACKAGE" --notes "$notes" $([[ "$PACKAGE" == *-pgogen || "$PACKAGE" == *-fsr3 ]] && echo --latest=false || echo --latest)
           fi

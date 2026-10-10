@@ -1948,6 +1948,10 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		return m_dispatch_declined = known->special != nullptr ? known->special : "dispatch: refused", false;
 	if ((Role() == 0 && known->sightings < 2) || known->vs != cs.cs_regs.data_addr) return false;
 	auto& pair = *known;
+	// Frame generation reads the TAA pass's depth and motion vectors from the normal path's bindings
+	// (RenderExecutor::DispatchDirect, FrameGen::OnDispatch): one dispatch a frame.
+	if (FrameGen::Capturing() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
+		return m_dispatch_declined = "table: frame generation (TAA)", false;
 	TablePrefetchPair(pair);
 	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1f, 0); // census: the dispatches' phases (b)

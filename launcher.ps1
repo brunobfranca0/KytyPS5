@@ -11,7 +11,7 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 	'Arabic', 'French (Canada)', 'Czech', 'Hungarian', 'Greek', 'Romanian', 'Thai', 'Vietnamese', 'Indonesian'
 $resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160', '2560x1080', '3440x1440', '3840x1600', '5120x2160'
 
-$settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true }
+$settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true; fsr3 = $false }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -25,6 +25,7 @@ function Get-PlayArguments {
 	$script = @("'$root\run-windows.ps1'", '-Prompt', '-Follow', '-Width', $size[0], '-Height', $size[1], '-Language', $settings.language)
 	if ($settings.fullscreen) { $script += '-Fullscreen'; if ($settings.aspect) { $script += '-AspectFit' } }
 	if (!$settings.redzone) { $script += '-NoRedZone' }
+	if ($settings.fsr3) { $script += '-Fsr3FrameGen' }
 	if ($settings.game) { $script += "-Game '$($settings.game.Replace("'", "''"))'" }
 	# The console stays for the live log; after a crash it waits for a key.
 	$command = '& ' + ($script -join ' ') + '; if ($LASTEXITCODE -ne 0) { Read-Host ''Press Enter to close'' | Out-Null }'
@@ -123,6 +124,8 @@ $language.SelectedIndex = [Math]::Max(0, [Math]::Min($languages.Count - 1, [int]
 Add-Row 'Console language' @($language)
 $redzone = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Red-zone protection (recommended)'; AutoSize = $true; Checked = [bool]$settings.redzone }
 Add-Row '' @($redzone)
+$fsr3 = New-Object System.Windows.Forms.CheckBox -Property @{ Text = "Generaci$([char]0xF3)n de frames FSR 3 (x2)"; AutoSize = $true; Checked = [bool]$settings.fsr3 }
+Add-Row '' @($fsr3)
 $buttons = New-Object System.Windows.Forms.FlowLayoutPanel -Property @{ AutoSize = $true; Margin = '0,10,0,0' }
 $play = New-Object System.Windows.Forms.Button -Property @{ Text = 'Play'; AutoSize = $true; Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold) }
 $precompile = New-Object System.Windows.Forms.Button -Property @{ Text = 'Precompile shaders'; AutoSize = $true }
@@ -144,6 +147,7 @@ function Read-Form {
 	$settings.aspect     = $aspect.Checked
 	$settings.language   = $language.SelectedIndex
 	$settings.redzone    = $redzone.Checked
+	$settings.fsr3       = $fsr3.Checked
 	Save-Settings
 }
 $play.Add_Click({

@@ -138,6 +138,7 @@ include_directories(
 	${KYTY_THIRD_PARTY_DIR}/gtest
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
 	${KYTY_THIRD_PARTY_DIR}/magic_enum/include/magic_enum
+	${KYTY_THIRD_PARTY_DIR}/ffx_api/include
 	${PROJECT_BINARY_DIR}
 	${KYTY_SOURCE_DIR}
 )
@@ -366,6 +367,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
+	"${KYTY_SOURCE_DIR}/local/fsr3-fg.h"
+	"${KYTY_SOURCE_DIR}/local/fsr3-fg.cpp"
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 

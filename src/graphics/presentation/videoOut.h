@@ -18,6 +18,8 @@ namespace Libs::VideoOut {
 
 // A movie frame was decoded (VideoDec2, AvPlayer): flips keep 60 per second meanwhile.
 void NoteMovieFrame() noexcept;
+// A movie frame was decoded within the last half second.
+bool MoviePlaying() noexcept;
 
 struct VideoOutBufferAttribute2;
 struct VideoOutFlipStatus;

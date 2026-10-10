@@ -1,4 +1,5 @@
 #include "frame-gen.h"
+#include "fsr3-fg.h"
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -351,6 +352,10 @@ bool FeatureFunction(sl::Feature feature, const char* name, F*& function) {
 
 bool Enabled() {
 	return g_ready;
+}
+
+bool Capturing() {
+	return Enabled() || Fsr3::Active();
 }
 
 bool Requested() {

@@ -64,6 +64,8 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 // (disabled here) go straight to the driver.
 void BypassCommandHooks(vk::Device device);
 [[nodiscard]] bool Enabled();
+// The TAA pass's inputs are gathered at the guest flip: DLSS-G (Enabled) or FSR 3 frame generation (src/local/fsr3-fg.h).
+[[nodiscard]] bool Capturing();
 
 // Present thread, around vkQueuePresentKHR of the image showing `inputs` (null: a frame
 // without inputs, e.g. a menu). `backbuffer` is the swapchain extent, `region` the part the

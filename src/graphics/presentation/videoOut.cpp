@@ -508,7 +508,7 @@ void NoteMovieFrame() noexcept {
 	}
 	g_movie_frame_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 }
-static bool MoviePlaying() {
+bool MoviePlaying() noexcept {
 	const auto last = g_movie_frame_ns.load(std::memory_order_relaxed);
 	if (last == 0) return false;
 	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();

@@ -38,6 +38,7 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 #include "frame-gen.h"
+#include "local/fsr3-fg.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -612,6 +613,9 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 }
 
+// KYTY_FSR3_FG: the frame generation swapchain's queues (src/local/fsr3-fg.h), fetched after the device.
+static Libs::Graphics::Fsr3::QueuePlan g_fsr3_plan;
+
 static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const VulkanExtensions& r,
                                      uint32_t                        queue_family,
                                      const std::vector<const char*>& device_extensions,
@@ -619,7 +623,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priorities[2] = {1.0f, 1.0f};
+	const float               queue_priorities[3] = {1.0f, 1.0f, 1.0f};
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.sType            = vk::StructureType::eDeviceQueueCreateInfo;
 	queue_create_info.queueFamilyIndex = queue_family;
@@ -627,7 +631,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	queue_create_info.pQueuePriorities = queue_priorities;
 
 	// KYTY_READBACK_QUEUE: also a queue of a transfer-only family (the copy engine).
-	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {queue_create_info, queue_create_info};
+	std::array<vk::DeviceQueueCreateInfo, 3> queue_create_infos {queue_create_info, queue_create_info, queue_create_info};
 	uint32_t                                 queue_create_count = 1;
 	graphics.readback_family                                    = static_cast<uint32_t>(-1);
 #if defined(_WIN32)
@@ -662,6 +666,17 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 			}
 		}
 	}
+
+#if defined(_WIN32)
+	g_fsr3_plan = {};
+	if (Libs::Graphics::Fsr3::Requested() &&
+	    Libs::Graphics::Fsr3::PlanQueues(physical_device, queue_family, queue_create_infos[0].queueCount, g_fsr3_plan)) {
+		queue_create_infos[0].queueCount                   = g_fsr3_plan.graphics_index + 1;
+		queue_create_infos[queue_create_count].queueFamilyIndex = g_fsr3_plan.compute_family;
+		queue_create_infos[queue_create_count].queueCount       = g_fsr3_plan.compute_count;
+		++queue_create_count;
+	}
+#endif
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.sType = vk::StructureType::ePhysicalDeviceColorWriteEnableFeaturesEXT;
@@ -1410,6 +1425,7 @@ void WindowContext::CreateVulkan() {
 		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
 		EXIT_IF(graphic_ctx.readback_queue == nullptr);
 	}
+	Libs::Graphics::Fsr3::OnDevice(graphic_ctx, g_fsr3_plan);
 	Libs::Graphics::FrameGen::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
 
 	if (!graphic_ctx.CreateAllocator()) {
