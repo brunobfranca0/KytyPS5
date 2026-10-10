@@ -1458,9 +1458,13 @@ void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size) {
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
 	LiveCensus::Scope census(LiveCensus::SyncDownload, vaddr >> 20u << 20u, is_write);
 	LiveCensus::WaitScope waiting(LiveCensus::WaitDownload);
-	DrainGuestReadback();
-	if (is_write && !IsRegionRegistered(vaddr, size)) {
-		return;
+	// Only the guest readbacks of the bytes this download covers must finish first (their copy would write
+	// older GPU bytes over the window's, and their marks race with its). The others are the guest threads'
+	// business: at Boletaria's dragon path the render thread waited ~4 ms a frame for all of them here,
+	// 10 light-table reads a frame each waiting for a readback of some other range to come back from the GPU.
+	if (is_write) {
+		DrainGuestReadback(vaddr, size);
+		if (!IsRegionRegistered(vaddr, size)) return;
 	}
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 	if (TryReadCopyFeedback(buffer, vaddr, size)) {
@@ -1474,6 +1478,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	const auto         buffer_end   = buffer_begin + buffer.Size();
 	const auto         window_begin = std::max(vaddr & ~(WindowSize - 1), buffer_begin);
 	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	DrainGuestReadback(window_begin, window_end - window_begin);
 
 	std::vector<DownloadCopy> copies;
 	m_memory_tracker.ForEachDownloadRange<false>(
