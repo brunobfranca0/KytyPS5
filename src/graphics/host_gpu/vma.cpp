@@ -74,6 +74,16 @@ bool GraphicContext::CreateAllocator() {
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
+	// Memory blocks of 64 MiB (VMA's default is 256): a block stays allocated while any allocation of it lives, so
+	// the game's streaming left 21 blocks of 256 MiB with 2.7 GB free inside them at Boletaria (11.9 GB held of
+	// which 8.9 in use); smaller blocks hold less around each straggler. KYTY_VMA_BLOCK_MB=<n> for an A/B.
+	{
+		uint64_t block_mb = 64;
+		if (const char* text = std::getenv("KYTY_VMA_BLOCK_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0)
+			block_mb = std::strtoull(text, nullptr, 10);
+		info.preferredLargeHeapBlockSize = block_mb << 20u;
+		std::printf("Video memory: allocator blocks of %llu MiB\n", static_cast<unsigned long long>(block_mb));
+	}
 	// KYTY_VRAM_LIMIT_MB=<n>: video memory as on a GPU with n MiB (VMA's heap size limit): its budget,
 	// and allocations past it failing, for tests of memory pressure on smaller GPUs.
 	std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_limits {};
