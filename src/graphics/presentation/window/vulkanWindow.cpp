@@ -1393,6 +1393,14 @@ void WindowContext::CreateVulkan() {
 		if (FrameGen::Requested() && HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
 		}
+		// KYTY_FSR3_FG: the FidelityFX backend calls vkGetBufferMemoryRequirements2KHR (the extension's name,
+		// null on a device without the extension even though the function is core).
+		if (Libs::Graphics::Fsr3::Requested()) {
+			for (const char* name: {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME}) {
+				if (HasExtension(available_extensions, name) && !HasExtension(device_extensions, name))
+					device_extensions.push_back(name);
+			}
+		}
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
 	}

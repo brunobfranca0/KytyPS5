@@ -351,19 +351,8 @@ bool CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR&
 	if (!g_requested || g_graphics == nullptr) return false;
 	std::lock_guard lock(g_mutex);
 	VkSwapchainKHR swapchain = VK_NULL_HANDLE;
-	if (g_swapchain_context != nullptr) {
-		// The context lives on; its replacement creates the new swapchain (a resize, a lost surface).
-		const VkSwapchainCreateInfoKHR create = info;
-		const auto result = g_functions.pOutCreateSwapchainFFXAPI(static_cast<VkDevice>(graphics.device), &create, nullptr,
-		                                                          &swapchain, g_swapchain_context);
-		if (result != VK_SUCCESS) {
-			std::printf("FSR3 FG: swapchain re-creation failed (%d)\n", static_cast<int>(result));
-			std::fflush(stdout);
-			return false;
-		}
-		*out = swapchain;
-		return true;
-	}
+	// (A new context each time: one re-created through the context's own replacement function presented nothing,
+	// a black screen after the window went fullscreen.)
 	ffxCreateContextDescFrameGenerationSwapChainVK create {};
 	create.header.type    = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VK;
 	create.physicalDevice = static_cast<VkPhysicalDevice>(graphics.physical_device);
@@ -401,13 +390,20 @@ bool CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR&
 	return true;
 }
 
-void DestroySwapchain(GraphicContext& graphics, vk::SwapchainKHR swapchain) {
+void DestroySwapchain(GraphicContext& /*graphics*/, vk::SwapchainKHR /*swapchain*/) {
 	std::lock_guard lock(g_mutex);
-	if (g_swapchain_context == nullptr || g_functions.pOutDestroySwapchainFFXAPI == nullptr) return;
-	// (The frame generation context names the swapchain in every configure: it is made again with the next.)
+	if (g_swapchain_context == nullptr) return;
+	// The frame generation context first (the swapchain calls it while presenting); destroying the swapchain's
+	// context destroys its swapchain. The next CreateSwapchain makes both again.
 	DestroyFrameGeneration();
-	g_functions.pOutDestroySwapchainFFXAPI(static_cast<VkDevice>(graphics.device), static_cast<VkSwapchainKHR>(swapchain),
-	                                       nullptr, g_swapchain_context);
+	g_ffx.DestroyContext(&g_swapchain_context, nullptr);
+	g_swapchain_context = nullptr;
+	g_functions         = {};
+	g_generating        = false;
+	g_state_logged      = -1;
+	g_stats             = {};
+	std::printf("FSR3 FG: frame generation swapchain released (resize, fullscreen or exit)\n");
+	std::fflush(stdout);
 }
 
 vk::Result GetSwapchainImages(GraphicContext& graphics, vk::SwapchainKHR swapchain, uint32_t* count, vk::Image* images) {
