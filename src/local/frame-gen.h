@@ -56,6 +56,7 @@ struct FrameInputs {
 	VulkanImage   hudless;
 	vk::ImageView hudless_view = nullptr;
 	bool          has_hudless  = false;
+	bool          hudless_composite = false; // the game's composite drawn without its HUD texture (not a copy with it)
 	// ... scaled to the backbuffer (DLSS-G wants it at the backbuffer's size): ScaleHudless.
 	VulkanImage   hudless_display;
 	vk::ImageView hudless_display_view = nullptr;
@@ -113,6 +114,8 @@ void AfterDraw(CommandBuffer& command);
 // more with the HUD's texture (of `images`, the one most draws went to this frame) cleared to transparent, the
 // result copied as the HUD-less image, then the flip image and the HUD texture put back as they were.
 void NoteDraw(ImageId target);
+// The table and native XPR paths: a draw into a recent flip image is left to the normal path (FlipSlot, BeforeFlipDraw).
+[[nodiscard]] bool IsFlipImage(ImageId id);
 [[nodiscard]] int FlipSlot(std::span<const ImageId> targets);
 void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageId target, uint32_t slot,
                     std::span<const TextureBinding> images, const std::function<void()>& redraw);

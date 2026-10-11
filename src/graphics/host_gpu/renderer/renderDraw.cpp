@@ -1800,11 +1800,11 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (m_native_xpr_verify.record != nullptr)
 		NativeXprVerify(buffer, state, rendering, std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
 	// (A table draw of vertices too: TableStore stores what a table try asked for.)
-	if (m_table_xpr)
+	if (m_table_xpr && flip_slot < 0)
 		TableStore(buffer, state, topology, primitive_restart_enable, rendering, !mesh_active && vertex_bindings.count == 0);
 	if (m_native_xpr_store) {
 		m_native_xpr_store = false;
-		if (!mesh_active && emit.indexed && vertex_bindings.count == 0)
+		if (flip_slot < 0 && !mesh_active && emit.indexed && vertex_bindings.count == 0)
 			NativeXprStore(buffer, state, topology, primitive_restart_enable, rendering,
 			               std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
 		else

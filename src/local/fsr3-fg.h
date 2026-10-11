@@ -43,6 +43,13 @@ vk::Result         AcquireNextImage(GraphicContext& graphics, vk::SwapchainKHR s
                                     uint32_t* index);
 vk::Result         QueuePresent(GraphicContext& graphics, const vk::PresentInfoKHR& info);
 
+// Present thread, in the present's command buffer right after the frame was scaled into the swapchain image
+// (`backbuffer_image`, left in PRESENT_SRC; `region`: where; `final_image`: the frame, in TRANSFER_SRC): the HUD layer
+// (F where it differs from the frame's HUD-less image H) for FSR 3 to composite over every frame shown, and H scaled
+// into the backbuffer in place of F. KYTY_FSR3_HUD_LAYER=0: off (the HUD-less image goes to FSR 3 instead).
+void RecordHudLayer(GraphicContext& graphics, vk::CommandBuffer command, vk::Image backbuffer_image, vk::Extent2D backbuffer,
+                    vk::Rect2D region, VulkanImage& final_image, const FrameGen::FrameInputs* inputs);
+
 // Present thread, after the frame's image is in the swapchain's backbuffer and its commands were
 // submitted (and finished), before QueuePresent: the frame's generation inputs (null or invalid:
 // none, no generation for this frame).

@@ -336,6 +336,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${lod_stats_pack_header}")
 
+# FSR 3 frame generation's HUD layer (src/local/fsr3-fg.cpp).
+set(hud_split_source "${KYTY_SOURCE_DIR}/local/hud-split.comp")
+set(hud_split_spv "${gpu_tiler_generated_dir}/hud_split.spv")
+set(hud_split_header "${gpu_tiler_generated_dir}/hud_split_spv.h")
+add_custom_command(
+	OUTPUT "${hud_split_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${hud_split_spv}" "${hud_split_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${hud_split_spv} -DOUTPUT=${hud_split_header}
+	        -DSYMBOL=HUD_SPLIT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${hud_split_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${hud_split_header}")
+
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"

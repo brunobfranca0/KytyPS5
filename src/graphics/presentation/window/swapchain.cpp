@@ -311,6 +311,7 @@ public:
 	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
 	// Where RecordPresentCommands put the frame in the swapchain image.
 	[[nodiscard]] vk::Rect2D PresentRegion() const noexcept { return m_present_region; }
+	[[nodiscard]] vk::Image  CurrentImage() const noexcept { return m_images[m_image_index]; }
 	[[nodiscard]] vk::SwapchainKHR Handle() const noexcept { return m_handle; }
 	// The FSR 3 frame generation swapchain (KYTY_FSR3_FG) stands in for the swapchain.
 	[[nodiscard]] bool IsFsr3() const noexcept { return m_fsr3; }
@@ -1052,6 +1053,12 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				    (static_cast<float>(hud->drawn.offset.y - region.offset.y) + static_cast<float>(hud->drawn.extent.height) + margin) / h);
 			}
 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+			// KYTY_FSR3_FG: the HUD as a layer FSR 3 composites over every frame shown, and the frame without it in the
+			// backbuffer (generated frames then have no HUD to drag).
+			if (swapchain.IsFsr3() && !draw_system_overlay)
+				Fsr3::RecordHudLayer(m_impl->window.graphic_ctx, command.Handle(), swapchain.CurrentImage(), swapchain.Extent(),
+				                     swapchain.PresentRegion(), frame.image,
+				                     frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr);
 			if (FrameGen::Enabled() && frame.fg.valid && !frame.reusing_last)
 				FrameGen::ScaleHudless(m_impl->window.graphic_ctx, command.Handle(), frame.fg, swapchain.Extent(), swapchain.Format());
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);

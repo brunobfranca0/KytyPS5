@@ -1026,6 +1026,25 @@ void CopyBack(vk::CommandBuffer command, VulkanImage& backup, Image& image) {
 }
 } // namespace
 
+namespace {
+// IsFlipImage's answers per image id (direct-mapped), valid while g_flip_epoch holds (it moves when a flip image changes).
+struct FlipAnswer {
+	ImageId  id;
+	uint64_t epoch  = 0;
+	bool     answer = false;
+};
+std::array<FlipAnswer, 512> g_flip_answers {};
+uint64_t                    g_flip_epoch = 1;
+} // namespace
+
+bool IsFlipImage(ImageId id) {
+	if (!id || g_cache == nullptr || !LiveCensus::g_render) return false;
+	auto& cached = g_flip_answers[id.index & (g_flip_answers.size() - 1)];
+	if (cached.epoch == g_flip_epoch && cached.id == id) return cached.answer;
+	cached = {id, g_flip_epoch, FlipOf(id) != nullptr};
+	return cached.answer;
+}
+
 void NoteDraw(ImageId target) {
 	if (target && LiveCensus::g_render) ++g_target_draws[KeyOf(target)];
 }
@@ -1147,6 +1166,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
                    FrameInputs& inputs, ImageId flip_id, Image& flip) {
 	inputs.valid       = false;
 	inputs.has_hudless = false;
+	inputs.hudless_composite = false;
 	g_cache            = &cache;
 	g_graphics_ctx     = &graphics;
 	// The flip images (two or three alternate): their views as render targets.
@@ -1158,6 +1178,8 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 			target  = &g_flips[g_flip_next];
 			g_flip_next = (g_flip_next + 1) % static_cast<uint32_t>(g_flips.size());
 		}
+		if (target->image != flip.backing.image || target->address != flip.info.data.address || !(target->id == flip_id))
+			++g_flip_epoch;
 		target->id      = flip_id;
 		target->image   = flip.backing.image;
 		target->address = flip.info.data.address;
@@ -1205,7 +1227,8 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	if (hudless && HudlessWanted()) {
 		ConfigureAs(graphics, inputs.hudless, inputs.hudless_view, g_hudless.format, vk::Extent3D {g_hudless.extent.width, g_hudless.extent.height, 1});
 		CopyRaw(vk_command, g_hudless, inputs.hudless);
-		inputs.has_hudless = true;
+		inputs.has_hudless       = true;
+		inputs.hudless_composite = composite;
 	}
 	{
 		// Every 600 frames with the TAA pass: how the HUD-less image was had (the composite without its HUD is the

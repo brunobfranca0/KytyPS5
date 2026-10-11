@@ -27,6 +27,7 @@
 #include <ffx_api/ffx_api_loader.h>
 #include <ffx_api/ffx_framegeneration.h>
 #include <ffx_api/vk/ffx_api_vk.h>
+#include "gpu_tiler_shaders/hud_split_spv.h"
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 #include "local/vulkan-recording.h"
 #endif
@@ -76,6 +77,36 @@ uint32_t              g_slot = 0;
 // The HUD-less image at the backbuffer's size and format (the frame's copy scaled as the backbuffer's).
 VulkanImage g_present_hudless;
 bool        g_present_hudless_ready = false;
+
+// The HUD layer (RecordHudLayer): the game's HUD as the real frame shows it, transparent elsewhere, at the backbuffer's
+// size; FSR 3 composites it over every frame shown. The backbuffer then holds the frame without its HUD.
+struct HudLayer {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	vk::Sampler             sampler    = nullptr;
+	VulkanImage             image;
+	vk::ImageView           view       = nullptr;
+	bool                    failed     = false;
+	bool                    written    = false; // holds a frame's HUD
+	bool                    this_frame = false; // the backbuffer holds this frame's HUD-less image
+	struct View {
+		VkImage       image  = VK_NULL_HANDLE;
+		vk::Format    format = vk::Format::eUndefined;
+		vk::ImageView view   = nullptr;
+	};
+	std::array<View, 6> views {}; // the presenter's frame images
+	uint32_t            next_view = 0;
+	uint32_t            logs      = 0;
+} g_hud;
+
+bool HudLayerWanted() {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_FSR3_HUD_LAYER");
+		return value == nullptr || *value == '\0' || *value != '0';
+	}();
+	return wanted;
+}
 
 uint64_t g_frame_id      = 0;
 bool     g_generating    = false; // the last frame had generation on
@@ -241,6 +272,138 @@ void RecordHudlessBlit(VkDevice device, VkCommandBuffer command, const VulkanIma
 	barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 	barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 	barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+}
+
+bool EnsureHudPipeline(GraphicContext& graphics) {
+	if (g_hud.pipeline != nullptr) return true;
+	if (g_hud.failed) return false;
+	g_hud.failed = true; // until it is made
+	const auto device = graphics.device;
+	std::array<vk::DescriptorSetLayoutBinding, 3> bindings {};
+	for (uint32_t i = 0; i < 3; ++i) {
+		bindings[i].binding         = i;
+		bindings[i].descriptorType  = i < 2 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
+	}
+	vk::DescriptorSetLayoutCreateInfo set_info {};
+	set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+	set_info.pBindings    = bindings.data();
+	if (device.createDescriptorSetLayout(&set_info, nullptr, &g_hud.set_layout) != vk::Result::eSuccess) return false;
+	vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, 24};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount         = 1;
+	layout_info.pSetLayouts            = &g_hud.set_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &push;
+	if (device.createPipelineLayout(&layout_info, nullptr, &g_hud.layout) != vk::Result::eSuccess) return false;
+	vk::ShaderModuleCreateInfo module_info {};
+	module_info.codeSize = sizeof(HUD_SPLIT_SPV);
+	module_info.pCode    = HUD_SPLIT_SPV;
+	vk::ShaderModule module = nullptr;
+	if (device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) return false;
+	vk::ComputePipelineCreateInfo pipeline_info {};
+	pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	pipeline_info.stage.module = module;
+	pipeline_info.stage.pName  = "main";
+	pipeline_info.layout       = g_hud.layout;
+	const auto created = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &g_hud.pipeline);
+	device.destroyShaderModule(module, nullptr);
+	if (created != vk::Result::eSuccess) {
+		g_hud.pipeline = nullptr;
+		return false;
+	}
+	vk::SamplerCreateInfo sampler {};
+	sampler.magFilter    = vk::Filter::eLinear;
+	sampler.minFilter    = vk::Filter::eLinear;
+	sampler.mipmapMode   = vk::SamplerMipmapMode::eNearest;
+	sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+	sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+	sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+	sampler.maxLod       = 0.0f;
+	if (device.createSampler(&sampler, nullptr, &g_hud.sampler) != vk::Result::eSuccess) return false;
+	g_hud.failed = false;
+	return true;
+}
+
+bool EnsureHudImage(GraphicContext& graphics, vk::Extent2D extent) {
+	if (g_hud.image.image != nullptr && g_hud.image.extent.width == extent.width && g_hud.image.extent.height == extent.height)
+		return true;
+	if (g_hud.view != nullptr) graphics.device.destroyImageView(g_hud.view, nullptr);
+	g_hud.view = nullptr;
+	if (g_hud.image.image != nullptr) graphics.DeleteImage(g_hud.image);
+	g_hud.image.image = nullptr;
+	g_hud.written     = false;
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR16G16B16A16Sfloat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_hud.image)) {
+		g_hud.image.image = nullptr;
+		return false;
+	}
+	vk::ImageViewCreateInfo view {};
+	view.image            = g_hud.image.image;
+	view.viewType         = vk::ImageViewType::e2D;
+	view.format           = create.format;
+	view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (graphics.device.createImageView(&view, nullptr, &g_hud.view) != vk::Result::eSuccess) {
+		graphics.DeleteImage(g_hud.image);
+		g_hud.image.image = nullptr;
+		g_hud.view        = nullptr;
+		return false;
+	}
+	g_hud.image.state = {};
+	return true;
+}
+
+vk::ImageView FrameImageView(GraphicContext& graphics, const VulkanImage& image) {
+	const auto handle = static_cast<VkImage>(image.image);
+	for (const auto& view: g_hud.views)
+		if (view.image == handle && view.format == image.format && view.view != nullptr) return view.view;
+	auto& slot = g_hud.views[g_hud.next_view];
+	g_hud.next_view = (g_hud.next_view + 1) % static_cast<uint32_t>(g_hud.views.size());
+	if (slot.view != nullptr) graphics.device.destroyImageView(slot.view, nullptr);
+	slot = {};
+	vk::ImageViewCreateInfo view {};
+	view.image            = image.image;
+	view.viewType         = vk::ImageViewType::e2D;
+	view.format           = image.format;
+	view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk::ImageView created = nullptr;
+	if (graphics.device.createImageView(&view, nullptr, &created) != vk::Result::eSuccess) return nullptr;
+	slot = {handle, image.format, created};
+	return created;
+}
+
+vk::ImageMemoryBarrier2 ImageBarrier(vk::Image image, vk::ImageLayout from, vk::ImageLayout to, vk::AccessFlags2 src_access,
+                                     vk::AccessFlags2 dst_access) {
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask       = src_access;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask       = dst_access;
+	barrier.oldLayout           = from;
+	barrier.newLayout           = to;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = image;
+	barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	return barrier;
+}
+void Barriers(vk::CommandBuffer command, std::initializer_list<vk::ImageMemoryBarrier2> barriers) {
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
+	dependency.pImageMemoryBarriers    = barriers.begin();
+	command.pipelineBarrier2(dependency);
 }
 
 bool EnsureCommandBuffers(GraphicContext& graphics) {
@@ -498,6 +661,84 @@ vk::Result QueuePresent(GraphicContext& graphics, const vk::PresentInfoKHR& info
 	return static_cast<vk::Result>(result);
 }
 
+void RecordHudLayer(GraphicContext& graphics, vk::CommandBuffer command, vk::Image backbuffer_image, vk::Extent2D backbuffer,
+                    vk::Rect2D region, VulkanImage& final_image, const FrameGen::FrameInputs* inputs) {
+	if (!Active() || !HudLayerWanted()) return;
+	std::lock_guard lock(g_mutex);
+	g_hud.this_frame = false;
+	// Only a frame whose HUD-less image is the game's composite drawn without its HUD texture (the same pixels as the
+	// frame but the HUD's), with generation possible.
+	if (inputs == nullptr || !inputs->valid || !inputs->has_hudless || !inputs->hudless_composite ||
+	    inputs->hudless.image == nullptr || inputs->hudless_view == nullptr || VideoOut::MoviePlaying() ||
+	    final_image.image == nullptr || final_image.extent.width != inputs->hudless.extent.width ||
+	    final_image.extent.height != inputs->hudless.extent.height)
+		return;
+	if (!EnsureHudPipeline(graphics) || !EnsureHudImage(graphics, backbuffer)) return;
+	const auto final_view = FrameImageView(graphics, final_image);
+	if (final_view == nullptr) return;
+
+	// The layer: F where it differs from H.
+	const auto layer_from = g_hud.written ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eUndefined;
+	Barriers(command, {ImageBarrier(final_image.image, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+	                                vk::AccessFlagBits2::eTransferRead, vk::AccessFlagBits2::eShaderRead),
+	                   ImageBarrier(g_hud.image.image, layer_from, vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead,
+	                                vk::AccessFlagBits2::eShaderWrite)});
+	vk::DescriptorImageInfo images[3] {};
+	images[0] = {g_hud.sampler, final_view, vk::ImageLayout::eShaderReadOnlyOptimal};
+	images[1] = {g_hud.sampler, inputs->hudless_view, vk::ImageLayout::eShaderReadOnlyOptimal};
+	images[2] = {nullptr, g_hud.view, vk::ImageLayout::eGeneral};
+	vk::WriteDescriptorSet writes[3] {};
+	for (uint32_t i = 0; i < 3; ++i) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = i < 2 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+		writes[i].pImageInfo      = &images[i];
+	}
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g_hud.pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g_hud.layout, 0, 3, writes);
+	struct {
+		int32_t offset[2];
+		int32_t size[2];
+		float   threshold;
+		int32_t radius;
+	} push {{region.offset.x, region.offset.y},
+	        {static_cast<int32_t>(region.extent.width), static_cast<int32_t>(region.extent.height)},
+	        EnvFloat("KYTY_FSR3_HUD_THRESHOLD", 3.0f / 1023.0f), static_cast<int32_t>(EnvFloat("KYTY_FSR3_HUD_RADIUS", 2.0f))};
+	command.pushConstants(g_hud.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	command.dispatch((backbuffer.width + 7) / 8, (backbuffer.height + 7) / 8, 1);
+
+	// The backbuffer: H instead of F, scaled as the presenter scaled F (FSR 3 interpolates it: no HUD to drag).
+	Barriers(command, {ImageBarrier(g_hud.image.image, vk::ImageLayout::eGeneral, vk::ImageLayout::eShaderReadOnlyOptimal,
+	                                vk::AccessFlagBits2::eShaderWrite, vk::AccessFlagBits2::eShaderRead),
+	                   ImageBarrier(final_image.image, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageLayout::eTransferSrcOptimal,
+	                                vk::AccessFlagBits2::eShaderRead, vk::AccessFlagBits2::eTransferRead),
+	                   ImageBarrier(inputs->hudless.image, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageLayout::eTransferSrcOptimal,
+	                                vk::AccessFlagBits2::eShaderRead, vk::AccessFlagBits2::eTransferRead),
+	                   ImageBarrier(backbuffer_image, vk::ImageLayout::ePresentSrcKHR, vk::ImageLayout::eTransferDstOptimal,
+	                                vk::AccessFlagBits2::eMemoryRead, vk::AccessFlagBits2::eTransferWrite)});
+	vk::ImageBlit blit {};
+	blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(inputs->hudless.extent.width), static_cast<int32_t>(inputs->hudless.extent.height), 1};
+	blit.dstOffsets[0]  = vk::Offset3D {region.offset.x, region.offset.y, 0};
+	blit.dstOffsets[1]  = vk::Offset3D {region.offset.x + static_cast<int32_t>(region.extent.width),
+	                                    region.offset.y + static_cast<int32_t>(region.extent.height), 1};
+	command.blitImage(inputs->hudless.image, vk::ImageLayout::eTransferSrcOptimal, backbuffer_image,
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &blit, vk::Filter::eLinear);
+	Barriers(command, {ImageBarrier(inputs->hudless.image, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+	                                vk::AccessFlagBits2::eTransferRead, vk::AccessFlagBits2::eShaderRead),
+	                   ImageBarrier(backbuffer_image, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::ePresentSrcKHR,
+	                                vk::AccessFlagBits2::eTransferWrite, vk::AccessFlagBits2::eMemoryRead)});
+	g_hud.written    = true;
+	g_hud.this_frame = true;
+	if (g_hud.logs < 3) {
+		++g_hud.logs;
+		std::printf("FSR3 FG: HUD layer %ux%u from the frame and its HUD-less image (%ux%u): composited over every frame shown\n",
+		            backbuffer.width, backbuffer.height, inputs->hudless.extent.width, inputs->hudless.extent.height);
+		std::fflush(stdout);
+	}
+}
+
 void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs, vk::SwapchainKHR swapchain,
                    vk::Extent2D backbuffer, vk::Format format) {
 	if (!Active()) return;
@@ -562,7 +803,28 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	config.frameGenerationEnabled             = generate;
 	config.allowAsyncWorkloads                = EnvOn("KYTY_FSR3_ASYNC", false);
 	// The HUD-less image (the frame's, scaled to the backbuffer below): FSR 3 keeps the HUD out of the generated frames.
-	const bool hudless = generate && inputs->has_hudless && inputs->hudless.image != nullptr &&
+	// The HUD layer (RecordHudLayer): registered while generating, the backbuffer then has no HUD (no HUD-less image to
+	// give); off, none (menus are shown as they are).
+	const bool layer = generate && HudLayerWanted() && g_hud.written && g_hud.view != nullptr &&
+	                   g_hud.image.extent.width == backbuffer.width && g_hud.image.extent.height == backbuffer.height;
+	{
+		ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceVK ui {};
+		ui.header.type = FFX_API_CONFIGURE_DESC_TYPE_FGSWAPCHAIN_REGISTERUIRESOURCE_VK;
+		if (layer) {
+			ui.uiResource       = ImageResource(g_hud.image, false);
+			ui.uiResource.state = FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
+			ui.flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA |
+			           FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING;
+		}
+		if (const auto result = g_ffx.Configure(&g_swapchain_context, &ui.header); result != FFX_API_RETURN_OK) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1) < 4) {
+				std::printf("FSR3 FG: HUD layer not registered (%u)\n", result);
+				std::fflush(stdout);
+			}
+		}
+	}
+	const bool hudless = generate && !layer && inputs->has_hudless && inputs->hudless.image != nullptr &&
 	                     EnsurePresentHudless(graphics, backbuffer, format);
 	config.HUDLessColor = FfxApiResource {};
 	if (hudless) {
@@ -707,6 +969,8 @@ vk::Result QueuePresent(GraphicContext&, const vk::PresentInfoKHR&) {
 	return vk::Result::eErrorFeatureNotPresent;
 }
 void BeforePresent(GraphicContext&, const FrameGen::FrameInputs*, vk::SwapchainKHR, vk::Extent2D, vk::Format) {}
+void RecordHudLayer(GraphicContext&, vk::CommandBuffer, vk::Image, vk::Extent2D, vk::Rect2D, VulkanImage&,
+                    const FrameGen::FrameInputs*) {}
 
 #endif
 
