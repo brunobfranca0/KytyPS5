@@ -834,6 +834,38 @@ static uint32_t TableCodeWord(const ShaderRecompiler::IR::TablePlan::Operand& op
 // The slots of the pair's stages, read into their blocks where the plans address them from the user data and lower
 // slots (a pointer read from memory may hold anything: what is read through it must be mapped), and the T#/S# words
 // they make (TableXpr::words, the set's key) and the pixel stage's LOD statistics words. False: something unmapped.
+namespace {
+// KYTY_SYNC_STATS: the table reads of GPU-written memory (each one waits for the GPU), per shader and run: how often,
+// whether the words changed since the run's previous read (served from the previous frame they would be right when
+// they did not), and whether the CPU needs them (to resolve resources) or only the shader reads them (a GPU copy
+// could provide those). Every 10 s.
+struct GpuReadProbe {
+	uint64_t shader = 0;
+	uint32_t stage = 0, run = 0, first = 0, count = 0, level = 0, cpu = 0, gpu = 0;
+	uint64_t address = 0, hash = 0, reads = 0, same = 0, changed = 0;
+	bool     used = false;
+};
+std::array<GpuReadProbe, 512>         g_gpu_read_probes {};
+std::chrono::steady_clock::time_point g_gpu_read_start {};
+void GpuReadProbePrint() {
+	std::vector<const GpuReadProbe*> list;
+	for (const auto& probe: g_gpu_read_probes)
+		if (probe.used) list.push_back(&probe);
+	std::sort(list.begin(), list.end(), [](auto* a, auto* b) { return a->reads > b->reads; });
+	std::printf("[gpuread] 10 s: %zu table runs read GPU-written memory\n", list.size());
+	for (size_t i = 0; i < std::min<size_t>(list.size(), 12); ++i) {
+		const auto& p = *list[i];
+		std::printf("[gpuread]  CS 0x%llx stage %u run %u (slots %u+%u, level %u, cpu %u, gpu %u) at 0x%llx: %llu reads, "
+		            "%llu same as before, %llu changed\n",
+		            static_cast<unsigned long long>(p.shader), p.stage, p.run, p.first, p.count, p.level, p.cpu, p.gpu,
+		            static_cast<unsigned long long>(p.address), static_cast<unsigned long long>(p.reads),
+		            static_cast<unsigned long long>(p.same), static_cast<unsigned long long>(p.changed));
+	}
+	std::fflush(stdout);
+	g_gpu_read_probes = {};
+}
+} // namespace
+
 bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data) {
 	auto&      table     = OwnTable();
 	const auto stages    = pair.programs[1] != nullptr ? 2u : 1u;
@@ -847,6 +879,41 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 	words.clear();
 	table.lod_stats.clear();
 	NativeXprReader reader(resources);
+	const bool probing = SyncStats::Enabled();
+	// (KYTY_SYNC_STATS) A run read through `reader`, noted when its memory is GPU-written.
+	const auto read_run = [&](uint32_t st, uint32_t index, uint64_t address, uint32_t count, uint32_t first,
+	                          uint32_t* out) {
+		if (!probing || !m_context.GetBufferCache().IsRegionGpuModified(address, uint64_t {count} * 4u)) {
+			reader.Read(address, count, out);
+			return;
+		}
+		reader.Read(address, count, out);
+		const uint64_t hash = XXH3_64bits(out, uint64_t {count} * 4u);
+		const uint64_t key  = pair.vs * 31u + st * 7919u + index;
+		auto&          probe = g_gpu_read_probes[(key * 0x9e3779b97f4a7c15ull) >> 55u];
+		if (!probe.used || probe.shader != pair.vs || probe.stage != st || probe.run != index) {
+			const auto& plan = pair.programs[st]->table_plan;
+			const auto& run  = pair.runs[st][index];
+			probe = {.shader = pair.vs, .stage = st, .run = index, .first = first, .count = count, .level = run.level,
+			         .address = address, .hash = hash, .used = true};
+			for (uint32_t slot = first; slot < first + count && slot < plan.cpu.size(); ++slot) {
+				probe.cpu += plan.cpu[slot] != 0;
+				probe.gpu += slot < plan.gpu.size() && plan.gpu[slot] != 0;
+			}
+		} else if (probe.hash == hash) {
+			++probe.same;
+		} else {
+			++probe.changed;
+			probe.hash = hash;
+		}
+		++probe.reads;
+		const auto now = std::chrono::steady_clock::now();
+		if (g_gpu_read_start == std::chrono::steady_clock::time_point {}) g_gpu_read_start = now;
+		if (now - g_gpu_read_start >= std::chrono::seconds(10)) {
+			GpuReadProbePrint();
+			g_gpu_read_start = now;
+		}
+	};
 	// A run's address, its pages proven mapped and its lines loading.
 	// (A bounded run, read through a V#: within its range, NUM_RECORDS bytes or NUM_RECORDS strides, as the normal
 	// path's evaluation, which fails past it: so does this one.)
@@ -901,7 +968,8 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 				            table.addresses[end], run.read.bounded, run.read.bounded ? value(run.read.records) : 0))
 					return false;
 			}
-			for (size_t i = begin; i < end; ++i) reader.Read(table.addresses[i], runs[i].count, slots.data() + runs[i].first);
+			for (size_t i = begin; i < end; ++i)
+				read_run(st, static_cast<uint32_t>(i), table.addresses[i], runs[i].count, runs[i].first, slots.data() + runs[i].first);
 		}
 		for (size_t i = 0; i < plan.images.size(); ++i) {
 			const auto& descriptor = plan.images[i];
@@ -998,7 +1066,8 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 				            table.addresses[i], run.bounded, run.bounded ? get(run.records) : 0))
 					return false;
 			}
-			for (auto i = begin; i < end; ++i) reader.Read(table.addresses[i], form.runs[i].count, slots.data() + form.runs[i].first);
+			for (auto i = begin; i < end; ++i)
+				read_run(st, i, table.addresses[i], form.runs[i].count, form.runs[i].first, slots.data() + form.runs[i].first);
 			begin = end;
 		}
 		const auto first = words.size();
