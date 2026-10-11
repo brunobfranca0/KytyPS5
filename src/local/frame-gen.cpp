@@ -235,6 +235,15 @@ std::chrono::steady_clock::time_point g_stat_start {};
 uint32_t         g_stat_real = 0, g_stat_on = 0;
 double           g_stat_present_ms = 0, g_stat_present_max = 0;
 std::chrono::steady_clock::time_point g_present_begin {};
+// The intervals between the game's frames reaching the present thread: their spread in each [dlssg] line, and
+// (KYTY_DLSSG_LIMIT) the cadence Reflex holds them to. DLSS-G paces its generated frames from that cadence: real
+// frames arriving unevenly (a 33 ms frame, then 28, then 39) showed as judder, more with x3 and x4.
+std::chrono::steady_clock::time_point g_last_real {};
+double           g_stat_interval_sum = 0, g_stat_interval_sq = 0, g_stat_interval_max = 0;
+uint32_t         g_stat_intervals = 0;
+std::vector<double> g_window_intervals;
+sl::ReflexOptions g_reflex {};
+uint32_t         g_limit_us = 0, g_limit_candidate = 0;
 
 // Matrices in Streamline's convention: row-major, row vectors (p' = p * M).
 using Mat4 = sl::float4x4;
@@ -537,6 +546,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 		if (std::string(mode) == "boost") reflex.mode = sl::ReflexMode::eLowLatencyWithBoost;
 	}
 	std::printf("Frame generation: Reflex mode %d\n", static_cast<int>(reflex.mode));
+	g_reflex = reflex;
 	if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
 		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
 	}
@@ -561,12 +571,58 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		if (g_stat_start == std::chrono::steady_clock::time_point {}) g_stat_start = now;
 		++g_stat_real;
 		if (usable) ++g_stat_on;
+		if (g_last_real != std::chrono::steady_clock::time_point {}) {
+			const double ms = std::chrono::duration<double, std::milli>(now - g_last_real).count();
+			g_stat_interval_sum += ms;
+			g_stat_interval_sq += ms * ms;
+			g_stat_interval_max = std::max(g_stat_interval_max, ms);
+			++g_stat_intervals;
+			g_window_intervals.push_back(ms);
+		}
+		g_last_real = now;
 		const double window = std::chrono::duration<double>(now - g_stat_start).count();
 		if (window >= 1.0) {
-			std::printf("[dlssg] real %.1f fps, shown %.1f fps; generation on %u of %u frames; present call %.2f ms (max %.1f)\n",
+			const double mean = g_stat_intervals != 0 ? g_stat_interval_sum / g_stat_intervals : 0.0;
+			const double sd   = g_stat_intervals != 0 ? std::sqrt(std::max(0.0, g_stat_interval_sq / g_stat_intervals - mean * mean)) : 0.0;
+			// KYTY_DLSSG_LIMIT: auto (default): when the game holds 30 or 60 fps (the median interval near 33.3 or
+			// 16.7 ms over two seconds in a row), Reflex's frame limit holds the frames to that cadence; otherwise none.
+			// A number: that fps always; 0: never.
+			static const int limit_setting = [] {
+				const char* value = std::getenv("KYTY_DLSSG_LIMIT");
+				if (value == nullptr || *value == '\0' || std::string(value) == "auto") return -1;
+				return std::max(0, std::atoi(value));
+			}();
+			uint32_t wanted = 0;
+			if (limit_setting > 0) {
+				wanted = 1000000u / static_cast<uint32_t>(limit_setting);
+			} else if (limit_setting < 0 && g_window_intervals.size() >= 10 && usable) {
+				auto sorted = g_window_intervals;
+				std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+				const double median = sorted[sorted.size() / 2];
+				if (median >= 30.0 && median <= 37.0) wanted = 33333;
+				else if (median >= 15.5 && median <= 18.0) wanted = 16667;
+			}
+			if (limit_setting >= 0 || wanted == g_limit_candidate) {
+				if (wanted != g_limit_us && g_api.reflex_set_options != nullptr) {
+					auto options         = g_reflex;
+					options.frameLimitUs = wanted;
+					const auto result    = g_api.reflex_set_options(options);
+					std::printf("DLSS-G: frames held to %s by Reflex%s\n",
+					            wanted != 0 ? (wanted == 33333 ? "30 fps" : wanted == 16667 ? "60 fps" : "a fixed rate") : "no rate",
+					            result == sl::Result::eOk ? "" : " (failed)");
+					if (result == sl::Result::eOk) g_limit_us = wanted;
+				}
+			}
+			g_limit_candidate = wanted;
+			g_window_intervals.clear();
+			std::printf("[dlssg] real %.1f fps, shown %.1f fps; generation on %u of %u frames; present call %.2f ms (max %.1f); "
+			            "frame interval %.1f ms, spread %.1f ms, max %.1f; limit %s\n",
 			            g_stat_real / window, g_stat_real / window * static_cast<double>(PresentedFrames()), g_stat_on,
-			            g_stat_real, g_stat_real != 0 ? g_stat_present_ms / g_stat_real : 0.0, g_stat_present_max);
+			            g_stat_real, g_stat_real != 0 ? g_stat_present_ms / g_stat_real : 0.0, g_stat_present_max, mean, sd,
+			            g_stat_interval_max, g_limit_us == 0 ? "none" : g_limit_us == 33333 ? "30" : g_limit_us == 16667 ? "60" : "fixed");
 			std::fflush(stdout);
+			g_stat_interval_sum = g_stat_interval_sq = g_stat_interval_max = 0;
+			g_stat_intervals = 0;
 			g_stat_start = now;
 			g_stat_real  = 0;
 			g_stat_on    = 0;
