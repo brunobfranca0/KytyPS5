@@ -116,3 +116,9 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   asíncrono 3,0 ms; 826 son el memset, 0,41 ms). **Pasada 3**: KYTY_SYNC_STATS=0 en las tres configs (las esperas ya
   están resueltas; la sonda costaba 1,8 ms/frame); mismo ejecutable. Techo: −1,8 ms/frame. Luego: `VirtualProtect`
   (0,9 ms), `TableEvaluate` restante (1,6 ms), `TableBlocks` (0,9 ms).
+- 2026-10-11, **pasada 3** (169d1a9, configs con KYTY_SYNC_STATS=0, log 211215): real 56,8/57,8 → 54,0 fps de media,
+  cpu 9,4/10,8 → 12,2 ms: **no concluyente**. Cada log es una ruta distinta (el jugador va donde quiere): el ruido
+  entre pasadas supera lo que se mide. Antes de seguir, una **ruta reproducible**: `Ruta.cmd` (nuevo) graba los
+  puntos que el jugador marca con F6 (`_Build/waypoints/route-*.txt`, del desarrollador: 9fde675) y los recorre solo
+  (`glide` a 5 m/s, giro de cámara 3 s en cada punto, por el fichero `live.txt`): misma ruta y velocidad en cada
+  versión. La pasada 3 se decide con esa ruta (A: KYTY_SYNC_STATS=1, B: =0, mismo ejecutable).
