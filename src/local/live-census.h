@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <x86intrin.h>
 
+#include "sync-stats.h"
+
 namespace LiveCensus {
 
 enum Kind : uint32_t {
@@ -124,7 +126,13 @@ public:
 		if (m_on) m_start = std::chrono::steady_clock::now();
 	}
 	~WaitScope() {
-		if (m_on) g_waits_ns[m_wait] += (std::chrono::steady_clock::now() - m_start).count();
+		if (m_on) {
+			const int64_t ns = (std::chrono::steady_clock::now() - m_start).count();
+			g_waits_ns[m_wait] += ns;
+			// KYTY_SYNC_STATS: the stacks the GPU waits and synchronous downloads come from.
+			if ((m_wait == WaitGpu || m_wait == WaitDownload) && ns > 20000 && SyncStats::Enabled())
+				SyncStats::Note(m_wait == WaitGpu ? 0u : 1u, ns);
+		}
 	}
 	WaitScope(const WaitScope&)            = delete;
 	WaitScope& operator=(const WaitScope&) = delete;
