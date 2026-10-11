@@ -42,6 +42,7 @@ modo rendimiento del juego. Carpeta de juego `C:\KytyPS5-juego`, lanzador `Jugar
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 181236 (FSR3 x2, 10 min) | dec3c3b | 67 % | 13,0 / 56,2 | 73 % | 10,0 | 3,56 | 2,67 | 48,7 K | 74,4 K | 855 ms | 12,6 / 23,8 GB |
 | 185047 (FSR3 x2, 4 min, medición) | b28e99f | 42 % | 36,4 / 52,4 | 47 % | 12,5 | 3,57 | 2,99 | 48,9 K | 82,6 K | 845 ms | 11,4 / 22,3 GB |
+| 192138 (FSR3 x2, 3,5 min, pasada 1) | 684e189 | 29 % | 20,2 / 50,3 | 46 % | 12,8 | 4,08 | 3,62 | 46,3 K | 79,7 K | 843 ms | 11,6 / 22,2 GB |
 
 Segundos lentos (~44 fps) frente a los rápidos (60) en 181236: frame 23,0 vs 16,7 ms; `cpu` 15,3 vs 8,8; `download` 7,1
 vs 2,6; `gpu_wait` 5,6 vs 1,8. Es decir, **unos 7 ms por frame de esperas síncronas a la GPU** y 6,5 ms más de CPU del
@@ -53,8 +54,11 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
 
 ## Hitos
 
-- [ ] **Z1 Relleno en CPU**: el shader de relleno (período < cuenta) se hace en la CPU cuando ninguno de los rangos
-      está escrito por la GPU, así los descriptores que el juego guarda ahí no se descargan. Commit `684e189`. Medir.
+- [x] ~~**Z1 Relleno en CPU**~~ (684e189): **revertido**, el juego nunca usa la forma de relleno (0 en 3,5 min).
+- [ ] **Z1b Copias a memoria con alias en CPU** (318794b): las copias del shader cs_memset32 cuyo destino está mapeado
+      en dos direcciones se hacían en la GPU (rechazadas como "aliased"), marcando el destino como escrito por la GPU.
+      Ahora se hacen en la CPU tras poner coherentes los alias (CPU-dirty, imágenes invalidadas, lecturas pendientes
+      terminadas); si un alias tiene bytes escritos por la GPU, sigue el shader. Medir.
 - [ ] **Z2 Integrar la rama del desarrollador** (`experiment/perf-40fps-20260926` de chenxiao07/KytyPS5, ≥ 46defa0)
       conservando FSR 3 x2, el relleno en CPU y el recolector de memoria que mida mejor. Comprobar FSR 3 en el log.
 - [ ] **Z3 Esperas a la GPU restantes**: lo que quede en `[sync]` tras Z1 (lecturas de la CPU del juego, `CopyBuffer`).
@@ -67,3 +71,10 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   esperan a rellenos del shader cs_memset32 que el emulador mandaba a la GPU. Implementado Z1 (684e189): rellenos con
   período < cuenta en la CPU (`BufferCache::FillPattern`), período de una palabra como fill de GPU si el destino ya está
   escrito por la GPU. Pendiente de medir en la ruta.
+- 2026-10-11, **pasada 1** (684e189, log 192138 vs 185047): real 52,4 → 50,3 fps, ms/frame 19,1 → 19,9,
+  sync_download 3,57 → 4,08 ms, gpu_wait 2,99 → 3,62 ms: **se revierte** (ruido/peor; la forma de relleno no existe en
+  este juego: `[memset]` 0 rellenos en todo el log). El log sí da la causa: `[memset] … left to the shader: aliased
+  memory` pasa de 0 a 650–2050 por 10 s exactamente cuando las descargas síncronas pasan de 0,14 s a 2,5–3,1 s por 10 s
+  (`[sync]`), y los escritores de los bytes esperados son ese shader vía `RebindBuffers` (18 s) y `CopyBuffer` (14,6 s)
+  de 40 s. Hipótesis Z1b: hacer esas copias en la CPU con los alias coherentes. Techo: ~2,7 s de descargas por 10 s
+  (~27 % del tiempo del hilo de render en la zona) más las esperas a la GPU que arrastran (gpu_wait).
