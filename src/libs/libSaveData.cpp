@@ -14,6 +14,8 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <fstream>
 #include <cstring>
 #include <deque>
 #include <vector>
@@ -238,6 +240,35 @@ static std::deque<SaveDataEvent> g_save_data_events;
 static SaveDataMountSlots        g_mount_slots;
 static Common::Mutex             g_mount_mutex;
 
+static std::string get_title_id();
+// The save data memory (SaveDataSetSaveDataMemory2) kept on disk: it was only in RAM, and lost at every exit.
+static std::filesystem::path save_memory_file() {
+	return std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / "_SaveDataMemory.bin";
+}
+static void load_save_memory() {
+	static bool loaded = false;
+	if (loaded) return;
+	loaded = true;
+	std::ifstream file(save_memory_file(), std::ios::binary);
+	if (!file) return;
+	std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+	if (data.size() > g_save_data_memory.size()) g_save_data_memory.resize(data.size());
+	std::memcpy(g_save_data_memory.data(), data.data(), data.size());
+	std::printf("[save] save data memory loaded: %zu bytes\n", data.size());
+}
+static void store_save_memory() {
+	std::error_code error;
+	std::filesystem::create_directories(save_memory_file().parent_path(), error);
+	const auto temporary = save_memory_file().string() + ".tmp";
+	{
+		std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+		if (!file) return;
+		file.write(reinterpret_cast<const char*>(g_save_data_memory.data()), static_cast<std::streamsize>(g_save_data_memory.size()));
+		if (!file) return;
+	}
+	std::filesystem::rename(temporary, save_memory_file(), error);
+}
+
 static std::string get_title_id() {
 	std::string title_id;
 	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) {
@@ -457,10 +488,10 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 
 	const int slot = g_mount_slots.FindAvailable(dir_name);
 	if (slot == SaveDataMountSlots::BUSY) {
-		return SAVE_DATA_ERROR_BUSY;
+		{ std::printf("[save] mount %s mode 0x%x: SAVE_DATA_ERROR_BUSY\n", dir_name.c_str(), mount->mount_mode); return SAVE_DATA_ERROR_BUSY; }
 	}
 	if (slot == SaveDataMountSlots::FULL) {
-		return SAVE_DATA_ERROR_MOUNT_FULL;
+		{ std::printf("[save] mount %s mode 0x%x: SAVE_DATA_ERROR_MOUNT_FULL\n", dir_name.c_str(), mount->mount_mode); return SAVE_DATA_ERROR_MOUNT_FULL; }
 	}
 
 	if (!create && !create2 && !open) {
@@ -468,11 +499,11 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	}
 
 	if (open && !Common::File::IsDirectoryExisting(mount_dir)) {
-		return SAVE_DATA_ERROR_NOT_FOUND;
+		{ std::printf("[save] mount %s mode 0x%x: SAVE_DATA_ERROR_NOT_FOUND\n", dir_name.c_str(), mount->mount_mode); return SAVE_DATA_ERROR_NOT_FOUND; }
 	}
 
 	if (create && Common::File::IsDirectoryExisting(mount_dir)) {
-		return SAVE_DATA_ERROR_EXISTS;
+		{ std::printf("[save] mount %s mode 0x%x: SAVE_DATA_ERROR_EXISTS\n", dir_name.c_str(), mount->mount_mode); return SAVE_DATA_ERROR_EXISTS; }
 	}
 
 	bool created = false;
@@ -486,10 +517,12 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	const auto metadata = capacity_metadata(dir_name);
 	const auto capacity = ReadSaveDataCapacity(mount_dir, metadata);
 	if (!capacity || !WriteSaveDataCapacity(metadata, std::max(capacity->blocks, mount->blocks))) {
-		return SAVE_DATA_ERROR_INTERNAL;
+		{ std::printf("[save] mount %s mode 0x%x: SAVE_DATA_ERROR_INTERNAL\n", dir_name.c_str(), mount->mount_mode); return SAVE_DATA_ERROR_INTERNAL; }
 	}
 
-	return mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
+	const int result = mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
+	std::printf("[save] mount %s mode 0x%x%s: %d\n", dir_name.c_str(), mount->mount_mode, created ? " (created)" : "", result);
+	return result;
 }
 
 int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
@@ -508,9 +541,12 @@ int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup
 	     setup_param->option, setup_param->user_id, static_cast<uint64_t>(setup_param->memory_size),
 	     static_cast<uint64_t>(setup_param->icon_memory_size), setup_param->slot_id);
 
+	load_save_memory();
 	if (setup_param->memory_size > g_save_data_memory.size()) {
 		g_save_data_memory.resize(setup_param->memory_size);
 	}
+	std::printf("[save] save data memory setup: %llu bytes, slot %u\n",
+	            static_cast<unsigned long long>(setup_param->memory_size), setup_param->slot_id);
 
 	if (result != nullptr) {
 		*result                     = {};
@@ -536,6 +572,7 @@ int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 	     reinterpret_cast<uint64_t>(get_param->param), reinterpret_cast<uint64_t>(get_param->icon),
 	     get_param->slot_id);
 
+	load_save_memory();
 	if (get_param->data != nullptr) {
 		auto* data = get_param->data;
 		if (data->buf == nullptr || data->offset < 0) {
@@ -589,6 +626,8 @@ int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param
 			}
 			std::memcpy(g_save_data_memory.data() + offset, data.buf, data.buf_size);
 		}
+		store_save_memory();
+		std::printf("[save] save data memory written (%u blocks)\n", data_num);
 	}
 
 	return OK;
