@@ -155,3 +155,20 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   jugador (no la grabada), así que la media y el p5 llevan ruido de ruta (las dos referencias difieren entre sí más que
   la pasada de ellas); lo que no lleva ruido es el coste por draw y que el cambio quita trabajo sin añadir ninguno.
   `fsr3.json` sigue con KYTY_SYNC_STATS=1 (stacks [sync] sin coste por run).
+- 2026-10-12, **perfil en la zona con 8b03bc8** (`_measure/prof-pasada5.bin`, 30 s, 120 000 muestras, pedido por
+  `live.txt` mientras el jugador estaba en el camino del dragón; log 010951). Esperas 36 % (flip 18 %: tope de 60; 18 %
+  esperando comandos del juego). Del trabajo: TableDispatch 20,9 % inclusivo (ya mayor que TableDraw 13,9 %); dentro,
+  TableBlocks 7,7 % de las muestras, de ellas ObtainBuffer de los búferes **escritos** 5,3 % (cerrojo de
+  m_gpu_modified_mutex + RangeSet::Add 1,8 %, RangeSet::Contains 1,0 %, FindBuffer 0,7 %, NoteGpuWrite 0,3 %);
+  TableEvaluate 7,6 %; VirtualProtect (ProtectMappedUnlocked) 5,4 %: 1,6 % desde Process (flush diferido), 1,2 %
+  UpdateGpuProtection, 1,1 % FlushDeferredProtection, 0,4 % ReapplyProtection en UploadDirtyRanges, 0,4 %
+  UpdateCpuProtection. RangeSet::Add ya devuelve pronto si el rango está cubierto (fast mode): lo que cuesta es el
+  cerrojo y la búsqueda, ~35 ns × ~10 000 por frame.
+  **Hallazgo de los segundos lentos (log 010951, 49 s < 55 fps)**: frame 19–20 ms = cpu del hilo de render 14–16 ms +
+  **reposo 4–5 ms** (en 46 de los 49 segundos; sólo 3 con el hilo saturado). El hilo de render no está saturado: es la
+  cadena por frame (traducción → GPU → readbacks del juego → siguientes comandos) la que suma 19–20 ms, como describe
+  el desarrollador en `lessons.md`. Quitar traducción sigue bajando el frame casi 1:1 (la cadena es serie), pero el
+  reposo de 4–5 ms es GPU + readbacks: hay que saber si la GPU va saturada con FG (generación FSR 3 ≈ 2–3 ms de GPU por
+  frame a 1440p). **Prueba pendiente (barata)**: la misma zona con `Jugar.cmd` → 1 (sin FG): si los segundos lentos
+  desaparecen, el límite en esa zona es la GPU con FG, no la CPU, y el ataque cambia (trabajo de GPU: resolución
+  interna del FG, pases de post, barreras), no la traducción.
