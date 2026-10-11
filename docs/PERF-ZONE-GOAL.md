@@ -122,3 +122,14 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   puntos que el jugador marca con F6 (`_Build/waypoints/route-*.txt`, del desarrollador: 9fde675) y los recorre solo
   (`glide` a 5 m/s, giro de cámara 3 s en cada punto, por el fichero `live.txt`): misma ruta y velocidad en cada
   versión. La pasada 3 se decide con esa ruta (A: KYTY_SYNC_STATS=1, B: =0, mismo ejecutable).
+- 2026-10-11, **pasada 3, con ruta** (169d1a9, `route-20261011-212419.txt`, 8 puntos/137 m; logs `_Build/run-logs/`
+  213112, 213836, 214813 = A, `logs/` 212214 = B; 7 vueltas). A (sonda encendida): real 59,3–59,9 de media, 76–85 % de
+  segundos ≥ 59, cpu 10,4–11,7 ms. B (apagada): 59,4–59,8, 78–86 %, cpu 10,5–10,7 ms. **Pasada 3: real 59,6 → 59,6 fps,
+  cpu 10,9 → 10,6 ms, sync_download 0,6 → 0,6 ms, gpu_wait 0,1 → 0,1 ms: dentro del ruido, se revierte** (las configs
+  quedan como estaban: `fsr3.json` con KYTY_SYNC_STATS=1 para diagnosticar, las otras dos a 0). Lección: la ruta
+  grabada va al tope de 60 fps casi siempre (1–2,7 ms de reposo por frame), así que no pisa la zona mala y no puede
+  medir una mejora de CPU. Siguiente: grabar la ruta con F6 **donde caen los fps** (dragón / Boletaria) y medir
+  también `cpu` ms del hilo de render, no solo fps. Lanzador: `run-windows-kyty.ps1` escribía los logs en
+  `_Build/run-logs` cuando existía `_Build` (creada por F6); corregido para que siempre use `logs/`. `Medir.cmd`
+  (nuevo) hace las vueltas solo: arranca con `fsr3.json`, pulsa Cruz hasta que aparece "FSR3 FG: on", recorre la ruta
+  N veces y cierra.
