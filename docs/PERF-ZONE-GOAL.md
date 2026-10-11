@@ -107,3 +107,12 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   GPU 0. En los frames lentos (40 fuera de cargas): `xpr` 9,8 ms (10–13 K `table_draws` por frame), `dispatch` 5,3 ms,
   `upload_wait` 4,6 ms, `draw_us` 1,5 ms. Siguiente: perfil del hilo de render en la zona lenta con la build integrada
   (`medir.cmd`) y atacar el mayor (los draws de tablas / XPR).
+- 2026-10-11, **perfil** (169d1a9, `prof-1791745431`, castillo, 10 s = 472 frames ≈ 47 fps, 40 000 muestras del hilo
+  de render): ocupado 87 %. Reparto del tiempo: `TableEvaluate` 16,4 % **de los que 8,6 % son los dos `rdtsc` de mi
+  sonda `[gpuread]`** (KYTY_SYNC_STATS=1 en las configs: ~1,8 ms por frame); esperas (CondVar) 12,9 % (9,7 % sin
+  trabajo del juego, 3,2 % el flip); `ProcessPm4` 6,4 %; `TableBlocks` 4,4 %; `VirtualProtect` 4,1 %; `TableDraw` 3,8 %;
+  `TableGather` 2,4 %; `NativeXprTry` 2,3 %; `FindBuffer`+`ObtainBuffer` 5,6 %. Census por frame: 5471 draws indirectos
+  de tabla (5,2 ms, 0,95 µs cada uno) + 2939 draws directos (3,45 ms, 1,18 µs) + 2821 dispatch (4,1 ms; 1603 en cómputo
+  asíncrono 3,0 ms; 826 son el memset, 0,41 ms). **Pasada 3**: KYTY_SYNC_STATS=0 en las tres configs (las esperas ya
+  están resueltas; la sonda costaba 1,8 ms/frame); mismo ejecutable. Techo: −1,8 ms/frame. Luego: `VirtualProtect`
+  (0,9 ms), `TableEvaluate` restante (1,6 ms), `TableBlocks` (0,9 ms).
