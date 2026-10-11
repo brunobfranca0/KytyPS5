@@ -44,6 +44,7 @@ modo rendimiento del juego. Carpeta de juego `C:\KytyPS5-juego`, lanzador `Jugar
 | 185047 (FSR3 x2, 4 min, medición) | b28e99f | 42 % | 36,4 / 52,4 | 47 % | 12,5 | 3,57 | 2,99 | 48,9 K | 82,6 K | 845 ms | 11,4 / 22,3 GB |
 | 192138 (FSR3 x2, 3,5 min, pasada 1) | 684e189 | 29 % | 20,2 / 50,3 | 46 % | 12,8 | 4,08 | 3,62 | 46,3 K | 79,7 K | 843 ms | 11,6 / 22,2 GB |
 | 195924 (FSR3 x2, 4,5 min, pasada 2) | 318794b | 33 % | 33,9 / 54,3 | 65 % | 13,8 | 0,61 | 0,09 | 67,5 K | 112 K | 850 ms | 12,5 / 23,5 GB |
+| 204612 (FSR3 x2, 7 min, castillo, integrada) | 169d1a9 | 66 % | 16,1 / 57,8 | 92 % | 10,8 | 0,01 | 0,00 | 61,2 K | 104 K | 875 ms (creación del contexto FSR 3 al arrancar) | 11,4 / 22,2 GB |
 
 Segundos lentos (~44 fps) frente a los rápidos (60) en 181236: frame 23,0 vs 16,7 ms; `cpu` 15,3 vs 8,8; `download` 7,1
 vs 2,6; `gpu_wait` 5,6 vs 1,8. Es decir, **unos 7 ms por frame de esperas síncronas a la GPU** y 6,5 ms más de CPU del
@@ -70,8 +71,12 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
       cada flip) y el mío por presupuesto (al acercarse a KYTY_VRAM_BUDGET_MB) se complementan; se dejan los dos y se
       mide VRAM/fallos/fps en la ruta. La skill `.claude/skills/ps5-emu-optimization` local ya es un superconjunto de la
       rama `docs/ai-optimization-skill` (aaa9e7c): se conserva la local. FSR 3 intacto (sin conflictos en frame-gen,
-      fsr3-fg, swapchain, videoOut). Pendiente: compilar, comprobar FSR 3 en el log, medir la ruta.
-- [ ] **Z3 Esperas a la GPU restantes**: lo que quede en `[sync]` tras Z1 (lecturas de la CPU del juego, `CopyBuffer`).
+      fsr3-fg, swapchain, videoOut). **Hecho** (log 204612): FSR 3 activo (`FSR3 FG: on`, shown = 2 × real salvo en
+      las 6 transiciones), apagado en menú/carga (2 veces); real 54,3 → 57,8 fps de media, 66 % de segundos ≥ 59,
+      over25=0 en el 92 %, descargas síncronas 0,61 → 0,01 ms, VRAM 12,5 → 11,4 GB, fallos 67 → 61 K/s, cpu 13,8 →
+      10,8 ms (ruta distinta: castillo de Boletaria; el jugador no vio nada roto). Los dos recolectores se quedan.
+- [x] **Z3 Esperas a la GPU restantes**: tras Z1b y la rama del desarrollador quedan 7 ms de descargas por 10 s (de
+      2500): resuelto para esta zona.
 - [ ] **Z4 CPU del hilo de render**: ~8000 draws indirectos por frame (`table_draws`), `TableEvaluate`, `VirtualProtect`.
 - [ ] **Z5 VRAM**: con y sin `KYTY_VRAM_BUDGET_MB=8192`.
 
@@ -97,3 +102,8 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   `!is_allocated(id)` en NativeXprTry: `FrameGen::FlipOf` indexaba `m_slot_images` con un id de destino de un draw de
   tabla cuya imagen ya se había borrado (se pregunta antes de comprobar los ids). Corregido (83a9ad4: `TryGetImage`).
   El jugador no vio texturas rotas.
+- 2026-10-11, **integración** (169d1a9, log 204612, castillo de Boletaria 7 min): ver tabla. Lo que queda son los
+  segundos lentos **de CPU**: en ellos `cpu` 15,9 ms frente a 9,0 en los rápidos, `idle` 3,7 frente a 1,1, esperas a la
+  GPU 0. En los frames lentos (40 fuera de cargas): `xpr` 9,8 ms (10–13 K `table_draws` por frame), `dispatch` 5,3 ms,
+  `upload_wait` 4,6 ms, `draw_us` 1,5 ms. Siguiente: perfil del hilo de render en la zona lenta con la build integrada
+  (`medir.cmd`) y atacar el mayor (los draws de tablas / XPR).
