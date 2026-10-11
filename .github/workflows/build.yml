@@ -135,8 +135,21 @@ jobs:
         env:
           KYTY_CMAKE_ARGS: -DKYTY_MARCH=x86-64-v3 ${{ inputs.pgo_generate == true && '-DKYTY_PGO_GENERATE=ON' || '' }}
         run: |
-          call build-windows.cmd kyty_emulator || exit /b 1
-          call build-windows.cmd kyty_shader_precompile || exit /b 1
+          call build-windows.cmd kyty_emulator > build.log 2>&1 || (type build.log & exit /b 1)
+          call build-windows.cmd kyty_shader_precompile >> build.log 2>&1 || (type build.log & exit /b 1)
+          type build.log
+
+      - name: Build errors
+        if: failure()
+        shell: pwsh
+        run: |
+          # The compiler's errors as annotations (readable through the API when the log is not).
+          if (Test-Path build.log) {
+            Select-String -Path build.log -Pattern 'error' | Select-Object -First 10 | ForEach-Object {
+              $line = $_.Line -replace '[\r\n]', ' '
+              Write-Output "::error::$line"
+            }
+          }
 
       - name: Package
         shell: pwsh

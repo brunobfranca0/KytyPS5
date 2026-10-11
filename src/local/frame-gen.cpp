@@ -969,6 +969,13 @@ int UiOverride() {
 	}();
 	return value;
 }
+bool UiDebug() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_FSR3_UI_DEBUG");
+		return text != nullptr && *text == '1';
+	}();
+	return value;
+}
 bool Rgba8(vk::Format format) {
 	switch (format) {
 		case vk::Format::eR8G8B8A8Unorm:
@@ -1099,7 +1106,9 @@ void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageI
 	CopyInto(vk_command, flip, g_hudless);
 	// Everything back.
 	CopyBack(vk_command, g_flip_backup, flip);
-	CopyBack(vk_command, g_ui_backup, ui);
+	// KYTY_FSR3_UI_DEBUG=1: the HUD texture is left cleared, so the game's own draw shows the picture without what
+	// was taken as the HUD (everything that vanishes from the screen is what frame generation keeps out).
+	if (!UiDebug()) CopyBack(vk_command, g_ui_backup, ui);
 	ui.Transit(ui_layout, vk::AccessFlagBits2::eShaderRead, {}, vk_command);
 	flip.Transit(flip_layout, flip_access, {}, vk_command);
 	if (in_pass) command.ResumeRendering(rendering);
