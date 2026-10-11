@@ -133,3 +133,17 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   `_Build/run-logs` cuando existía `_Build` (creada por F6); corregido para que siempre use `logs/`. `Medir.cmd`
   (nuevo) hace las vueltas solo: arranca con `fsr3.json`, pulsa Cruz hasta que aparece "FSR3 FG: on", recorre la ruta
   N veces y cierra.
+- 2026-10-11, **referencia de la zona mala** (169d1a9, log `logs/20261011-220008-577`, el jugador por el camino del
+  dragón; ruta F6 `route-20261011-220103.txt`, 4 puntos, 300 m): 233 s, mediana 60 fps, p5 44,3, 52 s por debajo de
+  55. Frame lento típico (26,5 ms): cpu del hilo de render 19,4 ms, reposo 7, **gpu_wait 0, download 0**: puro CPU.
+  Reparto: xpr 8,7 ms (indirectos 4,5 + directos 4,1) con 10 810 draws de tabla por frame (3 000–8 000 en el resto
+  del castillo), dispatch.table 5,0 ms, linear_copy 0,6, upload_wait 0,4; 20 MB subidos por frame, 1 250 region
+  syncs, 103 000 llamadas a protección por segundo (51 600 fallos de ventana). Perfil de la zona (prof 21:05, mismo
+  ejecutable): TableEvaluate 16,4 % propio (la sonda [gpuread] ~8,6 %), esperas 12,9 %, ProcessPm4 6,4 %, TableBlocks
+  4,4 %, VirtualProtect 4,1 %, TableDraw 3,8 %, TableGather 2,4 %, FindBuffer+ObtainBuffer 5,6 %; inclusivo TableDraw
+  30,5 %, DispatchDirect 26,9 %, TableDispatch 21,9 %, TableBlocks 12,3 %.
+- 2026-10-11, **pasada 4** (8b03bc8): la sonda por run de TableEvaluate (dos rdtsc y una búsqueda por run; KYTY_SYNC_STATS
+  la encendía en `fsr3.json`) pasa a su propio interruptor `KYTY_GPUREAD_PROBE`, apagado. Techo: ~1,5 ms por frame
+  lento (8,6 % de 19,4 ms), que en esa zona está en el camino crítico (CPU puro). Se mide en la misma zona: cpu ms del
+  hilo de render en los segundos lentos y p5 de fps real. Siguientes: dispatch.table (5 ms: evaluación de tablas de
+  ~2 800 dispatches, 1,8 us cada uno), TableBlocks/ObtainBuffer (12 %), VirtualProtect (4 %).
