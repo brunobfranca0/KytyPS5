@@ -1,15 +1,18 @@
 #include "frame-gen.h"
 #include "fsr3-fg.h"
+#include "live-census.h"
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderTarget.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 #ifndef NOMINMAX
@@ -764,9 +767,132 @@ void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId
 	g_sources = {depth, motion, depth_address, motion_address, true};
 }
 
+namespace {
+
+// FSR 3's HUD-less image: the flip image before the game draws its HUD on it. The 3D scene reaches it in the first
+// render pass of the frame into it (KYTY_FSR3_HUDLESS_PASS: the pass before which it is copied, 2 by default: the
+// scene's full-screen pass is the first, the HUD's draws come after); the copy is taken as that pass begins.
+struct FlipTarget {
+	ImageId                    id;
+	vk::Image                  image   = nullptr;
+	uint64_t                   address = 0;
+	std::vector<vk::ImageView> views;
+};
+std::array<FlipTarget, 4> g_flips {};
+uint32_t                  g_flip_next    = 0;
+TextureCache*             g_cache        = nullptr;
+GraphicContext*           g_graphics_ctx = nullptr;
+VulkanImage               g_hudless;
+vk::ImageView             g_hudless_view = nullptr;
+uint32_t                  g_flip_renders = 0;
+bool                      g_hudless_taken = false;
+uint32_t                  g_hudless_logs  = 0;
+
+bool HudlessWanted() {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_FSR3_HUDLESS");
+		return value == nullptr || *value == '\0' || *value != '0';
+	}();
+	return wanted;
+}
+uint32_t HudlessPass() {
+	static const uint32_t pass = [] {
+		const char* value = std::getenv("KYTY_FSR3_HUDLESS_PASS");
+		const int   n     = value != nullptr ? std::atoi(value) : 2;
+		return static_cast<uint32_t>(std::clamp(n, 1, 16));
+	}();
+	return pass;
+}
+vk::Format UnormOf(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Srgb: return vk::Format::eR8G8B8A8Unorm;
+		case vk::Format::eB8G8R8A8Srgb: return vk::Format::eB8G8R8A8Unorm;
+		default: return format;
+	}
+}
+// `image` as a sampled copy target of that format and size.
+void ConfigureAs(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view, vk::Format format, vk::Extent3D extent) {
+	if (image.image != nullptr && image.format == format && image.extent.width == extent.width &&
+	    image.extent.height == extent.height)
+		return;
+	VulkanImage source {};
+	source.format = format;
+	source.extent = extent;
+	Configure(graphics, image, view, source);
+}
+// A raw copy between two images of one size (formats of one class).
+void CopyRaw(vk::CommandBuffer command, VulkanImage& source, VulkanImage& target) {
+	Transition(command, source, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+	Transition(command, target, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = target.extent;
+	command.copyImage(source.image, vk::ImageLayout::eTransferSrcOptimal, target.image,
+	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	for (auto* image: {&source, &target})
+		Transition(command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+}
+
+} // namespace
+
+void OnBeginRendering(CommandBuffer& command, const RenderState& state) {
+	if (!LiveCensus::g_render || !Capturing() || !HudlessWanted() || g_cache == nullptr || g_graphics_ctx == nullptr) return;
+	const FlipTarget* flip       = nullptr;
+	uint32_t          attachment = 0;
+	for (uint32_t i = 0; i < state.num_color_attachments && flip == nullptr; ++i) {
+		const auto view = state.color_attachments[i].image_view;
+		if (view == nullptr) continue;
+		for (const auto& target: g_flips)
+			if (std::find(target.views.begin(), target.views.end(), view) != target.views.end()) {
+				flip       = &target;
+				attachment = i;
+				break;
+			}
+	}
+	if (flip == nullptr) return;
+	++g_flip_renders;
+	if (g_hudless_taken || g_flip_renders != HudlessPass()) return;
+	auto& image = g_cache->GetImage(flip->id);
+	if (image.backing.image != flip->image || image.info.data.address != flip->address) return;
+	ConfigureAs(*g_graphics_ctx, g_hudless, g_hudless_view, UnormOf(image.backing.format), image.backing.extent);
+	auto vk_command = command.Handle();
+	CopyInto(vk_command, image, g_hudless);
+	// Back as the render pass expects it.
+	image.Transit(state.color_attachments[attachment].image_layout,
+	              vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite, {}, vk_command);
+	g_hudless_taken = true;
+}
+
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
-                   FrameInputs& inputs) {
-	inputs.valid = false;
+                   FrameInputs& inputs, ImageId flip_id, Image& flip) {
+	inputs.valid       = false;
+	inputs.has_hudless = false;
+	g_cache            = &cache;
+	g_graphics_ctx     = &graphics;
+	// The flip images (two or three alternate): their views as render targets.
+	{
+		FlipTarget* target = nullptr;
+		for (auto& candidate: g_flips)
+			if (candidate.image == flip.backing.image && candidate.address == flip.info.data.address) target = &candidate;
+		if (target == nullptr) {
+			target  = &g_flips[g_flip_next];
+			g_flip_next = (g_flip_next + 1) % static_cast<uint32_t>(g_flips.size());
+		}
+		target->id      = flip_id;
+		target->image   = flip.backing.image;
+		target->address = flip.info.data.address;
+		target->views.clear();
+		for (const auto& view: flip.views)
+			if (view.view != nullptr) target->views.push_back(view.view);
+	}
+	const bool hudless       = g_hudless_taken && g_hudless.image != nullptr;
+	const auto flip_renders  = g_flip_renders;
+	g_hudless_taken          = false;
+	g_flip_renders           = 0;
 	// (DLSS-G needs the camera; FSR 3 only the TAA pass's images: the G-buffer draws that hold the camera mostly
 	// take the table path, which does not report it, and generation went on and off from frame to frame.)
 	const bool ready = g_sources.valid && (g_camera.valid || !g_ready);
@@ -795,6 +921,17 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	if (inputs.motion_attachment) {
 		ZeroStaticRect(vk_command, inputs.motion, inputs.motion_view);
 	}
+	if (hudless && HudlessWanted()) {
+		ConfigureAs(graphics, inputs.hudless, inputs.hudless_view, g_hudless.format, vk::Extent3D {g_hudless.extent.width, g_hudless.extent.height, 1});
+		CopyRaw(vk_command, g_hudless, inputs.hudless);
+		inputs.has_hudless = true;
+	}
+	if (g_hudless_logs < 12) {
+		++g_hudless_logs;
+		std::printf("FSR3 HUD-less: %u render passes into the flip image this frame, copy before pass %u: %s\n", flip_renders,
+		            HudlessPass(), hudless ? "taken" : "none");
+		std::fflush(stdout);
+	}
 	inputs.render_extent = {motion.backing.extent.width, motion.backing.extent.height};
 	inputs.camera        = camera;
 	inputs.guest_frame   = g_guest_frame;
@@ -802,13 +939,13 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 }
 
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
-	for (auto* view: {&inputs.depth_view, &inputs.motion_view}) {
+	for (auto* view: {&inputs.depth_view, &inputs.motion_view, &inputs.hudless_view}) {
 		if (*view != nullptr) {
 			graphics.device.destroyImageView(*view, nullptr);
 			*view = nullptr;
 		}
 	}
-	for (auto* image: {&inputs.depth, &inputs.motion}) {
+	for (auto* image: {&inputs.depth, &inputs.motion, &inputs.hudless}) {
 		if (image->image != nullptr) {
 			graphics.DeleteImage(*image);
 		}

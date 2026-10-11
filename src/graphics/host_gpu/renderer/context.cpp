@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "frame-gen.h"
 #include "live-counters.h"
 #include "live-trace.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -208,6 +209,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		return;
 	}
 	EndRendering();
+	// FSR 3 frame generation: the image before the HUD (a pass into the flip image, frame-gen.h).
+	FrameGen::OnBeginRendering(const_cast<CommandBuffer&>(*this), state);
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {

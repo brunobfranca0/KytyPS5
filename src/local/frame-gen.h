@@ -16,6 +16,7 @@
 #include <span>
 
 namespace Libs::Graphics {
+struct RenderState;
 class CommandBuffer;
 class TextureCache;
 namespace FrameGen {
@@ -48,6 +49,11 @@ struct FrameInputs {
 	Camera        camera;
 	uint64_t      guest_frame = 0;
 	bool          motion_attachment = false; // the motion copy is a color attachment too
+	// FSR 3: the game's image before its HUD (the flip image as the first render pass after the 3D scene found it),
+	// copied at the guest flip; its pixels as the flip image's (a UNORM format).
+	VulkanImage   hudless;
+	vk::ImageView hudless_view = nullptr;
+	bool          has_hudless  = false;
 	bool          valid       = false;
 };
 
@@ -85,8 +91,12 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> flattened_srt);
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,
                 uint64_t motion_address);
 // At the guest flip, in the frame's command buffer: copy the gathered images into `inputs`.
+// `flip` (`flip_id`): the image this flip shows (the HUD-less image is taken from the next ones like it).
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
-                   FrameInputs& inputs);
+                   FrameInputs& inputs, ImageId flip_id, Image& flip);
+// Renderer thread, as a render pass begins (CommandBuffer::BeginRendering, after the previous one ended): a pass into
+// a recent flip image; the HUD-less copy is taken before the one the HUD starts with.
+void OnBeginRendering(CommandBuffer& command, const RenderState& state);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
 
 } // namespace FrameGen

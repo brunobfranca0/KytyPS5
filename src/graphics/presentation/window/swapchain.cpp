@@ -360,7 +360,7 @@ struct Presenter::Impl {
 		frames.SetFormat(swapchain.Format());
 	}
 
-	Image& ResolveSurface(const ImageInfo& info) {
+	Image& ResolveSurface(const ImageInfo& info, ImageId* out_id = nullptr) {
 		TextureCache::ImageDesc desc {};
 		desc.info                  = info;
 		desc.view_info.format      = info.pixel_format;
@@ -375,6 +375,7 @@ struct Presenter::Impl {
 
 		auto&      cache      = renderer.GetTextureCache();
 		const auto image_id   = cache.FindImage(desc);
+		if (out_id != nullptr) *out_id = image_id;
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
 		cache.UpdateImage(image_id);
@@ -900,7 +901,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	EXIT_IF(buffer.IsInvalid());
 	auto*             frame = m_impl->frames.Acquire();
 	RenderLockGuard render_lock(m_impl->renderer.GetMutex());
-	auto&             image = m_impl->ResolveSurface(info);
+	ImageId           image_id {};
+	auto&             image = m_impl->ResolveSurface(info, &image_id);
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
@@ -917,7 +919,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->fg.valid = false;
 	if (FrameGen::Capturing()) {
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
-		                        buffer, frame->fg);
+		                        buffer, frame->fg, image_id, image);
 	}
 	return *frame;
 }

@@ -73,6 +73,10 @@ VkCommandPool         g_pool = VK_NULL_HANDLE;
 std::array<Slot, 4>   g_slots {};
 uint32_t              g_slot = 0;
 
+// The HUD-less image at the backbuffer's size and format (the frame's copy scaled as the backbuffer's).
+VulkanImage g_present_hudless;
+bool        g_present_hudless_ready = false;
+
 uint64_t g_frame_id      = 0;
 bool     g_generating    = false; // the last frame had generation on
 int      g_state_logged  = -1;
@@ -172,6 +176,71 @@ bool CreateFrameGeneration(GraphicContext& graphics, vk::Extent2D display, vk::E
 	            render.width, render.height, normal ? "as is" : "reversed, infinite");
 	std::fflush(stdout);
 	return true;
+}
+
+bool EnsurePresentHudless(GraphicContext& graphics, vk::Extent2D extent, vk::Format format) {
+	if (g_present_hudless.image != nullptr && g_present_hudless.format == format &&
+	    g_present_hudless.extent.width == extent.width && g_present_hudless.extent.height == extent.height)
+		return true;
+	if (g_present_hudless.image != nullptr) graphics.DeleteImage(g_present_hudless);
+	g_present_hudless = {};
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = format;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, g_present_hudless)) {
+		g_present_hudless = {};
+		return false;
+	}
+	return true;
+}
+
+// The frame's HUD-less copy scaled into g_present_hudless (as the presenter scales the frame into the backbuffer).
+void RecordHudlessBlit(VkDevice device, VkCommandBuffer command, const VulkanImage& source) {
+	static auto* barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(g_get_device_proc(device, "vkCmdPipelineBarrier"));
+	static auto* blit    = reinterpret_cast<PFN_vkCmdBlitImage>(g_get_device_proc(device, "vkCmdBlitImage"));
+	VkImageMemoryBarrier barriers[2] {};
+	for (auto& b: barriers) {
+		b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	}
+	barriers[0].image         = static_cast<VkImage>(source.image);
+	barriers[0].oldLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	barriers[0].newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	barriers[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+	barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	barriers[1].image         = static_cast<VkImage>(g_present_hudless.image);
+	barriers[1].oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
+	barriers[1].newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	barriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+	VkImageBlit region {};
+	region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	region.srcOffsets[1]  = {static_cast<int32_t>(source.extent.width), static_cast<int32_t>(source.extent.height), 1};
+	region.dstOffsets[1]  = {static_cast<int32_t>(g_present_hudless.extent.width),
+	                         static_cast<int32_t>(g_present_hudless.extent.height), 1};
+	blit(command, static_cast<VkImage>(source.image), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	     static_cast<VkImage>(g_present_hudless.image), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+	barriers[0].oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	barriers[0].newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	barriers[1].oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	barriers[1].newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
 }
 
 bool EnsureCommandBuffers(GraphicContext& graphics) {
@@ -492,7 +561,23 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	config.frameGenerationCallbackUserContext = &g_fg_context;
 	config.frameGenerationEnabled             = generate;
 	config.allowAsyncWorkloads                = EnvOn("KYTY_FSR3_ASYNC", false);
-	config.HUDLessColor                       = FfxApiResource {};
+	// The HUD-less image (the frame's, scaled to the backbuffer below): FSR 3 keeps the HUD out of the generated frames.
+	const bool hudless = generate && inputs->has_hudless && inputs->hudless.image != nullptr &&
+	                     EnsurePresentHudless(graphics, backbuffer, format);
+	config.HUDLessColor = FfxApiResource {};
+	if (hudless) {
+		auto& resource                   = config.HUDLessColor;
+		resource.resource                = static_cast<void*>(static_cast<VkImage>(g_present_hudless.image));
+		resource.state                   = FFX_API_RESOURCE_STATE_COMPUTE_READ;
+		resource.description.type        = FFX_API_RESOURCE_TYPE_TEXTURE2D;
+		resource.description.format      = ffxApiGetSurfaceFormatVK(static_cast<VkFormat>(format));
+		resource.description.width       = backbuffer.width;
+		resource.description.height      = backbuffer.height;
+		resource.description.depth       = 1;
+		resource.description.mipCount    = 1;
+		resource.description.flags       = FFX_API_RESOURCE_FLAGS_NONE;
+		resource.description.usage       = FFX_API_RESOURCE_USAGE_READ_ONLY;
+	}
 	config.flags = EnvOn("KYTY_FSR3_DEBUG_VIEW", false) ? static_cast<uint32_t>(FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW) : 0u;
 	config.onlyPresentGenerated = false;
 	config.generationRect       = {0, 0, static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height)};
@@ -532,6 +617,7 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	begin_cb(slot.command, &begin);
 
+	if (hudless) RecordHudlessBlit(device, slot.command, inputs->hudless);
 	const auto& camera = FromCamera(inputs->camera);
 	static const float mv_sign = EnvFloat("KYTY_FSR3_MV_SIGN", -1.0f) >= 0 ? 1.0f : -1.0f;
 	ffxDispatchDescFrameGenerationPrepare prepare {};
@@ -586,8 +672,9 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	g_stats.prepare_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prepare_begin).count();
 	g_stats.generated_on++;
 	if (!g_generating) {
-		std::printf("FSR3 FG: on (TAA pass: %ux%u depth and motion vectors, camera %s)\n", inputs->render_extent.width,
-		            inputs->render_extent.height, camera.valid ? "found" : "default");
+		std::printf("FSR3 FG: on (TAA pass: %ux%u depth and motion vectors, camera %s, HUD-less image %s)\n",
+		            inputs->render_extent.width, inputs->render_extent.height, camera.valid ? "found" : "default",
+		            hudless ? "yes" : "no");
 		std::fflush(stdout);
 		g_state_logged = 2;
 	}
