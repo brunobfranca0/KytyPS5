@@ -11,4 +11,6 @@ void Note(uint32_t kind, int64_t ns) noexcept;
 // The compute shader of the dispatch being translated (its code address; 0 a draw or none): the waits are listed per
 // shader too.
 inline thread_local uint64_t g_shader = 0;
+// The guest address the render thread's last read fault was at (a synchronous download's): listed with the waits.
+inline thread_local uint64_t g_fault_address = 0;
 } // namespace SyncStats

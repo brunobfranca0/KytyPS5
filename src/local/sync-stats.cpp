@@ -27,6 +27,7 @@ struct Entry {
 	std::array<uint64_t, Frames> stack {};
 	uint32_t                     kind  = 0;
 	uint64_t                     shader = 0;
+	uint64_t                     address = 0;
 	uint64_t                     calls = 0;
 	int64_t                      ns    = 0;
 	bool                         used  = false;
@@ -46,8 +47,8 @@ void Print() {
 	std::printf("[sync] 10 s: GPU waits %.1f ms, synchronous downloads %.1f ms (render thread)\n", total[0] / 1e6, total[1] / 1e6);
 	for (size_t i = 0; i < std::min<size_t>(entries.size(), 16); ++i) {
 		const auto& entry = *entries[i];
-		std::printf("[sync]  %s %7.1f ms %6" PRIu64 " calls, CS 0x%" PRIx64 ":", entry.kind == 0 ? "gpu " : "down", entry.ns / 1e6,
-		            entry.calls, entry.shader);
+		std::printf("[sync]  %s %7.1f ms %6" PRIu64 " calls, CS 0x%" PRIx64 " at 0x%" PRIx64 ":", entry.kind == 0 ? "gpu " : "down",
+		            entry.ns / 1e6, entry.calls, entry.shader, entry.address);
 		// (The emulator's frames only: through an exception handler the faulting code's frames come after the
 		// system's.)
 		for (const auto frame: entry.stack)
@@ -96,6 +97,7 @@ void Note(uint32_t kind, int64_t ns) noexcept {
 		}
 		entry.calls++;
 		entry.ns += ns;
+		entry.address = g_fault_address;
 		break;
 	}
 	const auto now = std::chrono::steady_clock::now();

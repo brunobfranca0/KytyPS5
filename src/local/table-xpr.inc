@@ -835,31 +835,34 @@ static uint32_t TableCodeWord(const ShaderRecompiler::IR::TablePlan::Operand& op
 // slots (a pointer read from memory may hold anything: what is read through it must be mapped), and the T#/S# words
 // they make (TableXpr::words, the set's key) and the pixel stage's LOD statistics words. False: something unmapped.
 namespace {
-// KYTY_SYNC_STATS: the table reads of GPU-written memory (each one waits for the GPU), per shader and run: how often,
-// whether the words changed since the run's previous read (served from the previous frame they would be right when
-// they did not), and whether the CPU needs them (to resolve resources) or only the shader reads them (a GPU copy
-// could provide those). Every 10 s.
+// KYTY_SYNC_STATS: the table reads that waited (> 20 us: a synchronous download of GPU-written memory), per shader and
+// run: how often, the time, whether the words changed since the run's previous read (served from the previous frame
+// they would be right when they did not), the words before and now, and whether the CPU needs them (to resolve
+// resources) or only the shader reads them. Every 10 s.
 struct GpuReadProbe {
 	uint64_t shader = 0;
 	uint32_t stage = 0, run = 0, first = 0, count = 0, level = 0, cpu = 0, gpu = 0;
-	uint64_t address = 0, hash = 0, reads = 0, same = 0, changed = 0;
+	uint64_t address = 0, hash = 0, reads = 0, waits = 0, wait_ns = 0, same = 0, changed = 0;
+	std::array<uint32_t, 4> before {}, now {};
 	bool     used = false;
 };
-std::array<GpuReadProbe, 512>         g_gpu_read_probes {};
+std::array<GpuReadProbe, 1024>        g_gpu_read_probes {};
 std::chrono::steady_clock::time_point g_gpu_read_start {};
 void GpuReadProbePrint() {
 	std::vector<const GpuReadProbe*> list;
 	for (const auto& probe: g_gpu_read_probes)
-		if (probe.used) list.push_back(&probe);
-	std::sort(list.begin(), list.end(), [](auto* a, auto* b) { return a->reads > b->reads; });
-	std::printf("[gpuread] 10 s: %zu table runs read GPU-written memory\n", list.size());
-	for (size_t i = 0; i < std::min<size_t>(list.size(), 12); ++i) {
+		if (probe.used && probe.waits != 0) list.push_back(&probe);
+	std::sort(list.begin(), list.end(), [](auto* a, auto* b) { return a->wait_ns > b->wait_ns; });
+	std::printf("[gpuread] 10 s: %zu table runs waited\n", list.size());
+	for (size_t i = 0; i < std::min<size_t>(list.size(), 10); ++i) {
 		const auto& p = *list[i];
-		std::printf("[gpuread]  CS 0x%llx stage %u run %u (slots %u+%u, level %u, cpu %u, gpu %u) at 0x%llx: %llu reads, "
-		            "%llu same as before, %llu changed\n",
+		std::printf("[gpuread]  0x%llx st %u run %u (slots %u+%u lvl %u cpu %u gpu %u) at 0x%llx: %llu reads, %llu waits "
+		            "%.1f ms, %llu same %llu changed; before %08x %08x %08x %08x now %08x %08x %08x %08x\n",
 		            static_cast<unsigned long long>(p.shader), p.stage, p.run, p.first, p.count, p.level, p.cpu, p.gpu,
 		            static_cast<unsigned long long>(p.address), static_cast<unsigned long long>(p.reads),
-		            static_cast<unsigned long long>(p.same), static_cast<unsigned long long>(p.changed));
+		            static_cast<unsigned long long>(p.waits), p.wait_ns / 1e6, static_cast<unsigned long long>(p.same),
+		            static_cast<unsigned long long>(p.changed), p.before[0], p.before[1], p.before[2], p.before[3], p.now[0],
+		            p.now[1], p.now[2], p.now[3]);
 	}
 	std::fflush(stdout);
 	g_gpu_read_probes = {};
@@ -883,19 +886,26 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 	// (KYTY_SYNC_STATS) A run read through `reader`, noted when its memory is GPU-written.
 	const auto read_run = [&](uint32_t st, uint32_t index, uint64_t address, uint32_t count, uint32_t first,
 	                          uint32_t* out) {
-		if (!probing || !m_context.GetBufferCache().IsRegionGpuModified(address, uint64_t {count} * 4u)) {
+		if (!probing) {
 			reader.Read(address, count, out);
 			return;
 		}
+		const auto begin = std::chrono::steady_clock::now();
 		reader.Read(address, count, out);
+		const auto end   = std::chrono::steady_clock::now();
+		const auto ns    = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+		const uint64_t key   = pair.vs * 31u + st * 7919u + index;
+		auto&          probe = g_gpu_read_probes[(key * 0x9e3779b97f4a7c15ull) >> 54u];
+		const bool     mine  = probe.used && probe.shader == pair.vs && probe.stage == st && probe.run == index;
+		if (!mine && ns < 20000) return; // (only runs that waited once are followed)
 		const uint64_t hash = XXH3_64bits(out, uint64_t {count} * 4u);
-		const uint64_t key  = pair.vs * 31u + st * 7919u + index;
-		auto&          probe = g_gpu_read_probes[(key * 0x9e3779b97f4a7c15ull) >> 55u];
-		if (!probe.used || probe.shader != pair.vs || probe.stage != st || probe.run != index) {
+		std::array<uint32_t, 4> words {};
+		std::copy_n(out, std::min<uint32_t>(count, 4u), words.begin());
+		if (!mine) {
 			const auto& plan = pair.programs[st]->table_plan;
 			const auto& run  = pair.runs[st][index];
 			probe = {.shader = pair.vs, .stage = st, .run = index, .first = first, .count = count, .level = run.level,
-			         .address = address, .hash = hash, .used = true};
+			         .address = address, .hash = hash, .now = words, .used = true};
 			for (uint32_t slot = first; slot < first + count && slot < plan.cpu.size(); ++slot) {
 				probe.cpu += plan.cpu[slot] != 0;
 				probe.gpu += slot < plan.gpu.size() && plan.gpu[slot] != 0;
@@ -904,14 +914,19 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 			++probe.same;
 		} else {
 			++probe.changed;
-			probe.hash = hash;
+			probe.hash   = hash;
+			probe.before = probe.now;
+			probe.now    = words;
 		}
 		++probe.reads;
-		const auto now = std::chrono::steady_clock::now();
-		if (g_gpu_read_start == std::chrono::steady_clock::time_point {}) g_gpu_read_start = now;
-		if (now - g_gpu_read_start >= std::chrono::seconds(10)) {
+		if (ns >= 20000) {
+			++probe.waits;
+			probe.wait_ns += ns;
+		}
+		if (g_gpu_read_start == std::chrono::steady_clock::time_point {}) g_gpu_read_start = end;
+		if (end - g_gpu_read_start >= std::chrono::seconds(10)) {
 			GpuReadProbePrint();
-			g_gpu_read_start = now;
+			g_gpu_read_start = end;
 		}
 	};
 	// A run's address, its pages proven mapped and its lines loading.

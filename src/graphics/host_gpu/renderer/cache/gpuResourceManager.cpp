@@ -1,3 +1,4 @@
+#include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "live-census.h"
 #include "live-counters.h"
@@ -118,6 +119,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 				CommandScheduler::SetThreadRecorder(recorder);
 			}
 		} normal_path;
+		SyncStats::g_fault_address = fault_vaddr;
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
