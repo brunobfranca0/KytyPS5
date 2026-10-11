@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 
@@ -38,6 +39,10 @@ static AudioPropagationHandle AudioPropagationNextHandle() {
 static int32_t KYTY_SYSV_ABI AudioPropagationSystemQueryMemory(
     const void* /*options*/, AudioPropagationSystemMemory* out_memory) {
 	PRINT_NAME();
+	{
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1) < 2) std::printf("AudioPropagation: SystemQueryMemory called (stub)\n");
+	}
 
 	if (out_memory != nullptr) {
 		out_memory->p_cpu_mem    = nullptr;
@@ -53,6 +58,10 @@ static int32_t KYTY_SYSV_ABI
 AudioPropagationSystemCreate(const void* /*options*/, AudioPropagationSystemMemory* /*memory*/,
                              AudioPropagationHandle* out_system_handle) {
 	PRINT_NAME();
+	{
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1) < 2) std::printf("AudioPropagation: SystemCreate called (stub)\n");
+	}
 
 	if (out_system_handle != nullptr) {
 		*out_system_handle = AudioPropagationNextHandle();
@@ -64,6 +73,10 @@ AudioPropagationSystemCreate(const void* /*options*/, AudioPropagationSystemMemo
 static int32_t KYTY_SYSV_ABI AudioPropagationRoomCreate(AudioPropagationHandle /*system_handle*/,
                                                         AudioPropagationHandle* out_room_handle) {
 	PRINT_NAME();
+	{
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1) < 2) std::printf("AudioPropagation: RoomCreate called (stub)\n");
+	}
 
 	if (out_room_handle != nullptr) {
 		*out_room_handle = AudioPropagationNextHandle();
@@ -76,6 +89,10 @@ static int32_t KYTY_SYSV_ABI AudioPropagationSystemRegisterMaterial(
     AudioPropagationHandle /*system_handle*/, const void* /*material*/,
     AudioPropagationHandle* out_material_handle) {
 	PRINT_NAME();
+	{
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1) < 2) std::printf("AudioPropagation: SystemRegisterMaterial called (stub)\n");
+	}
 
 	if (out_material_handle != nullptr) {
 		*out_material_handle = AudioPropagationNextHandle();
@@ -88,6 +105,10 @@ static int32_t KYTY_SYSV_ABI
 AudioPropagationSystemSetAttributes(AudioPropagationHandle /*system_handle*/,
                                     const void* /*attributes*/, uint32_t /*num_attributes*/) {
 	PRINT_NAME();
+	{
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1) < 2) std::printf("AudioPropagation: SystemSetAttributes called (stub)\n");
+	}
 
 	return 0;
 }
@@ -95,6 +116,10 @@ AudioPropagationSystemSetAttributes(AudioPropagationHandle /*system_handle*/,
 static int32_t KYTY_SYSV_ABI AudioPropagationSystemGetRays(AudioPropagationHandle /*system_handle*/,
                                                            void* /*rays*/, uint32_t* num_rays) {
 	PRINT_NAME();
+	{
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1) < 2) std::printf("AudioPropagation: SystemGetRays called (stub)\n");
+	}
 
 	if (num_rays != nullptr) {
 		*num_rays = 0;

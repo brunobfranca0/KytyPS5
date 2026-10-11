@@ -884,8 +884,25 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 	uint32_t    ambisonics     = 0;
 	bool        has_ambisonics = false;
 	for (uint32_t i = 0; i < num; i++) {
-		if (AudioInternal::StatsWanted())
-			g_audioout2_attr_counts[std::min<uint32_t>(attributes[i].attribute_id, 32)].fetch_add(1, std::memory_order_relaxed);
+		if (AudioInternal::StatsWanted()) {
+			const auto id = std::min<uint32_t>(attributes[i].attribute_id, 32);
+			g_audioout2_attr_counts[id].fetch_add(1, std::memory_order_relaxed);
+			// (In the run log: the first values of the attributes the mix does not read.)
+			static std::array<std::atomic<uint32_t>, 33> logged {};
+			if (id != AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM && logged[id].fetch_add(1, std::memory_order_relaxed) < 12 &&
+			    attributes[i].value != nullptr) {
+				char bytes[100] {};
+				size_t at = 0;
+				const auto* raw = static_cast<const uint8_t*>(attributes[i].value);
+				for (size_t b = 0; b < std::min<size_t>(attributes[i].value_size, 24); b++)
+					at += static_cast<size_t>(std::snprintf(bytes + at, sizeof(bytes) - at, "%02x", raw[b]));
+				float f[3] {};
+				std::memcpy(f, raw, std::min<size_t>(attributes[i].value_size, sizeof(f)));
+				std::printf("AudioOut2 port %llu attribute %u (%zu bytes): %s (as floats %g %g %g)\n", static_cast<unsigned long long>(port),
+				            attributes[i].attribute_id, attributes[i].value_size, bytes, static_cast<double>(f[0]),
+				            static_cast<double>(f[1]), static_cast<double>(f[2]));
+			}
+		}
 		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
 		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
 			AudioOut2Pcm pcm {};
