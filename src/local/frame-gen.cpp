@@ -1083,7 +1083,8 @@ void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageI
 	CopyInto(vk_command, ui, g_ui_backup);
 	// No HUD.
 	ui.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, vk_command);
-	const vk::ClearColorValue       transparent {std::array<uint32_t, 4> {0u, 0u, 0u, 0u}};
+	vk::ClearColorValue             transparent {};
+	transparent.uint32 = std::array<uint32_t, 4> {0u, 0u, 0u, 0u};
 	const vk::ImageSubresourceRange level {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
 	vk_command.clearColorImage(ui.backing.image, vk::ImageLayout::eTransferDstOptimal, &transparent, 1, &level);
 	ui.Transit(ui_layout, vk::AccessFlagBits2::eShaderRead, {}, vk_command);
