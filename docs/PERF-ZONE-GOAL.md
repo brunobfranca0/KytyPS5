@@ -172,3 +172,9 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   frame a 1440p). **Prueba pendiente (barata)**: la misma zona con `Jugar.cmd` → 1 (sin FG): si los segundos lentos
   desaparecen, el límite en esa zona es la GPU con FG, no la CPU, y el ataque cambia (trabajo de GPU: resolución
   interna del FG, pases de post, barreras), no la traducción.
+- 2026-10-12, **prueba sin FG** (8b03bc8, `sin-fg.json`, log 012001, misma zona, 179 s): fps media 55,5, p5 48,3,
+  46 % de segundos < 55; en ellos frame 19–21 ms = cpu 14–18 + reposo 3–5. **Igual que con FG**: la generación de
+  frames no cuesta nada medible y la GPU no es el límite. La zona es CPU: traducción (14–17 ms) + la latencia de la
+  cadena (3–5 ms de readbacks). Sigue el ataque a la traducción; con ~3 ms menos de cpu el frame cae bajo 16,7.
+  (Hoy el PC se colgó en negro una vez con 8b03bc8 a 60 fps en marcha; el log acaba limpio: driver/hardware, no el
+  emulador. Pendiente: visor de eventos a las 01:17.)
