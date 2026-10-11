@@ -580,6 +580,9 @@ void Swapchain::Create() {
 		                     "vkCreateSwapchainKHR");
 	}
 	EXIT_IF(m_handle == nullptr);
+	std::printf("Swapchain: %ux%u, present mode %d, %u images%s\n", m_extent.width, m_extent.height,
+	            static_cast<int>(create_info.presentMode), image_count, m_fsr3 ? " (FSR 3 frame generation)" : "");
+	std::fflush(stdout);
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
