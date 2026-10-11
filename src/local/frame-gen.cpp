@@ -1014,9 +1014,12 @@ bool Rgba8(vk::Format format) {
 }
 const FlipTarget* FlipOf(ImageId id) {
 	if (!id || g_cache == nullptr) return nullptr;
-	auto& image = g_cache->GetImage(id);
+	// (A table draw state's target id may name an image erased since: NativeXprTargetsCurrent asks before it checks
+	// the ids are live. GetImage asserted on one at the dragon's path, 2026-10-11.)
+	const auto* image = g_cache->TryGetImage(id);
+	if (image == nullptr) return nullptr;
 	for (const auto& target: g_flips)
-		if (target.image != nullptr && image.backing.image == target.image && image.info.data.address == target.address)
+		if (target.image != nullptr && image->backing.image == target.image && image->info.data.address == target.address)
 			return &target;
 	return nullptr;
 }
