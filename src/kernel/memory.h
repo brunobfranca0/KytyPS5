@@ -134,6 +134,8 @@ bool                   ReadFaults(uint64_t vaddr, uint64_t size);
 // The shader whose resources the GPU thread evaluates (KYTY_SYNC_LOG names it on a drain).
 extern thread_local uint64_t g_srt_shader_hash;
 bool                   IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size);
+// The other virtual ranges mapping the same bytes ({vaddr, size} each), for a range IsUniqueGuestBackingRange refused.
+bool                   GuestBackingAliases(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* aliases);
 // On failure, optionally return a static diagnostic string (no allocation).
 // The mapped parts of a guest range as they are, unmapped parts as zeros (a texture pool span
 // whose memory the game released). False when the backing store is unavailable.

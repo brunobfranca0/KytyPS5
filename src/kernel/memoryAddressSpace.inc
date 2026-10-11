@@ -706,6 +706,24 @@ public:
 		return true;
 	}
 
+	// The other virtual ranges mapping bytes of [vaddr, vaddr + size) (the aliases), as {vaddr, size} pairs within
+	// the range's physical span; false: the range is not mapped by one entry. Used on a range IsUniqueRange refused.
+	bool Aliases(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* aliases) {
+		aliases->clear();
+		if (size == 0 || UINT64_MAX - vaddr < size) return false;
+		auto     lock = MapReadLock();
+		MapEntry owner {};
+		if (!FindContainingUnlocked(vaddr, size, &owner)) return false;
+		const auto physical_begin = owner.backing_offset + (vaddr - owner.vaddr), physical_end = physical_begin + size;
+		for (const auto& [at, entry]: m_maps) {
+			if (at == owner.vaddr) continue;
+			const auto begin = std::max(physical_begin, entry.backing_offset);
+			const auto end   = std::min(physical_end, entry.backing_offset + entry.size);
+			if (begin < end) aliases->emplace_back(entry.vaddr + (begin - entry.backing_offset), end - begin);
+		}
+		return true;
+	}
+
 	bool IsUniqueRange(uint64_t vaddr, uint64_t size) {
 		// KYTY_ALIAS_VERIFY: every answer is compared with the full rebuild it replaces.
 		static const bool verify = std::getenv("KYTY_ALIAS_VERIFY") != nullptr;
@@ -1337,6 +1355,9 @@ public:
 	}
 
 	bool IsUniqueBackingRange(uint64_t vaddr, uint64_t size) { return m_backing->IsUniqueRange(vaddr, size); }
+	bool BackingAliases(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* aliases) {
+		return m_backing->Aliases(vaddr, size, aliases);
+	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
 

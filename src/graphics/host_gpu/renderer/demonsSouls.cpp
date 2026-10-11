@@ -29,10 +29,9 @@ bool IsSupportedGame() {
 // 01.007.000's, and 01.005.000's with the period in s12 instead of s8 (the same translated program).
 constexpr std::array<uint64_t, 2> LinearCopyShaders {0xeb7456322124ecc7ULL, 0x81bb2b1b9c751ecaULL};
 
-// Verified shader semantics: dst[i] = src[i % period], i < count. The linear
-// subset (a period of at least the count: a copy) and the repeating one (a fill,
-// BufferCache::FillPattern) are replaced. Other formats, workgroup shapes, overlaps
-// and GPU-owned control words stay on the shader path; CopyBuffer owns coherence.
+// Verified shader semantics: dst[i] = src[i % period], i < count. Only the
+// linear subset is replaced. Other formats, workgroup shapes, overlaps and
+// GPU-owned control words stay on the shader path; CopyBuffer owns coherence.
 bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint32_t x, uint32_t y,
                    uint32_t z, uint32_t mode) {
 	const auto& program = *input.stage.program;
@@ -54,7 +53,7 @@ bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint
 namespace {
 // KYTY_SYNC_STATS: what the linear copy shader's dispatches became over 10 s (render thread; relaxed counters).
 struct CopyStats {
-	std::atomic<uint32_t> copies {0}, fills_cpu {0}, fills_gpu {0}, shader {0};
+	std::atomic<uint32_t> copies {0}, copies_aliased {0}, shader {0};
 	std::array<std::pair<const char*, std::atomic<uint32_t>>, 16> reasons {};
 	std::chrono::steady_clock::time_point start {};
 };
@@ -75,9 +74,8 @@ void NoteCopy(std::atomic<uint32_t>& counter, const char* reason = nullptr) {
 	if (g_copy_stats.start == std::chrono::steady_clock::time_point {}) g_copy_stats.start = now;
 	if (now - g_copy_stats.start < std::chrono::seconds(10)) return;
 	g_copy_stats.start = now;
-	std::printf("[memset] 10 s: %u copies, %u repeating fills on the CPU, %u on the GPU, %u left to the shader:",
-	            g_copy_stats.copies.exchange(0), g_copy_stats.fills_cpu.exchange(0), g_copy_stats.fills_gpu.exchange(0),
-	            g_copy_stats.shader.exchange(0));
+	std::printf("[memset] 10 s: %u copies (%u into aliased memory), %u left to the shader:", g_copy_stats.copies.exchange(0),
+	            g_copy_stats.copies_aliased.exchange(0), g_copy_stats.shader.exchange(0));
 	for (auto& [name, count]: g_copy_stats.reasons)
 		if (name != nullptr) std::printf(" %s %u;", name, count.exchange(0));
 	std::printf("\n");
@@ -87,24 +85,23 @@ void NoteCopy(std::atomic<uint32_t>& counter, const char* reason = nullptr) {
 
 bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint32_t x, uint32_t y, uint32_t z,
                    uint32_t mode) {
-	const char*       reason = nullptr;
-	LinearCopyPattern pattern;
-	const auto        copy = LinearCopyOf(dispatch, x, y, z, mode, &reason, &pattern);
+	const char* reason  = nullptr;
+	bool        aliased = false;
+	const auto  copy    = LinearCopyOf(dispatch, x, y, z, mode, &reason, &aliased);
 	if (!copy) {
 		NoteCopy(g_copy_stats.shader, reason);
 		return false;
 	}
-	if (pattern.period_bytes != 0) {
-		// A repeating fill: on the CPU while neither range is GPU-written (before, the shader ran and its whole
-		// destination was taken as GPU-written: the image descriptors the game keeps there were then downloaded,
-		// waiting for the GPU, by every dispatch that reads one).
-		bool on_cpu = false;
-		if (!cache.FillPattern(copy->dst, copy->src, pattern.period_bytes, copy->bytes, &on_cpu)) {
-			NoteCopy(g_copy_stats.shader, "fill over GPU-written memory");
+	// A destination mapped at other addresses too: the copy is made on the CPU only once those are coherent with it
+	// (before, the shader ran and its whole destination was taken as GPU-written: the image descriptors the game keeps
+	// there were then downloaded, the GPU drained, by every dispatch reading one; ~1000 such copies per 10 s at the
+	// dragon's path, 2.5 s of 10 waited).
+	if (aliased) {
+		if (!cache.PrepareAliasesForCpuWrite(copy->dst, copy->bytes)) {
+			NoteCopy(g_copy_stats.shader, "alias GPU-written");
 			return false;
 		}
-		NoteCopy(on_cpu ? g_copy_stats.fills_cpu : g_copy_stats.fills_gpu);
-		return true;
+		NoteCopy(g_copy_stats.copies_aliased);
 	}
 	cache.CopyBuffer(copy->dst, copy->src, copy->bytes, false, false);
 	cache.ScheduleCopyFeedback(copy->dst, copy->bytes);
@@ -113,7 +110,7 @@ bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint3
 }
 
 std::optional<LinearCopy> LinearCopyOf(const LinearCopyDispatch& dispatch, uint32_t x, uint32_t y, uint32_t z, uint32_t mode,
-                                       const char** reason, LinearCopyPattern* pattern) {
+                                       const char** reason, bool* aliased) {
 	const auto refuse = [&](const char* why) {
 		if (reason != nullptr) *reason = why;
 		return std::nullopt;
@@ -143,22 +140,22 @@ std::optional<LinearCopy> LinearCopyOf(const LinearCopyDispatch& dispatch, uint3
 	                                                           sizeof(controls)))
 		return refuse("parameters GPU-written");
 	const uint64_t count = controls[0], period = controls[1], bytes = count * 4;
-	// (A period shorter than the count repeats the source's first `period` words: only for a caller that takes it.)
-	const bool repeating = period != 0 && period < count;
-	if (repeating && pattern == nullptr) return refuse("repeating");
-	const uint64_t read = repeating ? period : count; // the source words read
-	if (count == 0 || period == 0 || read > source.NumRecords() || count > destination.NumRecords())
+	if (count == 0 || period < count || count > source.NumRecords() || count > destination.NumRecords())
 		return refuse("counts");
 	if (x != (count + 63) / 64 || bytes > 16 * 1024 * 1024) return refuse("groups or size");
 	const auto src = source.Base48(), dst = destination.Base48();
-	if ((src < dst + bytes && dst < src + read * 4) ||
+	if ((src < dst + bytes && dst < src + bytes) ||
 	    (parameters.Base48() < dst + bytes && dst < parameters.Base48() + 16))
 		return refuse("overlap");
-	if (!LibKernel::Memory::IsUniqueGuestBackingRange(src, read * 4) ||
-	    !LibKernel::Memory::IsUniqueGuestBackingRange(dst, bytes) ||
-	    !LibKernel::Memory::IsUniqueGuestBackingRange(parameters.Base48(), 16))
-		return refuse("aliased memory");
-	if (pattern != nullptr) pattern->period_bytes = repeating ? period * 4 : 0;
+	// (The source and the parameters are only read: an alias of theirs changes nothing. The destination's aliases are the
+	// caller's to make coherent; without a caller that does, the shader runs.)
+	if (!LibKernel::Memory::IsUniqueGuestBackingRange(dst, bytes)) {
+		if (aliased == nullptr) return refuse("aliased destination");
+		*aliased = true;
+	} else if (aliased != nullptr) {
+		*aliased = false;
+	}
+	if (!LibKernel::Memory::IsFullyMapped(src, bytes) || !LibKernel::Memory::IsFullyMapped(dst, bytes)) return refuse("unmapped");
 	return LinearCopy {src, dst, bytes};
 }
 } // namespace Libs::Graphics::DemonsSouls

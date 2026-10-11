@@ -29,13 +29,10 @@ struct LinearCopyDispatch {
 struct LinearCopy {
 	uint64_t src = 0, dst = 0, bytes = 0;
 };
-// `reason` (optional): why a dispatch is not one (KYTY_SYNC_STATS' [memset] lines). `pattern`: a dispatch whose period is
-// shorter than its count (a repeating fill) is returned too, its period in `period_bytes` (else 0).
-struct LinearCopyPattern {
-	uint64_t period_bytes = 0;
-};
+// `reason` (optional): why a dispatch is not one (KYTY_SYNC_STATS' [memset] lines). `aliased` (optional): set when the
+// destination's memory is mapped at other addresses too (the caller makes them coherent, else the shader runs).
 std::optional<LinearCopy> LinearCopyOf(const LinearCopyDispatch& dispatch, uint32_t x, uint32_t y, uint32_t z, uint32_t mode,
-                                       const char** reason = nullptr, LinearCopyPattern* pattern = nullptr);
+                                       const char** reason = nullptr, bool* aliased = nullptr);
 // A dispatch of the linear copy shader (a program of its hash), copied on the CPU.
 bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint32_t x, uint32_t y,
                    uint32_t z, uint32_t mode);

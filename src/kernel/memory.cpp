@@ -1083,6 +1083,10 @@ bool IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr && g_guest_address_space->IsUniqueBackingRange(vaddr, size);
 }
 
+bool GuestBackingAliases(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* aliases) {
+	return g_guest_address_space != nullptr && g_guest_address_space->BackingAliases(vaddr, size, aliases);
+}
+
 // `data` is host memory (every caller reads into a local or a scratch vector): the lock-free
 // host read applies; the guest-destination variant took both backing locks for each word.
 bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size) {
@@ -1382,6 +1386,22 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 		*ptr      = 0x4b59545953553634ull; // "KYTYSU64"
 		ok        = (*ptr == 0x4b59545953553634ull);
 		std::memset(ptr, 0, PageSize);
+
+		// A second mapping of the same backing bytes: each is the other's alias (GuestBackingAliases), the first unique
+		// again once it is gone.
+		const auto second = base + 2u * PageSize;
+		if (g_guest_address_space->MapBacking(second, PageSize, PageSize, VirtualMemory::Mode::ReadWrite, &failure_reason)) {
+			std::vector<std::pair<uint64_t, uint64_t>> aliases;
+			ok = ok && !g_guest_address_space->IsUniqueBackingRange(alias, PageSize);
+			ok = ok && g_guest_address_space->BackingAliases(alias, PageSize, &aliases) && aliases.size() == 1 &&
+			     aliases[0] == std::pair<uint64_t, uint64_t> {second, PageSize};
+			ok = ok && g_guest_address_space->BackingAliases(second + 0x1000, 0x1000, &aliases) && aliases.size() == 1 &&
+			     aliases[0] == std::pair<uint64_t, uint64_t> {alias + 0x1000, 0x1000};
+			ok = g_guest_address_space->UnmapBacking(second, PageSize) && ok;
+			ok = ok && g_guest_address_space->IsUniqueBackingRange(alias, PageSize);
+		} else {
+			ok = false;
+		}
 
 		ok = g_guest_address_space->UnmapBacking(alias, PageSize) && ok;
 	}
