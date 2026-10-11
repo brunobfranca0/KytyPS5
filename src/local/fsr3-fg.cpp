@@ -102,8 +102,10 @@ struct HudLayer {
 
 bool HudLayerWanted() {
 	static const bool wanted = [] {
+		// (Off by default: FSR 3's own composition did not show the layer, the HUD was gone. The HUD-less image the
+		// game's composite gives every frame keeps the HUD out of the generated frames: confirmed in play, 10-11.)
 		const char* value = std::getenv("KYTY_FSR3_HUD_LAYER");
-		return value == nullptr || *value == '\0' || *value != '0';
+		return value != nullptr && *value == '1';
 	}();
 	return wanted;
 }
