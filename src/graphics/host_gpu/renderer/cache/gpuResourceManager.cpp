@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "live-census.h"
 #include "live-counters.h"
@@ -52,10 +53,40 @@ uint64_t GpuResourceManager::PreparationAliasEpoch() const noexcept {
 	return uint32_t(value) == 0 ? value : 0;
 }
 
+namespace {
+// The write window per guest thread: 16 KiB, doubled (up to 256 KiB) while a thread's faults land right after its
+// previous window (a stream of writes through a buffer: the game rewrites ~9 MiB of its GPU memory a frame on the
+// dragon's path, 580 faults a frame with 16 KiB windows); back to 16 KiB on any other fault. Sparse writers keep
+// small windows (a window's pages are uploaded again when the GPU next reads them).
+constexpr uint64_t WindowBase = 4 * TRACKER_PAGE_SIZE;
+constexpr uint64_t WindowMax  = 64 * TRACKER_PAGE_SIZE;
+thread_local uint64_t t_window_end  = 0;
+thread_local uint64_t t_window_size = WindowBase;
+uint64_t WindowFor(uint64_t fault) {
+	static const bool adaptive = [] {
+		const char* value = std::getenv("KYTY_WRITE_WINDOW_ADAPTIVE");
+		return value == nullptr || *value != '0';
+	}();
+	if (!adaptive) return WindowBase;
+	const bool sequential = t_window_end != 0 && fault >= t_window_end && fault - t_window_end < t_window_size;
+	t_window_size         = sequential ? std::min(t_window_size * 2, WindowMax) : WindowBase;
+	return t_window_size;
+}
+} // namespace
+
 bool GpuResourceManager::TryInvalidateCpuWriteWindow(uint64_t fault) {
+	const auto size = WindowFor(fault);
+	if (TryInvalidateCpuWriteWindow(fault, size)) return true;
+	if (size != WindowBase) {
+		t_window_size = WindowBase;
+		return TryInvalidateCpuWriteWindow(fault, WindowBase);
+	}
+	return false;
+}
+
+bool GpuResourceManager::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t window_size) {
 	// A small window amortizes faults from sequential CPU writes. Expanding a
 	// fault is allowed only for mapped, unaliased pages with no GPU/image owner.
-	constexpr uint64_t window_size  = 4 * TRACKER_PAGE_SIZE;
 	const auto         window_begin = fault & ~(window_size - 1);
 	GuestRange         selected {};
 	uint64_t           mapping_epoch;
@@ -80,7 +111,9 @@ bool GpuResourceManager::TryInvalidateCpuWriteWindow(uint64_t fault) {
 	if (mapping_epoch != m_mapping_epoch ||
 	    !m_mapped_ranges.Contains(selected.address, selected.size))
 		return false;
-	return m_buffer_cache.TryInvalidateCpuWriteWindow(fault, selected.address, selected.size);
+	if (!m_buffer_cache.TryInvalidateCpuWriteWindow(fault, selected.address, selected.size)) return false;
+	t_window_end = selected.address + selected.size;
+	return true;
 }
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {

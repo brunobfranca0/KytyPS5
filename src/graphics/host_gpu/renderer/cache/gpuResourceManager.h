@@ -69,6 +69,7 @@ public:
 private:
 	void                      RunCollectors();
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);
+	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t window_size);
 	void                      SynchronizeDirtyBdaRegions(GuestRange range);
 	void RefreshBdaRanges();
 	PageManager               m_page_manager;
