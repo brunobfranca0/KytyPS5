@@ -20,7 +20,7 @@ namespace SyncStats {
 
 namespace {
 
-constexpr int    Frames    = 10;
+constexpr int    Frames    = 28;
 constexpr size_t TableSize = 1024;
 
 struct Entry {
@@ -46,8 +46,10 @@ void Print() {
 	for (size_t i = 0; i < std::min<size_t>(entries.size(), 8); ++i) {
 		const auto& entry = *entries[i];
 		std::printf("[sync]  %s %7.1f ms %6" PRIu64 " calls:", entry.kind == 0 ? "gpu " : "down", entry.ns / 1e6, entry.calls);
+		// (The emulator's frames only: through an exception handler the faulting code's frames come after the
+		// system's.)
 		for (const auto frame: entry.stack)
-			if (frame != 0) std::printf(" %" PRIx64, frame);
+			if (frame >= 0x140000000ull && frame < 0x144000000ull) std::printf(" %" PRIx64, frame);
 		std::printf("\n");
 	}
 	std::fflush(stdout);
