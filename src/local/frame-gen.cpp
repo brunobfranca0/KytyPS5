@@ -526,6 +526,12 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	}
 	sl::ReflexOptions reflex {};
 	reflex.mode = sl::ReflexMode::eLowLatency;
+	// KYTY_DLSSG_REFLEX=off|low|boost (a comparison of DLSS-G's pacing).
+	if (const char* mode = std::getenv("KYTY_DLSSG_REFLEX"); mode != nullptr) {
+		if (std::string(mode) == "off") reflex.mode = sl::ReflexMode::eOff;
+		if (std::string(mode) == "boost") reflex.mode = sl::ReflexMode::eLowLatencyWithBoost;
+	}
+	std::printf("Frame generation: Reflex mode %d\n", static_cast<int>(reflex.mode));
 	if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
 		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
 	}
@@ -573,6 +579,13 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		}
 		g_mode_set = usable ? 1 : 0;
 		options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
+		// KYTY_DLSSG_PARALLEL=1: DLSS-G's work blocks none of the emulator's queues (a comparison: by default it
+		// blocks the presenting queue while it works).
+		static const bool parallel = [] {
+			const char* value = std::getenv("KYTY_DLSSG_PARALLEL");
+			return value != nullptr && *value == '1';
+		}();
+		if (parallel) options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockNoClientQueues;
 		options.numBackBuffers      = image_count;
 		options.colorWidth          = backbuffer.width;
 		options.colorHeight         = backbuffer.height;
