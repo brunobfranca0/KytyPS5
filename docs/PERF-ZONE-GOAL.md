@@ -60,8 +60,17 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
       4,08 → 0,61 ms, gpu_wait 3,62 → 0,09 ms). Lo que estaba mapeado dos veces era el **origen o los parámetros**
       (solo lectura), no el destino: `[memset] 0 into aliased memory`; el camino de alias del destino existe pero no
       se usó. Nuevo mayor: `cpu` 13,8 ms (sube) y fallos de página 46 K → 67 K/s, protect 80 K → 112 K/s.
-- [ ] **Z2 Integrar la rama del desarrollador** (`experiment/perf-40fps-20260926` de chenxiao07/KytyPS5, ≥ 46defa0)
-      conservando FSR 3 x2, el relleno en CPU y el recolector de memoria que mida mejor. Comprobar FSR 3 en el log.
+- [ ] **Z2 Integrar la rama del desarrollador** (`experiment/perf-40fps-20260926` de chenxiao07/KytyPS5, hasta f2f202c,
+      18 commits, 46defa0 incluido). Hecho en la rama `integracion` (merge 169d1a9; lo mío guardado en `mi-fsr3` y la
+      etiqueta `antes-de-merge`). Conflictos: `live-counters.h` (lista de nombres: la mía + sus 10 nuevos, comprobada
+      contra el enum), `demonsSoulsSceneGuard.cpp` (su mensaje de instalación + mi parche del unlink), `bufferCache.cpp`
+      (`NoteGpuWrite`: mi parámetro `caller` + su `LogGpuWriteWatch`; `ReadMemoryOnGpu`: su `KYTY_SYNC_STACK` + mi
+      `NoteWriterOf`). Sin choque semántico: su c4a7256 actúa sobre los memmove de libc del juego (CPU), el mío sobre
+      los dispatch del shader cs_memset32. Recolectores: el suyo por edad (buffers sin uso 1800 flips, imágenes 1200,
+      cada flip) y el mío por presupuesto (al acercarse a KYTY_VRAM_BUDGET_MB) se complementan; se dejan los dos y se
+      mide VRAM/fallos/fps en la ruta. La skill `.claude/skills/ps5-emu-optimization` local ya es un superconjunto de la
+      rama `docs/ai-optimization-skill` (aaa9e7c): se conserva la local. FSR 3 intacto (sin conflictos en frame-gen,
+      fsr3-fg, swapchain, videoOut). Pendiente: compilar, comprobar FSR 3 en el log, medir la ruta.
 - [ ] **Z3 Esperas a la GPU restantes**: lo que quede en `[sync]` tras Z1 (lecturas de la CPU del juego, `CopyBuffer`).
 - [ ] **Z4 CPU del hilo de render**: ~8000 draws indirectos por frame (`table_draws`), `TableEvaluate`, `VirtualProtect`.
 - [ ] **Z5 VRAM**: con y sin `KYTY_VRAM_BUDGET_MB=8192`.
