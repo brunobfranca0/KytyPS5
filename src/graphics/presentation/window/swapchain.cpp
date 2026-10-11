@@ -314,6 +314,17 @@ public:
 	[[nodiscard]] vk::SwapchainKHR Handle() const noexcept { return m_handle; }
 	// The FSR 3 frame generation swapchain (KYTY_FSR3_FG) stands in for the swapchain.
 	[[nodiscard]] bool IsFsr3() const noexcept { return m_fsr3; }
+	// The frame generation swapchain keeps the window's size changes to itself (its presents of an out-of-date
+	// swapchain are dropped: a frozen picture after going fullscreen); the surface's extent tells.
+	[[nodiscard]] bool Fsr3SurfaceChanged() const {
+		if (!m_fsr3) return false;
+		vk::SurfaceCapabilitiesKHR capabilities {};
+		if (m_window.graphic_ctx.physical_device.getSurfaceCapabilitiesKHR(m_window.surface, &capabilities) != vk::Result::eSuccess)
+			return false;
+		const auto extent = capabilities.currentExtent;
+		return extent.width != std::numeric_limits<uint32_t>::max() && extent.width != 0 && extent.height != 0 &&
+		       (extent.width != m_extent.width || extent.height != m_extent.height);
+	}
 
 private:
 	void Destroy();
@@ -1003,6 +1014,11 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	auto&      swapchain  = m_impl->swapchain;
 	auto*      hud        = m_impl->UpdateHud(reuse);
+	if (swapchain.Fsr3SurfaceChanged()) {
+		LOGF("FSR3 FG: the window's size changed: swapchain re-created\n");
+		std::printf("FSR3 FG: the window's size changed (fullscreen or resize): swapchain re-created\n");
+		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
+	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
