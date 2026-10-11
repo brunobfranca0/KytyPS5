@@ -368,7 +368,11 @@ private:
 	struct GpuWrite {
 		uint64_t begin, end;
 		bool     big = false; // spans more granules than GpuWriteSpan: in m_gpu_big_writes, not m_gpu_write_last
+		// KYTY_SYNC_STATS: the compute shader being translated when it was noted, and the noting code's return address.
+		uint64_t shader = 0, caller = 0;
 	};
+	// KYTY_SYNC_STATS: the latest logged write over [begin, end) into SyncStats' writer (none: zeros).
+	void NoteWriterOf(uint64_t begin, uint64_t end);
 	// The ticks of the stamped writes, oldest first: (end, tick) dates the writes numbered from the previous entry's end
 	// (the head's number for the first) up to `end`. (A tick in every entry: each was written once and read once more,
 	// a pass over thousands of cold entries a frame.)
@@ -389,7 +393,7 @@ private:
 		return static_cast<uint32_t>((granule * 0x9e3779b97f4a7c15ull) >> (64u - 16u));
 	}
 	void ResetGpuWrites();
-	void                  NoteGpuWrite(uint64_t vaddr, uint64_t size);
+	void                  NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t caller = 0);
 	[[nodiscard]] uint64_t InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed,
 	                                         bool between_commands);
 	// The graphics tick a transfer-queue copy of `ranges` ({begin, end}) waits for; false when

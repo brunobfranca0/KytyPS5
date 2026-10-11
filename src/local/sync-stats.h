@@ -13,4 +13,8 @@ void Note(uint32_t kind, int64_t ns) noexcept;
 inline thread_local uint64_t g_shader = 0;
 // The guest address the render thread's last read fault was at (a synchronous download's): listed with the waits.
 inline thread_local uint64_t g_fault_address = 0;
+// The GPU write a synchronous download waited for (the latest one logged over the bytes read): the compute shader that
+// made it (0: a draw, a copy or none) and the emulator code that noted it (a return address), listed with the waits.
+inline thread_local uint64_t g_writer_shader = 0;
+inline thread_local uint64_t g_writer_caller = 0;
 } // namespace SyncStats

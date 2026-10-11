@@ -10,6 +10,7 @@
 #include "async-upload.h"
 #include "parallel-pages.h"
 #include "readback-queue.h"
+#include "sync-stats.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -430,7 +431,8 @@ uint64_t BufferCache::GpuWriteTick(size_t index) const {
 // KYTY_READBACK_QUEUE. GPU thread, inside a command: the write is recorded at or after the
 // current tick, so its tick is only set at the next point between commands. Every GPU write
 // into a guest buffer is noted: shader writes, uploads, image copies and buffer joins.
-void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t caller) {
+	if (caller == 0 && SyncStats::Enabled()) caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 	TraceGpuWrite(vaddr, size, m_scheduler.CurrentTick());
 	if (kyty_local_readback_queue_mode.load(std::memory_order_relaxed) == 0 || m_graphics.readback_queue == nullptr) {
 		if (m_gpu_writes_on) {
@@ -452,7 +454,7 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	for (size_t i = m_gpu_writes.size(), last = std::max(m_gpu_writes_stamped, i > 4 ? i - 4 : 0); i > last; --i)
 		if (m_gpu_writes[i - 1].begin == vaddr && m_gpu_writes[i - 1].end == vaddr + size) return;
 	const bool big = ((vaddr + size - 1) >> GpuWriteGranuleBits) - (vaddr >> GpuWriteGranuleBits) >= GpuWriteSpan;
-	m_gpu_writes.push_back({vaddr, vaddr + size, big});
+	m_gpu_writes.push_back({vaddr, vaddr + size, big, SyncStats::Enabled() ? SyncStats::g_shader : 0, caller});
 	if (big) {
 		m_gpu_big_writes.push_back(m_gpu_writes_base + m_gpu_writes.size() - 1);
 	} else {
@@ -1455,7 +1457,25 @@ void BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 }
 
+void BufferCache::NoteWriterOf(uint64_t begin, uint64_t end) {
+	SyncStats::g_writer_shader = SyncStats::g_writer_caller = 0;
+	size_t scanned = 0;
+	for (size_t i = m_gpu_writes.size(); i > 0 && scanned < 200000; --i, ++scanned) {
+		const auto& write = m_gpu_writes[i - 1];
+		if (write.begin < end && begin < write.end) {
+			SyncStats::g_writer_shader = write.shader;
+			SyncStats::g_writer_caller = write.caller != 0 ? write.caller : 1;
+			return;
+		}
+	}
+}
+
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
+	// (Cleared after the waits below were noted: other waits name no writer.)
+	struct WriterReset {
+		~WriterReset() { SyncStats::g_writer_shader = SyncStats::g_writer_caller = 0; }
+	} writer_reset;
+	if (SyncStats::Enabled() && GuestGpu::IsGpuThread()) NoteWriterOf(vaddr, vaddr + size);
 	LiveCensus::Scope census(LiveCensus::SyncDownload, vaddr >> 20u << 20u, is_write);
 	LiveCensus::WaitScope waiting(LiveCensus::WaitDownload);
 	// Only the guest readbacks of the bytes this download covers must finish first (their copy would write
