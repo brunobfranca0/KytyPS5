@@ -366,6 +366,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
+	"${KYTY_SOURCE_DIR}/local/sync-stats.h"
+	"${KYTY_SOURCE_DIR}/local/sync-stats.cpp"
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
