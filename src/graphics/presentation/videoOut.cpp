@@ -520,22 +520,42 @@ bool MoviePlaying() noexcept {
 // 16.7 / 33.3 ms steps, 46-52 fps with a juddering frame time graph); now it shows at 18 ms, which a VRR
 // (G-Sync / FreeSync) display follows smoothly. The vblank itself keeps its 60 Hz (the game's clock), and
 // flips stay at most one per vblank period, so the game's speed and its movies are unchanged.
+// KYTY_FLIP_FPS=<fps>: the game's 3D view is shown at most that many frames a second, evenly spaced (e.g. 45, which
+// frame generation doubles to 90). Only frames with the game's TAA pass (gameplay and in-engine scenes); menus,
+// loading screens and movies keep their rate. Implies flip-when-ready (below). The vblank keeps its 60 Hz, the game's
+// clock: the game runs at that rate as on a slower frame, its speed unchanged.
+static uint32_t FlipFpsCap() {
+	static const uint32_t cap = [] {
+		const char* value = std::getenv("KYTY_FLIP_FPS");
+		const int   fps   = value != nullptr ? std::atoi(value) : 0;
+		const auto  result = static_cast<uint32_t>(std::clamp(fps, 0, 240));
+		if (result != 0) {
+			std::printf("Flips: the game's 3D view held to %u fps (KYTY_FLIP_FPS)\n", result);
+			std::fflush(stdout);
+		}
+		return result;
+	}();
+	return cap;
+}
+
 static bool FlipWhenReady() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_FLIP_WHEN_READY");
-		return value != nullptr && *value != '\0' && *value != '0';
+		return (value != nullptr && *value != '\0' && *value != '0') || FlipFpsCap() != 0;
 	}();
 	return enabled;
 }
 
 // Minimum spacing between two flips (QueryPerformanceCounter units) in flip-when-ready mode.
-static uint64_t FlipStepQpc(const VideoOutConfig& cfg, bool capped) {
+static uint64_t FlipStepQpc(const VideoOutConfig& cfg, bool capped, bool game_view) {
 	const auto     frequency = Common::Timer::QueryPerformanceFrequency();
 	const uint64_t period    = std::max<uint64_t>(frequency / std::max(Config::GetVblankFrequency(), 1u), 1);
 	uint64_t       intervals = static_cast<uint64_t>(cfg.flip_rate) + 1u;
 	if (const uint32_t ratio = Config::GetVblankFrequency() / 60; ratio > 1 && MoviePlaying()) intervals = std::max<uint64_t>(intervals, ratio);
 	if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) intervals = static_cast<uint64_t>(floor) + 1u;
-	return period * intervals;
+	uint64_t step = period * intervals;
+	if (const uint32_t cap = FlipFpsCap(); cap != 0 && game_view && !MoviePlaying()) step = std::max<uint64_t>(step, frequency / cap);
+	return step;
 }
 
 // Called when a flip is about to be shown: schedules the earliest time for the next one. The schedule is
@@ -543,9 +563,9 @@ static uint64_t FlipStepQpc(const VideoOutConfig& cfg, bool capped) {
 // latency used to be added to every frame (16.7 + ~0.8 ms -> a steady 57 fps instead of 60). A flip that
 // comes late by less than a period keeps the phase (the next one may come a little sooner); a flip late by
 // a full period or more (a stall) re-anchors on now.
-static void ScheduleNextFlipLocked(VideoOutConfig& cfg, bool capped) {
+static void ScheduleNextFlipLocked(VideoOutConfig& cfg, bool capped, bool game_view) {
 	const uint64_t now  = Common::Timer::QueryPerformanceCounter();
-	const uint64_t step = FlipStepQpc(cfg, capped);
+	const uint64_t step = FlipStepQpc(cfg, capped, game_view);
 	const uint64_t due  = cfg.next_flip_due_qpc;
 	if (due == 0 || now >= due + step) {
 		cfg.next_flip_due_qpc = now + step;
@@ -1223,7 +1243,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		return false;
 	}
 	if (FlipWhenReady()) {
-		ScheduleNextFlipLocked(*r.cfg, capped);
+		ScheduleNextFlipLocked(*r.cfg, capped, r.frame != nullptr && Graphics::Presenter::IsGameView(*r.frame));
 	}
 
 	m_mutex.Lock();

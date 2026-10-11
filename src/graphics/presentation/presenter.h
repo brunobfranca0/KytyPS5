@@ -35,6 +35,8 @@ public:
 	// KYTY_FLIP_RATE caps the frame's flip. With frame generation only frames carrying its inputs
 	// are capped (the game's 3D view): movies and menus keep a flip per vblank.
 	[[nodiscard]] static bool FlipRateApplies(const Frame& frame) noexcept;
+	// A frame of the game's 3D view (its TAA pass was seen: gameplay or an in-engine scene), not a menu, load or movie.
+	[[nodiscard]] static bool IsGameView(const Frame& frame) noexcept;
 	void                         Present(Frame& frame, bool reuse = false);
 	void                         Discard(Frame& frame);
 

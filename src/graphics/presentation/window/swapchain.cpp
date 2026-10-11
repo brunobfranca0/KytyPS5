@@ -996,6 +996,10 @@ bool Presenter::FlipRateApplies(const Frame& frame) noexcept {
 	return !FrameGen::Enabled() || frame.fg.valid;
 }
 
+bool Presenter::IsGameView(const Frame& frame) noexcept {
+	return frame.fg.valid;
+}
+
 void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
