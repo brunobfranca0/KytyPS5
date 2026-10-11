@@ -1,3 +1,4 @@
+#include <cmath>
 #include "libs/audio.h"
 
 #include "SDL.h"
@@ -231,6 +232,17 @@ SDL_AudioFormat Audio::SdlFormat(Format format) {
 	return FormatIsFloat(format) ? AUDIO_F32SYS : AUDIO_S16SYS;
 }
 
+// KYTY_AUDIO_SURROUND=1: a 7.1 (7.1.4) port opens the device with its channels, for real surround speakers. By
+// default it opens a stereo device and is downmixed here (DownmixesToStereo): a device that reports 7.1 (headphones,
+// some drivers) played what the game put in the centre (dialogue) and the surrounds (effects) on nothing.
+static bool SurroundWanted() {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_AUDIO_SURROUND");
+		return value != nullptr && *value == '1';
+	}();
+	return wanted;
+}
+
 bool Audio::OpenSdlDevice(PortOut* port) {
 	EXIT_IF(port == nullptr);
 
@@ -242,14 +254,17 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
 	desired.format   = SdlFormat(port->format);
-	desired.channels = static_cast<Uint8>(OutputChannels(*port));
+	const bool stereo = port->channels_num >= 8 && !SurroundWanted();
+	desired.channels = static_cast<Uint8>(stereo ? 2 : OutputChannels(*port));
 	desired.samples  = static_cast<Uint16>(port->samples_num);
 	desired.callback = nullptr;
 
 	SDL_AudioSpec obtained {};
 
-	port->audio_device =
-	    SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
+	// (A stereo device for a 7.1 port: SDL may not change the channels, it converts our two to the device's itself.)
+	port->audio_device = SDL_OpenAudioDevice(
+	    nullptr, 0, &desired, &obtained,
+	    stereo ? (SDL_AUDIO_ALLOW_ANY_CHANGE & ~SDL_AUDIO_ALLOW_CHANNELS_CHANGE) : SDL_AUDIO_ALLOW_ANY_CHANGE);
 	if (port->audio_device == 0) {
 		LOGF("AudioOut: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
 		return false;
@@ -257,6 +272,10 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 
 	port->audio_spec = obtained;
 	SDL_PauseAudioDevice(port->audio_device, 0);
+	std::printf("AudioOut device: %d channels from the game, %u to the output, %s\n", port->channels_num,
+	            static_cast<unsigned>(obtained.channels),
+	            DownmixesToStereo(*port) ? "downmixed to stereo (centre and surrounds included)" : "not downmixed");
+	std::fflush(stdout);
 
 	LOGF("AudioOut: opened SDL device (%d Hz, %u ch, format 0x%04x)\n", obtained.freq,
 	     obtained.channels, obtained.format);
@@ -309,6 +328,15 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 			return value * static_cast<float>(port.volume[ch]) / 32768.0f;
 		};
 		constexpr float SIDE = 0.70710677f;
+		// The sum of the front, centre and surrounds can pass full scale: above KNEE the peaks are bent smoothly
+		// towards 1.0 (never clipped), below it every sample passes as it is (the music keeps its level).
+		constexpr float KNEE  = 0.85f;
+		const auto      limit = [](float value) {
+            const float magnitude = std::fabs(value);
+            if (magnitude <= KNEE) return value;
+            const float bent = KNEE + (1.0f - KNEE) * std::tanh((magnitude - KNEE) / (1.0f - KNEE));
+            return value < 0.0f ? -bent : bent;
+		};
 		buffer->resize(static_cast<size_t>(frames) * 2 * bytes_per_sample);
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			float left  = sample(frame, 0) + SIDE * (sample(frame, 2) + sample(frame, 4) + sample(frame, 6));
@@ -317,6 +345,8 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 				left += SIDE * (sample(frame, 8) + sample(frame, 10));
 				right += SIDE * (sample(frame, 9) + sample(frame, 11));
 			}
+			left  = limit(left);
+			right = limit(right);
 			if (is_float) {
 				reinterpret_cast<float*>(buffer->data())[frame * 2]     = left;
 				reinterpret_cast<float*>(buffer->data())[frame * 2 + 1] = right;
