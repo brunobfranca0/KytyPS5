@@ -54,6 +54,10 @@ struct FrameInputs {
 	VulkanImage   hudless;
 	vk::ImageView hudless_view = nullptr;
 	bool          has_hudless  = false;
+	// ... scaled to the backbuffer (DLSS-G wants it at the backbuffer's size): ScaleHudless.
+	VulkanImage   hudless_display;
+	vk::ImageView hudless_display_view = nullptr;
+	bool          has_hudless_display  = false;
 	bool          valid       = false;
 };
 
@@ -102,6 +106,9 @@ void OnBeginRendering(CommandBuffer& command, const RenderState& state);
 // which draw.
 void AfterDraw(CommandBuffer& command);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
+// Present thread, in the present's command buffer: the HUD-less image scaled to the backbuffer (DLSS-G).
+void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
+                  vk::Format format);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

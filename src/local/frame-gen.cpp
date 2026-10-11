@@ -115,7 +115,7 @@ void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view
 	create.format        = source.format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+	create.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled;
 	if (attachment != nullptr) {
 		*attachment = !IsDepthFormat(source.format) &&
 		              static_cast<bool>(graphics.physical_device.getFormatProperties(source.format).optimalTilingFeatures &
@@ -228,6 +228,8 @@ uint64_t         g_presents = 0;
 int              g_mode_set = -1; // the DLSS-G mode last set (1 on, 0 off)
 std::chrono::steady_clock::time_point g_stat_start {};
 uint32_t         g_stat_real = 0, g_stat_on = 0;
+double           g_stat_present_ms = 0, g_stat_present_max = 0;
+std::chrono::steady_clock::time_point g_present_begin {};
 
 // Matrices in Streamline's convention: row-major, row vectors (p' = p * M).
 using Mat4 = sl::float4x4;
@@ -546,12 +548,14 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		if (usable) ++g_stat_on;
 		const double window = std::chrono::duration<double>(now - g_stat_start).count();
 		if (window >= 1.0) {
-			std::printf("[dlssg] real %.1f fps, shown %.1f fps; generation on %u of %u frames\n", g_stat_real / window,
-			            g_stat_real / window * static_cast<double>(PresentedFrames()), g_stat_on, g_stat_real);
+			std::printf("[dlssg] real %.1f fps, shown %.1f fps; generation on %u of %u frames; present call %.2f ms (max %.1f)\n",
+			            g_stat_real / window, g_stat_real / window * static_cast<double>(PresentedFrames()), g_stat_on,
+			            g_stat_real, g_stat_real != 0 ? g_stat_present_ms / g_stat_real : 0.0, g_stat_present_max);
 			std::fflush(stdout);
 			g_stat_start = now;
 			g_stat_real  = 0;
 			g_stat_on    = 0;
+			g_stat_present_ms = g_stat_present_max = 0;
 		}
 	}
 	// DLSS-G options: on while frames carry inputs; sizes are hints for its allocations.
@@ -698,17 +702,17 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		const bool      partial = region.offset.x != 0 || region.offset.y != 0 ||
 		                     region.extent.width != backbuffer.width || region.extent.height != backbuffer.height;
 		// The HUD-less image (the flip image before the HUD), at the game image's size: DLSS-G keeps the HUD out.
-		sl::Resource hudless(sl::ResourceType::eTex2d, static_cast<VkImage>(inputs->hudless.image), nullptr,
-		                     static_cast<VkImageView>(inputs->hudless_view),
+		sl::Resource hudless(sl::ResourceType::eTex2d, static_cast<VkImage>(inputs->hudless_display.image), nullptr,
+		                     static_cast<VkImageView>(inputs->hudless_display_view),
 		                     static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
-		hudless.width        = inputs->hudless.extent.width;
-		hudless.height       = inputs->hudless.extent.height;
-		hudless.nativeFormat = static_cast<uint32_t>(inputs->hudless.format);
+		hudless.width        = inputs->hudless_display.extent.width;
+		hudless.height       = inputs->hudless_display.extent.height;
+		hudless.nativeFormat = static_cast<uint32_t>(inputs->hudless_display.format);
 		hudless.mipLevels    = 1;
 		hudless.arrayLayers  = 1;
 		hudless.flags        = 0;
-		hudless.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(inputs->hudless.usage));
-		const sl::Extent hudless_extent {0, 0, inputs->hudless.extent.width, inputs->hudless.extent.height};
+		hudless.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(inputs->hudless_display.usage));
+		const sl::Extent hudless_extent {0, 0, inputs->hudless_display.extent.width, inputs->hudless_display.extent.height};
 		std::vector<sl::ResourceTag> tags {
 		    sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &full),
 		    sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
@@ -716,7 +720,12 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		};
 		if (partial)
 			tags.emplace_back(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &game);
-		if (inputs->has_hudless && inputs->hudless.image != nullptr)
+		static const bool hudless_tag = [] {
+			const char* value = std::getenv("KYTY_FRAMEGEN_HUDLESS");
+			return value == nullptr || *value != '0';
+		}();
+		if (hudless_tag && inputs->has_hudless_display && inputs->hudless_display.extent.width == backbuffer.width &&
+		    inputs->hudless_display.extent.height == backbuffer.height)
 			tags.emplace_back(&hudless, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent,
 			                  &hudless_extent);
 		if (const auto result = g_api.set_tag_for_frame(token, viewport, tags.data(), static_cast<uint32_t>(tags.size()), nullptr);
@@ -733,6 +742,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 	}
 	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, token);
 	g_api.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
+	g_present_begin = std::chrono::steady_clock::now();
 #else
 	(void)inputs;
 	(void)backbuffer;
@@ -744,6 +754,11 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 
 void AfterPresent() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (g_present_begin != std::chrono::steady_clock::time_point {}) {
+		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_present_begin).count();
+		g_stat_present_ms += ms;
+		g_stat_present_max = std::max(g_stat_present_max, ms);
+	}
 	if (!g_ready || g_token == nullptr) {
 		return;
 	}
@@ -1009,18 +1024,42 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 }
 
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
-	for (auto* view: {&inputs.depth_view, &inputs.motion_view, &inputs.hudless_view}) {
+	for (auto* view: {&inputs.depth_view, &inputs.motion_view, &inputs.hudless_view, &inputs.hudless_display_view}) {
 		if (*view != nullptr) {
 			graphics.device.destroyImageView(*view, nullptr);
 			*view = nullptr;
 		}
 	}
-	for (auto* image: {&inputs.depth, &inputs.motion, &inputs.hudless}) {
+	for (auto* image: {&inputs.depth, &inputs.motion, &inputs.hudless, &inputs.hudless_display}) {
 		if (image->image != nullptr) {
 			graphics.DeleteImage(*image);
 		}
 	}
 	inputs.valid = false;
+}
+
+void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
+                  vk::Format format) {
+	inputs.has_hudless_display = false;
+	if (!inputs.valid || !inputs.has_hudless || inputs.hudless.image == nullptr) return;
+	ConfigureAs(graphics, inputs.hudless_display, inputs.hudless_display_view, format,
+	            vk::Extent3D {backbuffer.width, backbuffer.height, 1});
+	Transition(command, inputs.hudless, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+	Transition(command, inputs.hudless_display, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	vk::ImageBlit region {};
+	region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(inputs.hudless.extent.width),
+                                         static_cast<int32_t>(inputs.hudless.extent.height), 1};
+	region.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height), 1};
+	command.blitImage(inputs.hudless.image, vk::ImageLayout::eTransferSrcOptimal, inputs.hudless_display.image,
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eLinear);
+	for (auto* image: {&inputs.hudless, &inputs.hudless_display})
+		Transition(command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+	inputs.has_hudless_display = true;
 }
 
 } // namespace Libs::Graphics::FrameGen
