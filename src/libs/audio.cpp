@@ -19,7 +19,10 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+#include <iterator>
 #include <limits>
+#include <mutex>
 #include <vector>
 
 #include "libatrac9.h"
@@ -110,6 +113,10 @@ private:
 
 		SDL_AudioDeviceID audio_device = 0;
 		SDL_AudioSpec     audio_spec   = {};
+
+		// KYTY_AUDIO_STATS: the blocks output in the period and each channel's peak.
+		uint32_t stat_blocks = 0;
+		float    stat_peak[12] {};
 	};
 
 	struct PortIn {
@@ -137,6 +144,7 @@ private:
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
 	                                           std::vector<uint8_t>* buffer);
 	static bool            QueueSdlAudio(PortOut* port, const void* data, bool blocking);
+	void                   NoteOutputs(const OutputParam* params, uint32_t num);
 };
 
 static Audio* g_audio = nullptr;
@@ -568,6 +576,44 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 	return false;
 }
 
+// KYTY_AUDIO_STATS: every 5 s, each port's blocks and per-channel peak (what the game sent, before any downmix).
+void Audio::NoteOutputs(const OutputParam* params, uint32_t num) {
+	static std::mutex stats_mutex;
+	static double     last = 0.0;
+	std::scoped_lock  lock(stats_mutex);
+	for (uint32_t i = 0; i < num; i++) {
+		auto& port = m_out_ports[params[i].handle.GetId()];
+		if (params[i].data == nullptr || port.channels_num <= 0) continue;
+		port.stat_blocks++;
+		const auto channels = static_cast<uint32_t>(port.channels_num);
+		const int  encoding = FormatIsFloat(port.format) ? 2 : 0;
+		for (uint32_t frame = 0; frame < port.samples_num; frame += 4) {
+			for (uint32_t ch = 0; ch < channels && ch < 12; ch++) {
+				const auto  index = static_cast<size_t>(frame) * channels + ch;
+				const float v     = encoding == 2 ? std::fabs(static_cast<const float*>(params[i].data)[index])
+				                                  : std::fabs(static_cast<float>(static_cast<const int16_t*>(params[i].data)[index]) / 32768.0f);
+				if (v > port.stat_peak[ch] && std::isfinite(v)) port.stat_peak[ch] = v;
+			}
+		}
+	}
+	const double now = AudioInternal::StatsSeconds();
+	if (last == 0.0) last = now;
+	if (now - last < 5.0) return;
+	last = now;
+	for (int id = 0; id < OUT_PORTS_MAX; id++) {
+		auto& port = m_out_ports[id];
+		if (!port.used || port.stat_blocks == 0) continue;
+		char peaks[160] {};
+		size_t at = 0;
+		for (int ch = 0; ch < port.channels_num && ch < 12; ch++)
+			at += static_cast<size_t>(std::snprintf(peaks + at, sizeof(peaks) - at, " %.3f", static_cast<double>(port.stat_peak[ch])));
+		std::printf("[audioout] port %d type %d %s, device %u ch: %u blocks, peak per channel%s\n", id, port.type,
+		            Common::EnumName(port.format).c_str(), static_cast<unsigned>(port.audio_spec.channels), port.stat_blocks, peaks);
+		port.stat_blocks = 0;
+		std::fill(std::begin(port.stat_peak), std::end(port.stat_peak), 0.0f);
+	}
+}
+
 uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
 	EXIT_NOT_IMPLEMENTED(num == 0);
 	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
@@ -599,6 +645,8 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	if (blocking && max_wait_time != 0 && !any_port_has_device) {
 		Common::Thread::SleepMicro(max_wait_time);
 	}
+
+	if (AudioInternal::StatsWanted()) NoteOutputs(params, num);
 
 	for (uint32_t i = 0; i < num; i++) {
 		auto& port = m_out_ports[params[i].handle.GetId()];

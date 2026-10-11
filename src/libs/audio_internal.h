@@ -3,6 +3,11 @@
 
 #include "common/common.h"
 
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+
 namespace Libs::Audio::AudioInternal {
 
 enum class Format {
@@ -29,6 +34,38 @@ int      AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format form
 void     AudioOutClose(int handle);
 bool     AudioOutHasDevice(int handle);
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking = true);
+
+// KYTY_AUDIO_STATS (on unless =0): every 5 s the run log shows what each audio stage carried (AJM decodes,
+// AudioOut2 ports and objects, the AudioOut devices), each with its peak level, to find where a sound is lost.
+inline bool StatsWanted() {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_AUDIO_STATS");
+		return value == nullptr || *value != '0';
+	}();
+	return wanted;
+}
+// Seconds on a steady clock (the stats' 5 s periods).
+inline double StatsSeconds() {
+	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// The largest absolute sample (full scale 1.0) of `count` samples, every `stride`th one read.
+// encoding: 0 = int16, 1 = int32, 2 = float.
+inline float PcmPeak(const void* data, size_t count, int encoding, size_t stride) {
+	if (data == nullptr || count == 0) return 0.0f;
+	if (stride == 0) stride = 1;
+	float peak = 0.0f;
+	for (size_t i = 0; i < count; i += stride) {
+		float v = 0.0f;
+		switch (encoding) {
+			case 0: v = static_cast<float>(static_cast<const int16_t*>(data)[i]) / 32768.0f; break;
+			case 1: v = static_cast<float>(static_cast<const int32_t*>(data)[i]) / 2147483648.0f; break;
+			default: v = static_cast<const float*>(data)[i]; break;
+		}
+		v = std::fabs(v);
+		if (v > peak && std::isfinite(v)) peak = v;
+	}
+	return peak;
+}
 
 } // namespace Libs::Audio::AudioInternal
 

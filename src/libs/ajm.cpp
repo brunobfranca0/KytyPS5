@@ -6,6 +6,7 @@
 #include "libs/ajm/decoder.h"
 #include "libs/ajm/mp3_decoder.h"
 #include "libs/audio.h"
+#include "libs/audio_internal.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -339,12 +340,19 @@ private:
 	uint32_t m_frames_per_packet = 1;
 };
 
+struct AjmInstanceStats {
+	uint32_t decodes = 0, frames = 0, riff = 0, partial = 0, no_room = 0, errors = 0, empty = 0;
+	uint64_t in_bytes = 0, out_bytes = 0;
+	float    peak = 0.0f;
+};
+
 struct AjmInstanceState {
 	uint32_t                    context = 0;
 	uint32_t                    codec   = 0;
 	uint64_t                    flags   = 0;
 	AjmGaplessState             gapless;
 	std::unique_ptr<AjmDecoder> decoder;
+	AjmInstanceStats            stats;
 };
 
 static std::mutex                                     g_ajm_instances_mutex;
@@ -609,6 +617,51 @@ static void AjmLogDecodeResult(const char* job, uint32_t instance, const AjmDeco
 		            instance, instance >> 14u, static_cast<unsigned>(result.result), in, out);
 }
 
+// KYTY_AUDIO_STATS: each instance's decodes over 5 s (called with g_ajm_instances_mutex held): what was decoded and
+// how loud, whether new files (RIFF headers) started, and the results that produce nothing (partial input, no room,
+// errors). A voice the game decodes as silence, or never decodes, shows here.
+static void AjmNoteDecode(uint32_t instance, AjmInstanceState& state, const void* input, size_t input_size, const void* output,
+                          const AjmDecodeResult& result) {
+	auto& st = state.stats;
+	st.decodes++;
+	st.frames += result.frames;
+	st.in_bytes += result.input_consumed;
+	st.out_bytes += result.output_written;
+	if (input != nullptr && input_size >= 4 && std::memcmp(input, "RIFF", 4) == 0) st.riff++;
+	if ((result.result & AJM_RESULT_PARTIAL_INPUT) != 0) st.partial++;
+	if ((result.result & AJM_RESULT_NOT_ENOUGH_ROOM) != 0) st.no_room++;
+	if ((result.result & (AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL | AJM_RESULT_INVALID_DATA | AJM_RESULT_NOT_INITIALIZED |
+	                      AJM_RESULT_INVALID_PARAMETER)) != 0)
+		st.errors++;
+	if (result.output_written == 0) st.empty++;
+	const auto encoding = static_cast<int>(result.format.sample_encoding);
+	const auto bytes    = encoding == 0 ? 2u : 4u;
+	st.peak = std::max(st.peak, Libs::Audio::AudioInternal::PcmPeak(output, result.output_written / bytes, encoding, 7));
+	(void)instance;
+
+	static double last = 0.0;
+	const double  now  = Libs::Audio::AudioInternal::StatsSeconds();
+	if (last == 0.0) last = now;
+	if (now - last < 5.0) return;
+	last = now;
+	uint32_t active = 0;
+	for (const auto& [id, s]: g_ajm_instances)
+		if (s.stats.decodes != 0) active++;
+	std::printf("[ajm] %.0f s: %u instances decoded (instance: channels, rate, decodes, frames, new files, KiB in/out, peak; "
+	            "partial/no room/errors/nothing out)\n",
+	            5.0, active);
+	for (auto& [id, s]: g_ajm_instances) {
+		auto& t = s.stats;
+		if (t.decodes == 0) continue;
+		const auto format = s.decoder != nullptr ? s.decoder->GetFormat() : AjmSidebandFormat {};
+		std::printf("[ajm]  0x%05x %uch %u Hz: %u dec, %u fr, %u riff, %llu/%llu KiB, peak %.3f; %u/%u/%u/%u\n", id, format.channel_num,
+		            format.sampling_frequency, t.decodes, t.frames, t.riff, static_cast<unsigned long long>(t.in_bytes / 1024),
+		            static_cast<unsigned long long>(t.out_bytes / 1024), static_cast<double>(t.peak), t.partial, t.no_room, t.errors,
+		            t.empty);
+		t = {};
+	}
+}
+
 static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, size_t input_size,
                                          void* output, size_t output_size, bool multiple_frames) {
 	std::scoped_lock lock(g_ajm_instances_mutex);
@@ -619,8 +672,9 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 		return result;
 	}
 
-	return state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
-	                              &state->gapless);
+	auto result = state->decoder->Decode(input, input_size, output, output_size, multiple_frames, &state->gapless);
+	if (Libs::Audio::AudioInternal::StatsWanted()) AjmNoteDecode(instance, *state, input, input_size, output, result);
+	return result;
 }
 
 static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer* input_buffers,
@@ -1142,6 +1196,12 @@ int KYTY_SYSV_ABI AjmBatchJobSetResampleParameters(AjmBatchInfo* info, uint32_t 
 	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE);
 	LOGF("\t instance = 0x%08" PRIx32 ", ratio = %f, flags = 0x%08" PRIx32 "\n", instance,
 	     static_cast<double>(ratio), flags);
+	{
+		// (Not done here: decoded audio keeps its rate. In the run log, the first requests.)
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("AJM resample requested (ignored): instance 0x%05x ratio %f flags 0x%x\n", instance, static_cast<double>(ratio), flags);
+	}
 	return AjmAppendJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample");
 }
 
@@ -1152,6 +1212,12 @@ int KYTY_SYSV_ABI AjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE);
+	{
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("AJM resample-ex requested (ignored): instance 0x%05x ratio %f change %f flags 0x%x\n", instance,
+			            static_cast<double>(ratio_start), static_cast<double>(ratio_change_per_sample), flags);
+	}
 	LOGF("\t instance = 0x%08" PRIx32 ", ratio_start = %f, ratio_change = %f, flags = 0x%08" PRIx32
 	     "\n",
 	     instance, static_cast<double>(ratio_start), static_cast<double>(ratio_change_per_sample),
