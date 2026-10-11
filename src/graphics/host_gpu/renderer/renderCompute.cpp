@@ -1,3 +1,4 @@
+#include "local/sync-stats.h"
 #include "common/assert.h"
 #include "live-trace-gpu.h"
 #include "common/common.h"
@@ -376,6 +377,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			LiveCounters::Add(LiveCounters::DispatchSameShader);
 	}
 	LiveCounters::g_last_dispatch_shader = sh_ctx.GetCs().cs_regs.data_addr;
+	SyncStats::g_shader = sh_ctx.GetCs().cs_regs.data_addr;
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,

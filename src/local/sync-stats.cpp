@@ -26,6 +26,7 @@ constexpr size_t TableSize = 1024;
 struct Entry {
 	std::array<uint64_t, Frames> stack {};
 	uint32_t                     kind  = 0;
+	uint64_t                     shader = 0;
 	uint64_t                     calls = 0;
 	int64_t                      ns    = 0;
 	bool                         used  = false;
@@ -43,9 +44,10 @@ void Print() {
 	int64_t total[2] {};
 	for (const auto* entry: entries) total[entry->kind & 1] += entry->ns;
 	std::printf("[sync] 10 s: GPU waits %.1f ms, synchronous downloads %.1f ms (render thread)\n", total[0] / 1e6, total[1] / 1e6);
-	for (size_t i = 0; i < std::min<size_t>(entries.size(), 8); ++i) {
+	for (size_t i = 0; i < std::min<size_t>(entries.size(), 16); ++i) {
 		const auto& entry = *entries[i];
-		std::printf("[sync]  %s %7.1f ms %6" PRIu64 " calls:", entry.kind == 0 ? "gpu " : "down", entry.ns / 1e6, entry.calls);
+		std::printf("[sync]  %s %7.1f ms %6" PRIu64 " calls, CS 0x%" PRIx64 ":", entry.kind == 0 ? "gpu " : "down", entry.ns / 1e6,
+		            entry.calls, entry.shader);
 		// (The emulator's frames only: through an exception handler the faulting code's frames come after the
 		// system's.)
 		for (const auto frame: entry.stack)
@@ -73,7 +75,8 @@ void Note(uint32_t kind, int64_t ns) noexcept {
 	void*        frames[Frames + 2] {};
 	const auto   count = RtlCaptureStackBackTrace(2, Frames, frames, nullptr);
 	std::array<uint64_t, Frames> stack {};
-	uint64_t     hash  = kind * 0x9e3779b97f4a7c15ull;
+	const uint64_t shader = g_shader;
+	uint64_t     hash  = kind * 0x9e3779b97f4a7c15ull ^ shader * 0xc2b2ae3d27d4eb4full;
 	for (int i = 0; i < count && i < Frames; ++i) {
 		auto address = reinterpret_cast<uint64_t>(frames[i]);
 		// Exe-relative (the map's addresses: 0x140000000 + rva); other modules as they are.
@@ -87,7 +90,8 @@ void Note(uint32_t kind, int64_t ns) noexcept {
 			entry.used  = true;
 			entry.stack = stack;
 			entry.kind  = kind;
-		} else if (entry.kind != kind || entry.stack != stack) {
+			entry.shader = shader;
+		} else if (entry.kind != kind || entry.shader != shader || entry.stack != stack) {
 			continue;
 		}
 		entry.calls++;

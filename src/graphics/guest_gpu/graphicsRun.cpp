@@ -1,3 +1,4 @@
+#include "local/sync-stats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
@@ -1762,6 +1763,7 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 	LiveTrace::MarkAfter gpu_mark {[&] { return GetScheduler().Current().RawHandle(); }, LiveTrace::MarkNativeXpr,
 	                               m_sh_ctx.GetPs().ps_regs.data_addr};
 	LiveCounters::g_last_dispatch_shader = 0;
+	SyncStats::g_shader = 0;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	auto& executor = m_renderer.GetRenderExecutor();
 	if (FrameCapture::Active()) { // a recorded frame sees every draw on the normal path
