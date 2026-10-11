@@ -7,6 +7,9 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include <unordered_map>
+#include <utility>
 #include "graphics/host_gpu/renderer/renderTarget.h"
 
 #include <algorithm>
@@ -949,6 +952,161 @@ void AfterDraw(CommandBuffer& command) {
 	g_hudless_taken = true;
 }
 
+namespace {
+std::unordered_map<uint64_t, uint32_t> g_target_draws; // this frame's normal-path draws per color target
+VulkanImage                            g_flip_backup;
+vk::ImageView                          g_flip_backup_view = nullptr;
+VulkanImage                            g_ui_backup;
+vk::ImageView                          g_ui_backup_view = nullptr;
+bool                                   g_composite      = false; // this frame's HUD-less image is a composite without HUD
+uint32_t                               g_composite_logs = 0;
+uint64_t KeyOf(ImageId id) { return (uint64_t {id.index} << 32u) | id.generation; }
+// KYTY_FSR3_UI_IMAGE=n: the HUD texture is the composite's n-th candidate (the log lists them), not the guess.
+int UiOverride() {
+	static const int value = [] {
+		const char* text = std::getenv("KYTY_FSR3_UI_IMAGE");
+		return text != nullptr && *text != '\0' ? std::atoi(text) : -1;
+	}();
+	return value;
+}
+bool Rgba8(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32: return true;
+		default: return false;
+	}
+}
+const FlipTarget* FlipOf(ImageId id) {
+	if (!id || g_cache == nullptr) return nullptr;
+	auto& image = g_cache->GetImage(id);
+	for (const auto& target: g_flips)
+		if (target.image != nullptr && image.backing.image == target.image && image.info.data.address == target.address)
+			return &target;
+	return nullptr;
+}
+// `backup` into `image` (mip 0, layer 0).
+void CopyBack(vk::CommandBuffer command, VulkanImage& backup, Image& image) {
+	Transition(command, backup, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = backup.extent;
+	command.copyImage(backup.image, vk::ImageLayout::eTransferSrcOptimal, image.backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	Transition(command, backup, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+}
+} // namespace
+
+void NoteDraw(ImageId target) {
+	if (target && LiveCensus::g_render) ++g_target_draws[KeyOf(target)];
+}
+
+int FlipSlot(std::span<const ImageId> targets) {
+	if (!LiveCensus::g_render || !HudlessWanted() || g_cache == nullptr || g_graphics_ctx == nullptr || g_hudless_taken)
+		return -1;
+	for (size_t i = 0; i < targets.size(); ++i)
+		if (FlipOf(targets[i]) != nullptr) return static_cast<int>(i);
+	return -1;
+}
+
+void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageId target, uint32_t slot,
+                    std::span<const TextureBinding> images, const std::function<void()>& redraw) {
+	if (g_hudless_taken || slot >= rendering.num_color_attachments || FlipOf(target) == nullptr) return;
+	auto& flip = g_cache->GetImage(target);
+	// The HUD texture: of the full-screen-ish color images the composite samples, an 8-bit (or 10-bit) one with alpha
+	// that the most draws went to this frame (the HUD's sprites and text; the scene's last passes are one draw each).
+	struct Candidate {
+		size_t   binding;
+		ImageId  id;
+		uint32_t draws;
+		bool     rgba8;
+	};
+	std::vector<Candidate> candidates;
+	for (size_t i = 0; i < images.size(); ++i) {
+		const auto id = images[i].image_id;
+		if (!id || id == target) continue;
+		if (std::any_of(candidates.begin(), candidates.end(), [&](const Candidate& c) { return c.id == id; })) continue;
+		auto& image = g_cache->GetImage(id);
+		if (IsDepthFormat(image.backing.format) || image.backing.image == flip.backing.image) continue;
+		if (image.backing.extent.width * 2 < flip.backing.extent.width ||
+		    image.backing.extent.height * 2 < flip.backing.extent.height)
+			continue;
+		const auto found = g_target_draws.find(KeyOf(id));
+		candidates.push_back({i, id, found != g_target_draws.end() ? found->second : 0u, Rgba8(image.backing.format)});
+	}
+	int chosen = -1;
+	if (const int forced = UiOverride(); forced >= 0) {
+		if (forced < static_cast<int>(candidates.size())) chosen = forced;
+	} else {
+		for (size_t i = 0; i < candidates.size(); ++i) {
+			const auto& c = candidates[i];
+			if (c.draws == 0) continue;
+			if (chosen < 0 || std::pair {c.rgba8, c.draws} > std::pair {candidates[chosen].rgba8, candidates[chosen].draws})
+				chosen = static_cast<int>(i);
+		}
+	}
+	if (g_composite_logs < 8) {
+		++g_composite_logs;
+		std::printf("HUD-less: the flip image's draw (%ux%u format %d) samples %zu images, candidates:",
+		            flip.backing.extent.width, flip.backing.extent.height, static_cast<int>(flip.backing.format),
+		            images.size());
+		for (size_t i = 0; i < candidates.size(); ++i) {
+			const auto& image = g_cache->GetImage(candidates[i].id);
+			std::printf(" [%zu] binding %zu %ux%u format %d draws %u%s", i, candidates[i].binding, image.backing.extent.width,
+			            image.backing.extent.height, static_cast<int>(image.backing.format), candidates[i].draws,
+			            static_cast<int>(i) == chosen ? " (HUD)" : "");
+		}
+		std::printf("\n");
+		std::fflush(stdout);
+	}
+	if (chosen < 0) return;
+	const auto& binding = images[candidates[chosen].binding];
+	auto&       ui      = g_cache->GetImage(candidates[chosen].id);
+	const auto  ui_layout    = binding.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eShaderReadOnlyOptimal
+	                                                                         : binding.layout;
+	const auto  flip_layout  = rendering.color_attachments[slot].image_layout;
+	const auto  flip_access  = vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+	const bool  in_pass      = command.RenderingWith(rendering);
+	auto        vk_command   = command.Handle();
+	command.EndRendering();
+	// Both as they are now.
+	ConfigureAs(*g_graphics_ctx, g_flip_backup, g_flip_backup_view, flip.backing.format, flip.backing.extent);
+	CopyInto(vk_command, flip, g_flip_backup);
+	ConfigureAs(*g_graphics_ctx, g_ui_backup, g_ui_backup_view, ui.backing.format, ui.backing.extent);
+	CopyInto(vk_command, ui, g_ui_backup);
+	// No HUD.
+	ui.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, vk_command);
+	const vk::ClearColorValue       transparent {std::array<uint32_t, 4> {0u, 0u, 0u, 0u}};
+	const vk::ImageSubresourceRange level {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk_command.clearColorImage(ui.backing.image, vk::ImageLayout::eTransferDstOptimal, &transparent, 1, &level);
+	ui.Transit(ui_layout, vk::AccessFlagBits2::eShaderRead, {}, vk_command);
+	flip.Transit(flip_layout, flip_access, {}, vk_command);
+	// The draw without it (the pass as the game began it: cleared, unless it was already in progress).
+	g_resuming = true;
+	if (in_pass) command.ResumeRendering(rendering);
+	else command.BeginRendering(rendering);
+	redraw();
+	command.EndRendering();
+	ConfigureAs(*g_graphics_ctx, g_hudless, g_hudless_view, UnormOf(flip.backing.format), flip.backing.extent);
+	CopyInto(vk_command, flip, g_hudless);
+	// Everything back.
+	CopyBack(vk_command, g_flip_backup, flip);
+	CopyBack(vk_command, g_ui_backup, ui);
+	ui.Transit(ui_layout, vk::AccessFlagBits2::eShaderRead, {}, vk_command);
+	flip.Transit(flip_layout, flip_access, {}, vk_command);
+	if (in_pass) command.ResumeRendering(rendering);
+	g_resuming      = false;
+	g_hudless_taken = true;
+	g_composite     = true;
+}
+
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs, ImageId flip_id, Image& flip) {
 	inputs.valid       = false;
@@ -975,6 +1133,8 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	const auto flip_renders  = g_flip_renders;
 	const auto flip_draws    = g_flip_max_draws;
 	g_hudless_taken          = false;
+	const bool composite     = std::exchange(g_composite, false);
+	g_target_draws.clear();
 	g_flip_renders           = 0;
 	g_flip_max_draws         = 0;
 	g_flip_pass              = false;
@@ -1013,8 +1173,8 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	}
 	if (g_hudless_logs < 12) {
 		++g_hudless_logs;
-		std::printf("HUD-less: %u render passes into the flip image this frame (most draws in one: %u), copy after draw %u: %s\n",
-		            flip_renders, flip_draws, HudlessDraw(), hudless ? "taken" : "none");
+		std::printf("HUD-less: %u render passes into the flip image this frame (most draws in one: %u), %s\n",
+		            flip_renders, flip_draws, !hudless ? "none" : composite ? "the composite drawn without its HUD" : "copy after the first draw (with the HUD)");
 		std::fflush(stdout);
 	}
 	inputs.render_extent = {motion.backing.extent.width, motion.backing.extent.height};

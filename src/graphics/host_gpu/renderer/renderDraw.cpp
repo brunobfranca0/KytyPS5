@@ -1644,6 +1644,16 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
+	// Frame generation: the draws into each target counted, and the game's final composite into the flip image found
+	// (it is recorded directly: FrameGen::BeforeFlipDraw draws it once more first, without the HUD).
+	int flip_slot = -1;
+	if (FrameGen::Capturing()) {
+		std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX> targets {};
+		for (uint32_t i = 0; i < state.color_count; ++i) targets[i] = state.color_info[i].image_id;
+		if (state.color_count > 0) FrameGen::NoteDraw(targets[0]);
+		if (!mesh_active && bindings.pixel.has_value())
+			flip_slot = FrameGen::FlipSlot(std::span {targets.data(), state.color_count});
+	}
 	bool record_draw = false;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	const auto primitive = ucfg.GetPrimType();
@@ -1658,6 +1668,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	     primitive == Prospero::PrimitiveType::kTriStrip ||
 	     primitive == Prospero::PrimitiveType::kRectList);
 #endif
+	if (flip_slot >= 0) record_draw = false;
 	auto vk_buffer = buffer.Handle();
 	if (set_bind_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x100u);
@@ -1713,11 +1724,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
-	m_context.GetCommandScheduler().BeginRendering(rendering);
-	if (!record_draw) {
-		if (set_auto_debug) {
-			SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
-		}
+	const auto emit_draw = [&] {
 		if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		} else if (emit.gpu_args != 0 && emit.indexed) {
@@ -1734,9 +1741,18 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 		}
+	};
+	if (flip_slot >= 0) {
+		FrameGen::BeforeFlipDraw(buffer, rendering, state.color_info[flip_slot].image_id, static_cast<uint32_t>(flip_slot),
+		                         std::span<const TextureBinding> {bindings.pixel->images}, emit_draw);
 	}
-	// Frame generation's HUD-less image: the flip image after the scene's draw (frame-gen.h).
-	if (FrameGen::Capturing()) FrameGen::AfterDraw(buffer);
+	m_context.GetCommandScheduler().BeginRendering(rendering);
+	if (!record_draw) {
+		if (set_auto_debug) {
+			SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
+		}
+		emit_draw();
+	}
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	else {
 		LocalDrawRecording::Draw packet {};
@@ -1756,6 +1772,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    emit.direct_run.empty() ? std::span {&command, 1} : emit.direct_run);
 	}
 #endif
+	// Frame generation's HUD-less image, when the composite above did not give it: the flip image after its first draw.
+	if (FrameGen::Capturing()) FrameGen::AfterDraw(buffer);
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

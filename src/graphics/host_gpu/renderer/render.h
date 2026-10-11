@@ -129,6 +129,8 @@ public:
 	// The render pass `state` again after an interruption (a copy of its target): its attachments loaded, not
 	// cleared, and `state` kept as the current one (the next draws with it continue the pass).
 	void ResumeRendering(const RenderState& state) const;
+	// The render pass `state` is the one in progress.
+	[[nodiscard]] bool RenderingWith(const RenderState& state) const { return m_rendering && m_render_state == state; }
 	// Raw internal graphics operations must invalidate the values recorded by
 	// the ordinary draw path. Compute and transfer commands do not alter them.
 	void InvalidateGraphicsState() const noexcept;

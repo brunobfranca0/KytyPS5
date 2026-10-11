@@ -13,10 +13,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <span>
 
 namespace Libs::Graphics {
 struct RenderState;
+struct TextureBinding;
 class CommandBuffer;
 class TextureCache;
 namespace FrameGen {
@@ -105,6 +107,15 @@ void OnBeginRendering(CommandBuffer& command, const RenderState& state);
 // first draw (the scene's full-screen pass; the HUD is drawn after it in the same pass). KYTY_FSR3_HUDLESS_DRAW: after
 // which draw.
 void AfterDraw(CommandBuffer& command);
+// Normal draw path. The game draws its final image (scene and HUD from separate textures) into the flip image with
+// one draw. NoteDraw counts the draws into each color target this frame. FlipSlot: the slot of `targets` that is a
+// recent flip image (-1: none). BeforeFlipDraw, with everything bound and before the pass begins: that draw once
+// more with the HUD's texture (of `images`, the one most draws went to this frame) cleared to transparent, the
+// result copied as the HUD-less image, then the flip image and the HUD texture put back as they were.
+void NoteDraw(ImageId target);
+[[nodiscard]] int FlipSlot(std::span<const ImageId> targets);
+void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageId target, uint32_t slot,
+                    std::span<const TextureBinding> images, const std::function<void()>& redraw);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
 // Present thread, in the present's command buffer: the HUD-less image scaled to the backbuffer (DLSS-G).
 void ScaleHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
