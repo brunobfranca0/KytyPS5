@@ -160,6 +160,14 @@ public:
 	};
 	void SynchronizeRegionRequest(SyncRegionRequest& request);
 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch.load(std::memory_order_acquire); }
+	// Moves whenever something ObtainBuffer of a written range does or looks at could differ from its last call over
+	// that range within one tick: a guest readback queued or finished (DrainGuestReadback), a GPU-modified range
+	// subtracted (its pages given back, a download, a discard), a copy feedback snapshot recorded
+	// (InvalidateCopyFeedback), a CPU write window invalidated. With it, the tick, the registration epoch and the
+	// range's CPU modification epoch unchanged, a written V# resolved once in the tick resolves to the same buffer and
+	// needs no second ObtainBuffer (TableBlocks' memo).
+	[[nodiscard]] uint64_t WrittenObtainEpoch() const { return m_written_obtain_epoch.load(std::memory_order_acquire); }
+	void                   MoveWrittenObtainEpoch() { m_written_obtain_epoch.fetch_add(1, std::memory_order_acq_rel); }
 	// A buffer registered or unregistered in the tracker regions of the range since `epoch`.
 	[[nodiscard]] bool RegisteredSince(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
 		for (auto region = vaddr / TRACKER_REGION_SIZE, last = (vaddr + size - 1) / TRACKER_REGION_SIZE; region <= last; ++region)
@@ -342,6 +350,7 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	std::shared_mutex                                 m_gpu_modified_mutex; // (its changes: HasGpuDirtyBytes)
+	std::atomic<uint64_t>                             m_written_obtain_epoch {1};
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	// ObtainBufferForImage (KYTY_ASYNC_UPLOAD=2): the backing pieces of an image upload.

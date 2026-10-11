@@ -407,6 +407,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 			LiveTrace::Event(LiveTrace::ReadbackTicks, address, size | request->tick << 32u);
 		m_guest_readbacks[slot] = request;
 		m_active_guest_readbacks |= 1u << slot;
+		MoveWrittenObtainEpoch();
 		LiveCounters::Add(LiveCounters::AsyncReadbacks);
 		return request;
 	}
@@ -424,6 +425,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// Subsequent accesses to this window must retire this request before proceeding.
 	m_guest_readbacks[slot] = request;
 	m_active_guest_readbacks |= 1u << slot;
+	MoveWrittenObtainEpoch();
 	LiveCounters::Add(LiveCounters::AsyncReadbacks);
 	return request;
 }
@@ -708,6 +710,7 @@ void BufferCache::DrainGuestReadback(uint64_t address, uint64_t size, bool gpu_r
 void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 	auto request = m_guest_readbacks[slot];
 	if (!request) return;
+	MoveWrittenObtainEpoch();
 	uint32_t pending = GuestReadback::Pending;
 	if (detach && !request->copied.load(std::memory_order_acquire) &&
 	    request->state.compare_exchange_strong(pending, GuestReadback::Detached, std::memory_order_acq_rel)) {
@@ -729,6 +732,7 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		for (const auto& part: request->parts) m_gpu_modified_ranges.Subtract(part.address, part.size);
+		MoveWrittenObtainEpoch();
 	}
 	// The renderer may have dirtied other pages in the widened window since handoff.
 	for (const auto& page: request->pages)
@@ -874,6 +878,7 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 	}
 	slot = {vaddr, size, m_scheduler.CurrentTick(), mapping_epoch, owner->Handle()};
 	if (feedback.Insert(vaddr, selected)) feedback.Count(slot, 1);
+	MoveWrittenObtainEpoch();
 	feedback.cursor = (selected + 1) % CopyFeedback::SlotCount;
 }
 
@@ -936,6 +941,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		for (const auto& copy: copies) m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+		MoveWrittenObtainEpoch();
 	}
 	// Only complete dirty-page coverage allows dropping protection. CPU-clean bytes
 	// are never published from the snapshot. Any later upload/GPU write invalidates it.
@@ -1235,6 +1241,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		for (const auto& copy: copies) m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+		MoveWrittenObtainEpoch();
 	}
 }
 
@@ -1531,6 +1538,7 @@ void BufferCache::DiscardGpuWrites(uint64_t vaddr, uint64_t size) {
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		m_gpu_modified_ranges.ForEachIntersection(first, last - first, [&](RangeSet::Range range) { dropped += range.size; });
 		m_gpu_modified_ranges.Subtract(first, last - first);
+		MoveWrittenObtainEpoch();
 	}
 	LiveCounters::Add(LiveCounters::DiscardedGpuBytes, dropped);
 	InvalidateCopyFeedback(first, last - first);

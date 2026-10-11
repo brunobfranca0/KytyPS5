@@ -255,11 +255,22 @@ struct RenderExecutor::TableXpr {
 	// A written V#'s range clamped to the mappings, and (`image_checked`) that no image starts at it, while `special`
 	// is the special generation (mappings and image starts as then): obtained as written at every use, its proofs
 	// (a memory lock and a texture cache lock and lookup) once (direct-mapped by the words).
+	// `memo`: the buffer the range was last obtained as written into (ObtainBuffer; the main executor, no speculation,
+	// unformatted), good while the tick, the registration epoch, BufferCache::WrittenObtainEpoch and the range's CPU
+	// modification epoch are those of that call: everything ObtainBuffer would do over it then is done (its pages
+	// GPU-owned and the range in the GPU-modified set, its feedback invalidated, its write noted for this tick, the
+	// readbacks over it drained) or would find the same (the buffer). A run of dispatches of one shader writes the same
+	// ~7 V#s each; at the dragon's path those ~10 000 second lookups a frame were 5 % of the render thread.
 	struct WrittenRange {
 		std::array<uint32_t, 4> words {};
 		uint32_t                special = 0;
 		bool                    image_checked = false;
+		bool                    memo = false;
 		uint64_t                address = 0, size = 0;
+		vk::DeviceAddress       device = 0;
+		BufferId                owner {};
+		const Buffer*           owner_buffer = nullptr;
+		uint64_t                tick = 0, registration = 0, obtain_epoch = 0, cpu_epoch = 0;
 	};
 	static constexpr size_t                WrittenEntries = 1024;
 	std::array<WrittenRange, WrittenEntries> written;
@@ -1364,12 +1375,47 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						if (image_starts(address)) return false;
 						proof.image_checked = true;
 					}
-					const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
-					region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
-					if (owner == nullptr || buffer_cache.GetBufferIfLive(buffer_cache.FindBuffer(address, size)) != owner)
-						return false;
-					if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
-					device = owner->BufferDeviceAddress() + offset;
+					const bool own_plain = Role() == 0 && Spec::Current() == nullptr && !formatted;
+					const auto tick      = m_context.GetCommandScheduler().CurrentTick();
+					if (proof.memo && own_plain && proof.tick == tick &&
+					    proof.registration == buffer_cache.RegistrationEpoch() &&
+					    proof.obtain_epoch == buffer_cache.WrittenObtainEpoch() &&
+					    cpu_epoch(address, size) == proof.cpu_epoch &&
+					    buffer_cache.GetBufferIfLive(proof.owner) == proof.owner_buffer) {
+						device = proof.device;
+						LiveCounters::Add(LiveCounters::TableWrittenMemo);
+						// KYTY_TABLE_WRITTEN_VERIFY=1: the lookup as well, its result against the memo's.
+						static const bool verify = std::getenv("KYTY_TABLE_WRITTEN_VERIFY") != nullptr;
+						if (verify) {
+							const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
+							region_epochs.fill({UINT64_MAX, 0});
+							const auto found = owner != nullptr ? owner->BufferDeviceAddress() + offset : vk::DeviceAddress {0};
+							static std::atomic<uint32_t> mismatches {0};
+							if (found != device && mismatches.fetch_add(1, std::memory_order_relaxed) < 16)
+								std::printf("Table: written memo mismatch at 0x%llx+0x%llx: memo 0x%llx, lookup 0x%llx\n",
+								            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+								            static_cast<unsigned long long>(device), static_cast<unsigned long long>(found));
+						}
+					} else {
+						proof.memo                 = false;
+						const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
+						region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
+						const auto id = buffer_cache.FindBuffer(address, size);
+						if (owner == nullptr || buffer_cache.GetBufferIfLive(id) != owner) return false;
+						if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
+						device = owner->BufferDeviceAddress() + offset;
+						// (The epochs after ObtainBuffer: its uploads and GPU marks are what the next use must find.)
+						if (const auto epoch = buffer_cache.CpuModificationEpoch(address, size); own_plain && epoch != 0) {
+							proof.memo         = true;
+							proof.device       = device;
+							proof.owner        = id;
+							proof.owner_buffer = owner;
+							proof.tick         = tick;
+							proof.registration = buffer_cache.RegistrationEpoch();
+							proof.obtain_epoch = buffer_cache.WrittenObtainEpoch();
+							proof.cpu_epoch    = epoch;
+						}
+					}
 				}
 				const auto [word, stride]      = word_of(words4);
 				block[plan.BufferDword(i)]     = static_cast<uint32_t>(device);
