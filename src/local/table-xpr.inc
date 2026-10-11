@@ -890,10 +890,11 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 			reader.Read(address, count, out);
 			return;
 		}
-		const auto begin = std::chrono::steady_clock::now();
+		// (TSC cycles, not steady_clock: two clock reads per run were 20% of the render thread at the dragon's path.)
+		const auto begin = __rdtsc();
 		reader.Read(address, count, out);
-		const auto end   = std::chrono::steady_clock::now();
-		const auto ns    = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+		const auto cycles = __rdtsc() - begin;
+		const auto ns     = cycles / 4u; // (~4 GHz TSC: a threshold and a total, not a measurement)
 		const uint64_t key   = pair.vs * 31u + st * 7919u + index;
 		auto&          probe = g_gpu_read_probes[(key * 0x9e3779b97f4a7c15ull) >> 54u];
 		const bool     mine  = probe.used && probe.shader == pair.vs && probe.stage == st && probe.run == index;
@@ -923,10 +924,14 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 			++probe.waits;
 			probe.wait_ns += ns;
 		}
-		if (g_gpu_read_start == std::chrono::steady_clock::time_point {}) g_gpu_read_start = end;
-		if (end - g_gpu_read_start >= std::chrono::seconds(10)) {
-			GpuReadProbePrint();
-			g_gpu_read_start = end;
+		if (ns >= 20000) {
+			// (The clock only after a wait: rare.)
+			const auto end = std::chrono::steady_clock::now();
+			if (g_gpu_read_start == std::chrono::steady_clock::time_point {}) g_gpu_read_start = end;
+			if (end - g_gpu_read_start >= std::chrono::seconds(10)) {
+				GpuReadProbePrint();
+				g_gpu_read_start = end;
+			}
 		}
 	};
 	// A run's address, its pages proven mapped and its lines loading.
