@@ -48,8 +48,13 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Before a host write of all of [vaddr, vaddr + size) (any thread): as InvalidateMemory, but the GPU-written bytes the
+	// write replaces are dropped, not read back (only those of its first and last page outside it are).
+	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	// Live "sync" (any thread, racy by design: for a stalled GPU thread).
 	void                   PrintSyncState();
+	// Live "buffers <path>": the cached buffers as a tab-separated table (on the GPU thread).
+	void                   WriteBufferReport(const char* path);
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
@@ -209,6 +214,12 @@ public:
 		TouchBuffer(*buffer);
 		return true;
 	}
+	// The buffers no binding used for a while go (RunGarbageCollector, once a flip).
+	void RetireStaleBuffers(uint64_t tick);
+	// The buffers [vaddr, vaddr + size) holds whole go, after the guest unmapped it (GpuResourceManager::UnmapMemory).
+	void DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size);
+	// Then a buffer the range holds in part, mapped in no more than half of it now, is cut to its mapped parts.
+	void SplitUnmappedBuffers(uint64_t vaddr, uint64_t size);
 	// The mapped parts of registered buffers in [begin, end), adjacent ones merged.
 	void CollectMappedRegisteredRanges(const RangeSet& mapped, uint64_t begin, uint64_t end,
 	                                   std::vector<RangeSet::Range>& ranges) const;
@@ -241,6 +252,8 @@ private:
 	}
 	[[nodiscard]] static std::pair<uint64_t, uint64_t> DownloadEnvelope(const DownloadCopy& copy);
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	// GPU thread: InvalidateMemoryForWrite's work where GPU-written bytes are in the range.
+	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);

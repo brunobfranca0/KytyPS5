@@ -134,6 +134,20 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+bool GpuResourceManager::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size)) {
+		return false;
+	}
+	m_buffer_cache.InvalidateMemoryForWrite(vaddr, size);
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	return true;
+}
+
+void GpuResourceManager::MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEachIntersection(vaddr, size, [&](RangeSet::Range range) { out.Add(range.address, range.size); });
+}
+
 bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
@@ -205,6 +219,10 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		}
 		const bool registered = size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
+		if (registered) {
+			m_buffer_cache.DeleteUnmappedBuffers(vaddr, size);
+			m_buffer_cache.SplitUnmappedBuffers(vaddr, size);
+		}
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);

@@ -37,7 +37,17 @@ public:
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Before a host write of the whole range: GPU-written bytes it replaces are dropped (BufferCache::InvalidateMemoryForWrite).
+	[[nodiscard]] bool InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
+	// Before a host write of the range: the images over it only (their bytes are rewritten, as InvalidateMemory does).
+	[[nodiscard]] bool InvalidateImages(uint64_t vaddr, uint64_t size) {
+		if (!IsMapped(vaddr, size)) return false;
+		m_texture_cache.InvalidateMemory(vaddr, size);
+		return true;
+	}
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// The mapped parts of [vaddr, vaddr + size), added to `out`.
+	void               MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	// `releasing`: the caller unmaps or decommits the range right after (munmap, free,
 	// memory pool decommit), not a range about to receive a mapping.

@@ -511,6 +511,56 @@ void TextureCache::RetireImage(ImageId id) {
 	DeleteImage(id);
 }
 
+// The guest's bytes are all of the image: only sampled (no GPU write, target, storage or video-out use), without
+// metadata, stencil or depth. Another view of its memory can be another image: each refreshes from those bytes (as
+// the buffer cache holds them), a CPU write invalidates both (InvalidateCpuAliases), a GPU buffer write marks both.
+bool TextureCache::GuestTexture(const Image& image) {
+	return image.registered && !image.depth_id && !image.IsGpuModified() && !image.usage.storage &&
+	       !image.usage.render_target && !image.usage.depth_target && !image.usage.video_out && !image.binding.is_target &&
+	       !image.info.IsDepth() && !image.info.HasMetadata() && !image.info.HasStencil() && image.info.samples == 1;
+}
+
+bool TextureCache::GuestTextureRequest(BindingType type, const ImageInfo& info) {
+	return type == BindingType::Texture && !info.IsDepth() && !info.HasMetadata() && !info.HasStencil() &&
+	       info.samples == 1;
+}
+
+void TextureCache::NoteGuestAlias(const ImageInfo& requested, Image& kept) {
+	++m_guest_aliases;
+	kept.guest_alias = true;
+	m_alias_insert   = true; // (FindImage marks the image it inserts)
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("TextureCache: guest texture alias addr=0x%llx size=0x%llx levels=%u layers=%u next to size=0x%llx "
+		            "levels=%u layers=%u fmt=%u %ux%u\n",
+		            static_cast<unsigned long long>(requested.data.address),
+		            static_cast<unsigned long long>(requested.data.size), requested.resources.levels,
+		            requested.resources.layers, static_cast<unsigned long long>(kept.info.data.size),
+		            kept.info.resources.levels, kept.info.resources.layers, static_cast<uint32_t>(requested.guest_format),
+		            requested.extent.width, requested.extent.height);
+		std::fflush(stdout);
+	}
+}
+
+// An image a write binding found: the guest-texture aliases at its address go (written, it no longer holds what they
+// read from the guest's bytes).
+void TextureCache::FreeGuestAliases(ImageId written) {
+	const auto                address = m_slot_images[written].info.data.address;
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, 1, pages)) return;
+	ImageIds others;
+	if (const auto* owners = m_image_page_table.Find(pages.first)) {
+		owners->ForEach([&](ImageId id) {
+			const auto* image = m_slot_images.try_get(id);
+			if (id != written && image != nullptr && image->guest_alias && image->info.data.address == address &&
+			    GuestTexture(*image)) {
+				others.push_back(id);
+			}
+		});
+	}
+	for (const auto id: others) FreeImage(id, "guest-alias-written");
+}
+
 void TextureCache::TouchImage(Image& image) {
 	if (auto* spec = Spec::Current()) { // (touched when the speculative translation is committed)
 		auto& touched = spec->touched_images;
@@ -1329,6 +1379,13 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            : ImageId {}};
 		}
 		if (requested.type == cached.info.type && !cached.info.resources.Contains(requested.resources)) {
+			// (A sampled view of a guest texture in a shape it does not hold, and the expanded image would not hold the
+			// texture's own: an image of its own, GuestTexture. One holding it replaces it as before.)
+			if (GuestTextureRequest(binding, requested) && GuestTexture(cached) &&
+			    !requested.resources.Contains(cached.info.resources)) {
+				NoteGuestAlias(requested, cached);
+				return {merged_id};
+			}
 			return {ExpandImage(requested, cached_id)};
 		}
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
@@ -2451,6 +2508,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
+		m_alias_insert = false;
 		ImageIds candidates;
 		if (kyty_local_preparation_lookup_mode.load(std::memory_order_relaxed) != 0) {
 			// Every exact match starts on the requested first page. Traversing
@@ -2510,17 +2568,30 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					            desc.info.extent.height, desc.info.resources.layers, desc.info.resources.levels,
 					            static_cast<uint32_t>(desc.type), static_cast<uint32_t>(desc.info.tile_mode));
 				}
-				FreeImage(result, "find-resources");
+				// (A sampled view of a guest texture in a shape it does not hold, which would not hold the texture's
+				// own either: an image of its own, the other view keeps this one, GuestTexture. One holding it replaces
+				// it as before: requests of the old shape find it.)
+				if (resolved.info.data.address == desc.info.data.address && GuestTextureRequest(desc.type, desc.info) &&
+				    GuestTexture(resolved) && !desc.info.resources.Contains(resolved.info.resources)) {
+					NoteGuestAlias(desc.info, resolved);
+				} else {
+					FreeImage(result, "find-resources");
+				}
 				result = {};
 			}
 		}
 		if (!result) {
-			result         = InsertImage(desc.info);
-			auto& inserted = m_slot_images[result];
+			result               = InsertImage(desc.info);
+			auto& inserted       = m_slot_images[result];
+			inserted.guest_alias = m_alias_insert;
+			m_alias_insert       = false;
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
+		}
+		if (m_guest_aliases != 0 && desc.type != BindingType::Texture) {
+			FreeGuestAliases(result);
 		}
 		auto& image = m_slot_images[result];
 		if (desc.info.tile_mode == Prospero::TileMode::kDepth &&
@@ -3648,6 +3719,36 @@ void TextureCache::EraseRetired() {
 	});
 }
 
+// Per flip, whatever the memory use (the collector below runs only near the video memory budget, never on a 32 GB GPU):
+// images no draw or dispatch used for RetireTicks flips go, at most MaxRetirements a flip, as stale buffers do
+// (BufferCache::RetireStaleBuffers). Kept, their page watchers took a fault at every write the game made when it gave
+// that memory to other data (the third loop of the user's 1-1 route: partial dirty faults 17 -> 164 a frame, write
+// faults 73 -> 232), and they held their video memory for good. One the game draws again is made again from its bytes.
+// Passed over (to the back of the list): images whose bytes only the GPU has (no download here), depth images with a
+// stencil association (deleting depth deletes it too), unregistered ones.
+void TextureCache::RetireStaleImages(uint64_t tick) {
+	constexpr uint64_t RetireTicks    = 1200;
+	constexpr size_t   MaxRetirements = 16;
+	if (tick <= RetireTicks) return;
+	thread_local std::vector<ImageId> stale, kept;
+	stale.clear();
+	kept.clear();
+	m_lru_cache.ForEachItemBelow(tick - RetireTicks, [&](ImageId id) {
+		const auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered) return false;
+		if (owner->depth_id || owner->IsGpuModified())
+			kept.push_back(id);
+		else
+			stale.push_back(id);
+		return stale.size() == MaxRetirements;
+	});
+	for (const auto id: kept) TouchImage(m_slot_images[id]);
+	for (const auto id: stale) {
+		DeleteImage(id);
+		LiveCounters::Add(LiveCounters::GcImageDeletes);
+	}
+}
+
 void TextureCache::RunGarbageCollector() {
 	EraseRetired();
 	std::scoped_lock lock {m_lock};
@@ -3658,6 +3759,7 @@ void TextureCache::RunGarbageCollector() {
 		RetireImage(item.second.id);
 		return true;
 	});
+	RetireStaleImages(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
