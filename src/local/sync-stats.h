@@ -6,6 +6,10 @@
 
 namespace SyncStats {
 [[nodiscard]] bool Enabled() noexcept;
+// KYTY_GPUREAD_PROBE=1: the table reads that waited, per shader and run ([gpuread], table-xpr.inc). Apart from
+// KYTY_SYNC_STATS: it times every table run (two TSC reads and a lookup each; ~8 % of the render thread at the dragon's
+// path, where a slow frame reads ~50 000 runs), so it is off unless asked for.
+[[nodiscard]] bool ReadProbe() noexcept;
 // A wait of that kind (0 GPU, 1 download) that took `ns`, from the current call stack.
 void Note(uint32_t kind, int64_t ns) noexcept;
 // The compute shader of the dispatch being translated (its code address; 0 a draw or none): the waits are listed per

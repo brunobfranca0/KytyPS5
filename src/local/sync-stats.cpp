@@ -71,6 +71,14 @@ bool Enabled() noexcept {
 	return enabled;
 }
 
+bool ReadProbe() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPUREAD_PROBE");
+		return value != nullptr && *value != '\0' && *value != '0';
+	}();
+	return enabled;
+}
+
 void Note(uint32_t kind, int64_t ns) noexcept {
 #if defined(_WIN32)
 	if (!Enabled()) return;

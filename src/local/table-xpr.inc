@@ -863,7 +863,7 @@ static uint32_t TableCodeWord(const ShaderRecompiler::IR::TablePlan::Operand& op
 // slots (a pointer read from memory may hold anything: what is read through it must be mapped), and the T#/S# words
 // they make (TableXpr::words, the set's key) and the pixel stage's LOD statistics words. False: something unmapped.
 namespace {
-// KYTY_SYNC_STATS: the table reads that waited (> 20 us: a synchronous download of GPU-written memory), per shader and
+// KYTY_GPUREAD_PROBE: the table reads that waited (> 20 us: a synchronous download of GPU-written memory), per shader and
 // run: how often, the time, whether the words changed since the run's previous read (served from the previous frame
 // they would be right when they did not), the words before and now, and whether the CPU needs them (to resolve
 // resources) or only the shader reads them. Every 10 s.
@@ -910,8 +910,8 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 	words.clear();
 	table.lod_stats.clear();
 	NativeXprReader reader(resources);
-	const bool probing = SyncStats::Enabled();
-	// (KYTY_SYNC_STATS) A run read through `reader`, noted when its memory is GPU-written.
+	const bool probing = SyncStats::ReadProbe();
+	// (KYTY_GPUREAD_PROBE) A run read through `reader`, noted when its memory is GPU-written.
 	const auto read_run = [&](uint32_t st, uint32_t index, uint64_t address, uint32_t count, uint32_t first,
 	                          uint32_t* out) {
 		if (!probing) {
