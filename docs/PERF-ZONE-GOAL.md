@@ -147,3 +147,11 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   lento (8,6 % de 19,4 ms), que en esa zona está en el camino crítico (CPU puro). Se mide en la misma zona: cpu ms del
   hilo de render en los segundos lentos y p5 de fps real. Siguientes: dispatch.table (5 ms: evaluación de tablas de
   ~2 800 dispatches, 1,8 us cada uno), TableBlocks/ObtainBuffer (12 %), VirtualProtect (4 %).
+- 2026-10-11, **pasada 4 medida** (8b03bc8, log 234732, 222 s por el camino del dragón, el jugador; referencias
+  169d1a9: logs 220008 (222 s) y 222444 (248 s)). **Pasada 4: real 57,3/54,0 → 57,9 fps de media, p5 45,8/45,0 →
+  51,2, segundos < 55: 22 %/50 % → 15 %; cpu del hilo de render en los segundos lentos 15,4/16,4 → 15,0 ms;
+  sync_download 0,0 → 0,0; gpu_wait 0,0 → 0,0: se queda.** Coste por draw de tabla (xpr) en los frames lentos con ≥
+  9 000 draws: 0,98 → 0,82 us (−17 %); dispatch.table igual (5,7 → 5,6 ms: sus runs son pocos). Las rutas son del
+  jugador (no la grabada), así que la media y el p5 llevan ruido de ruta (las dos referencias difieren entre sí más que
+  la pasada de ellas); lo que no lleva ruido es el coste por draw y que el cambio quita trabajo sin añadir ninguno.
+  `fsr3.json` sigue con KYTY_SYNC_STATS=1 (stacks [sync] sin coste por run).
