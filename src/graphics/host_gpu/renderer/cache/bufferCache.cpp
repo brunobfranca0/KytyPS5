@@ -2233,6 +2233,34 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	dst->CopyInRun(command, *src, src_offset, dst_offset, size);
 }
 
+bool BufferCache::FillPattern(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t period_bytes, uint64_t size, bool* on_cpu) {
+	*on_cpu = false;
+	if (Spec::Current() != nullptr || period_bytes == 0 || (period_bytes & 3u) != 0 || (size & 3u) != 0 || size == 0 ||
+	    IsRegionGpuModified(src_vaddr, period_bytes) || m_texture_cache.FindImageFromRange(src_vaddr, period_bytes))
+		return false;
+	if (!IsRegionGpuModified(dst_vaddr, size)) {
+		thread_local std::vector<uint8_t> pattern;
+		pattern.resize(size);
+		std::memcpy(pattern.data(), reinterpret_cast<const void*>(src_vaddr), period_bytes);
+		// (Doubling: each copy repeats what is already there.)
+		for (uint64_t filled = period_bytes; filled < size;) {
+			const auto bytes = std::min(filled, size - filled);
+			std::memcpy(pattern.data() + filled, pattern.data(), bytes);
+			filled += bytes;
+		}
+		CopyGuestMemory(dst_vaddr, reinterpret_cast<uint64_t>(pattern.data()), size);
+		*on_cpu = true;
+		return true;
+	}
+	if (period_bytes == 4) {
+		uint32_t value = 0;
+		std::memcpy(&value, reinterpret_cast<const void*>(src_vaddr), 4);
+		FillBuffer(dst_vaddr, size, value, false);
+		return true;
+	}
+	return false;
+}
+
 // Copies from this size on compare their pages on helper threads too (ParallelPages): below it, waking them costs about
 // what they would take off this thread.
 static constexpr uint64_t ParallelCompareBytes = uint64_t {2} << 20u;

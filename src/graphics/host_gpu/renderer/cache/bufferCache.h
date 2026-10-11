@@ -121,6 +121,10 @@ public:
 	                bool src_gds);
 	// CopyBuffer's copy on the CPU: only the destination pages whose bytes differ are written.
 	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
+	// The linear copy shader's repeating form (dst[i] = src[i % period], the period shorter than the count): on the CPU
+	// when neither range is GPU-written (CopyGuestMemory's way), a GPU fill for a one-word period; false: the caller
+	// leaves it to the shader. `on_cpu`: which way it went.
+	[[nodiscard]] bool FillPattern(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t period_bytes, uint64_t size, bool* on_cpu);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// GPU thread: retire a pending guest read before touching overlapping backing.
