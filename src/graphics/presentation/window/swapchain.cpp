@@ -1032,8 +1032,8 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			// and command buffers; the queue has its own lock), from the presenter's frame image into the swapchain's:
 			// nothing the GPU thread uses. Under the renderer's lock, its GPU thread waited for the whole recording
 			// and submission once a frame (~60 us, ~110 us with the wake-up). Frame generation shares the renderer's.
-			std::optional<RenderLockGuard> render_lock;
-			if (FrameGen::Enabled()) render_lock.emplace(m_impl->renderer.GetMutex());
+			// (Frame generation's inputs are the frame's own copies: no renderer lock. Under it the GPU thread waited for
+			// DLSS-G's present pacing: ~13 real fps.)
 			auto&             command          = m_impl->present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    (overlay_visual.active || hud != nullptr) && swapchain.PrepareSystemOverlay(hud);

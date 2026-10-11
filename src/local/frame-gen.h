@@ -97,6 +97,10 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 // Renderer thread, as a render pass begins (CommandBuffer::BeginRendering, after the previous one ended): a pass into
 // a recent flip image; the HUD-less copy is taken before the one the HUD starts with.
 void OnBeginRendering(CommandBuffer& command, const RenderState& state);
+// Renderer thread, after a draw was recorded: in the flip image's render pass, the HUD-less copy is taken after its
+// first draw (the scene's full-screen pass; the HUD is drawn after it in the same pass). KYTY_FSR3_HUDLESS_DRAW: after
+// which draw.
+void AfterDraw(CommandBuffer& command);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
 
 } // namespace FrameGen

@@ -1,5 +1,7 @@
 #include "frame-gen.h"
 #include "fsr3-fg.h"
+#include "graphics/presentation/videoOut.h"
+#include <chrono>
 #include "live-census.h"
 
 #include "common/logging/log.h"
@@ -223,6 +225,9 @@ bool             g_options_set = false;
 vk::Extent2D     g_options_backbuffer {};
 vk::Extent2D     g_options_render {};
 uint64_t         g_presents = 0;
+int              g_mode_set = -1; // the DLSS-G mode last set (1 on, 0 off)
+std::chrono::steady_clock::time_point g_stat_start {};
+uint32_t         g_stat_real = 0, g_stat_on = 0;
 
 // Matrices in Streamline's convention: row-major, row vectors (p' = p * M).
 using Mat4 = sl::float4x4;
@@ -532,12 +537,33 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		return;
 	}
 	const sl::ViewportHandle viewport {0};
-	const bool               usable = inputs != nullptr && inputs->valid;
+	// Movies, menus and loading screens (no TAA pass) are presented as they are: DLSS-G off for them.
+	const bool               usable = inputs != nullptr && inputs->valid && !VideoOut::MoviePlaying();
+	{
+		const auto now = std::chrono::steady_clock::now();
+		if (g_stat_start == std::chrono::steady_clock::time_point {}) g_stat_start = now;
+		++g_stat_real;
+		if (usable) ++g_stat_on;
+		const double window = std::chrono::duration<double>(now - g_stat_start).count();
+		if (window >= 1.0) {
+			std::printf("[dlssg] real %.1f fps, shown %.1f fps; generation on %u of %u frames\n", g_stat_real / window,
+			            g_stat_real / window * static_cast<double>(PresentedFrames()), g_stat_on, g_stat_real);
+			std::fflush(stdout);
+			g_stat_start = now;
+			g_stat_real  = 0;
+			g_stat_on    = 0;
+		}
+	}
 	// DLSS-G options: on while frames carry inputs; sizes are hints for its allocations.
-	if (!g_options_set || (usable && (g_options_backbuffer != backbuffer ||
-	                                  g_options_render != inputs->render_extent))) {
+	if (!g_options_set || g_mode_set != (usable ? 1 : 0) ||
+	    (usable && (g_options_backbuffer != backbuffer || g_options_render != inputs->render_extent))) {
 		sl::DLSSGOptions options {};
-		options.mode                = sl::DLSSGMode::eOn;
+		options.mode                = usable ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+		if (g_mode_set != (usable ? 1 : 0)) {
+			std::printf("DLSS-G: %s\n", usable ? "on (TAA pass)" : "off (no TAA pass: menu, loading or movie)");
+			std::fflush(stdout);
+		}
+		g_mode_set = usable ? 1 : 0;
 		options.numFramesToGenerate = static_cast<uint32_t>(g_generate);
 		options.numBackBuffers      = image_count;
 		options.colorWidth          = backbuffer.width;
@@ -671,14 +697,29 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		// The backbuffer is tagged only when the game image covers part of it (KYTY_PRESENT_ASPECT).
 		const bool      partial = region.offset.x != 0 || region.offset.y != 0 ||
 		                     region.extent.width != backbuffer.width || region.extent.height != backbuffer.height;
-		sl::ResourceTag tags[] {
+		// The HUD-less image (the flip image before the HUD), at the game image's size: DLSS-G keeps the HUD out.
+		sl::Resource hudless(sl::ResourceType::eTex2d, static_cast<VkImage>(inputs->hudless.image), nullptr,
+		                     static_cast<VkImageView>(inputs->hudless_view),
+		                     static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+		hudless.width        = inputs->hudless.extent.width;
+		hudless.height       = inputs->hudless.extent.height;
+		hudless.nativeFormat = static_cast<uint32_t>(inputs->hudless.format);
+		hudless.mipLevels    = 1;
+		hudless.arrayLayers  = 1;
+		hudless.flags        = 0;
+		hudless.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(inputs->hudless.usage));
+		const sl::Extent hudless_extent {0, 0, inputs->hudless.extent.width, inputs->hudless.extent.height};
+		std::vector<sl::ResourceTag> tags {
 		    sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &full),
 		    sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
 		                    &full),
-		    sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent,
-		                    &game),
 		};
-		if (const auto result = g_api.set_tag_for_frame(token, viewport, tags, partial ? 3u : 2u, nullptr);
+		if (partial)
+			tags.emplace_back(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &game);
+		if (inputs->has_hudless && inputs->hudless.image != nullptr)
+			tags.emplace_back(&hudless, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent,
+			                  &hudless_extent);
+		if (const auto result = g_api.set_tag_for_frame(token, viewport, tags.data(), static_cast<uint32_t>(tags.size()), nullptr);
 		    result != sl::Result::eOk && g_presents < 8) {
 			LOGF("frame generation: slSetTagForFrame failed (%d)\n", static_cast<int>(result));
 		}
@@ -795,14 +836,6 @@ bool HudlessWanted() {
 	}();
 	return wanted;
 }
-uint32_t HudlessPass() {
-	static const uint32_t pass = [] {
-		const char* value = std::getenv("KYTY_FSR3_HUDLESS_PASS");
-		const int   n     = value != nullptr ? std::atoi(value) : 2;
-		return static_cast<uint32_t>(std::clamp(n, 1, 16));
-	}();
-	return pass;
-}
 vk::Format UnormOf(vk::Format format) {
 	switch (format) {
 		case vk::Format::eR8G8B8A8Srgb: return vk::Format::eR8G8B8A8Unorm;
@@ -839,31 +872,65 @@ void CopyRaw(vk::CommandBuffer command, VulkanImage& source, VulkanImage& target
 
 } // namespace
 
+namespace {
+// The flip image's render pass in progress (renderer thread).
+bool              g_flip_pass       = false;
+const FlipTarget* g_flip_target     = nullptr;
+uint32_t          g_flip_attachment = 0;
+uint32_t          g_flip_draws      = 0;
+uint32_t          g_flip_max_draws  = 0;
+RenderState       g_flip_state {};
+bool              g_resuming        = false;
+uint32_t HudlessDraw() {
+	static const uint32_t draw = [] {
+		const char* value = std::getenv("KYTY_FSR3_HUDLESS_DRAW");
+		const int   n     = value != nullptr ? std::atoi(value) : 1;
+		return static_cast<uint32_t>(std::clamp(n, 1, 1000));
+	}();
+	return draw;
+}
+} // namespace
+
 void OnBeginRendering(CommandBuffer& command, const RenderState& state) {
-	if (!LiveCensus::g_render || !Capturing() || !HudlessWanted() || g_cache == nullptr || g_graphics_ctx == nullptr) return;
-	const FlipTarget* flip       = nullptr;
-	uint32_t          attachment = 0;
-	for (uint32_t i = 0; i < state.num_color_attachments && flip == nullptr; ++i) {
+	(void)command;
+	if (g_resuming || !LiveCensus::g_render || !Capturing() || !HudlessWanted() || g_cache == nullptr ||
+	    g_graphics_ctx == nullptr)
+		return;
+	g_flip_pass   = false;
+	g_flip_target = nullptr;
+	for (uint32_t i = 0; i < state.num_color_attachments && g_flip_target == nullptr; ++i) {
 		const auto view = state.color_attachments[i].image_view;
 		if (view == nullptr) continue;
 		for (const auto& target: g_flips)
 			if (std::find(target.views.begin(), target.views.end(), view) != target.views.end()) {
-				flip       = &target;
-				attachment = i;
+				g_flip_target     = &target;
+				g_flip_attachment = i;
 				break;
 			}
 	}
-	if (flip == nullptr) return;
+	if (g_flip_target == nullptr) return;
+	g_flip_pass  = true;
+	g_flip_draws = 0;
+	g_flip_state = state;
 	++g_flip_renders;
-	if (g_hudless_taken || g_flip_renders != HudlessPass()) return;
-	auto& image = g_cache->GetImage(flip->id);
-	if (image.backing.image != flip->image || image.info.data.address != flip->address) return;
+}
+
+void AfterDraw(CommandBuffer& command) {
+	if (!g_flip_pass || !LiveCensus::g_render) return;
+	++g_flip_draws;
+	g_flip_max_draws = std::max(g_flip_max_draws, g_flip_draws);
+	if (g_hudless_taken || g_flip_draws != HudlessDraw() || g_flip_target == nullptr) return;
+	auto& image = g_cache->GetImage(g_flip_target->id);
+	if (image.backing.image != g_flip_target->image || image.info.data.address != g_flip_target->address) return;
 	ConfigureAs(*g_graphics_ctx, g_hudless, g_hudless_view, UnormOf(image.backing.format), image.backing.extent);
+	command.EndRendering();
 	auto vk_command = command.Handle();
 	CopyInto(vk_command, image, g_hudless);
-	// Back as the render pass expects it.
-	image.Transit(state.color_attachments[attachment].image_layout,
+	image.Transit(g_flip_state.color_attachments[g_flip_attachment].image_layout,
 	              vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite, {}, vk_command);
+	g_resuming = true;
+	command.ResumeRendering(g_flip_state);
+	g_resuming      = false;
 	g_hudless_taken = true;
 }
 
@@ -891,11 +958,14 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	}
 	const bool hudless       = g_hudless_taken && g_hudless.image != nullptr;
 	const auto flip_renders  = g_flip_renders;
+	const auto flip_draws    = g_flip_max_draws;
 	g_hudless_taken          = false;
 	g_flip_renders           = 0;
+	g_flip_max_draws         = 0;
+	g_flip_pass              = false;
 	// (DLSS-G needs the camera; FSR 3 only the TAA pass's images: the G-buffer draws that hold the camera mostly
 	// take the table path, which does not report it, and generation went on and off from frame to frame.)
-	const bool ready = g_sources.valid && (g_camera.valid || !g_ready);
+	const bool ready = g_sources.valid;
 	const auto sources = g_sources;
 	const auto camera  = g_camera;
 	g_sources.valid    = false;
@@ -928,8 +998,8 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	}
 	if (g_hudless_logs < 12) {
 		++g_hudless_logs;
-		std::printf("FSR3 HUD-less: %u render passes into the flip image this frame, copy before pass %u: %s\n", flip_renders,
-		            HudlessPass(), hudless ? "taken" : "none");
+		std::printf("HUD-less: %u render passes into the flip image this frame (most draws in one: %u), copy after draw %u: %s\n",
+		            flip_renders, flip_draws, HudlessDraw(), hudless ? "taken" : "none");
 		std::fflush(stdout);
 	}
 	inputs.render_extent = {motion.backing.extent.width, motion.backing.extent.height};

@@ -1735,6 +1735,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 		}
 	}
+	// Frame generation's HUD-less image: the flip image after the scene's draw (frame-gen.h).
+	if (FrameGen::Capturing()) FrameGen::AfterDraw(buffer);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	else {
 		LocalDrawRecording::Draw packet {};

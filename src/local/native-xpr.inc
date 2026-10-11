@@ -3170,6 +3170,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 			vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second,
 			                              group_sizes[group], static_cast<uint32_t>(stride));
 	}
+	if (FrameGen::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
 	emit.command     = vk_buffer;
 	emit.generation  = buffer.GraphicsGeneration();
 	emit.state       = &draw_state;
