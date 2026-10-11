@@ -767,7 +767,9 @@ void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs) {
 	inputs.valid = false;
-	const bool ready = g_sources.valid && g_camera.valid;
+	// (DLSS-G needs the camera; FSR 3 only the TAA pass's images: the G-buffer draws that hold the camera mostly
+	// take the table path, which does not report it, and generation went on and off from frame to frame.)
+	const bool ready = g_sources.valid && (g_camera.valid || !g_ready);
 	const auto sources = g_sources;
 	const auto camera  = g_camera;
 	g_sources.valid    = false;
