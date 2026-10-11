@@ -178,3 +178,12 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   cadena (3–5 ms de readbacks). Sigue el ataque a la traducción; con ~3 ms menos de cpu el frame cae bajo 16,7.
   (Hoy el PC se colgó en negro una vez con 8b03bc8 a 60 fps en marcha; el log acaba limpio: driver/hardware, no el
   emulador. Pendiente: visor de eventos a las 01:17.)
+- 2026-10-12, **pasada 5** (c128d6b): memo de los V# escritos en `TableBlocks`. Cada dispatch de tabla obtenía como
+  escritos sus ~7 búferes (ObtainBuffer: drenar readbacks, FindBuffer, sincronizar, invalidar feedback, cerrojo +
+  RangeSet::Add, NoteGpuWrite); en un run del mismo shader son los mismos. La `WrittenRange` del V# recuerda el búfer y
+  la dirección mientras no cambien el tick, la época de registro, `BufferCache::WrittenObtainEpoch` (nueva: readbacks
+  encolados/terminados, rangos GPU restados, instantáneas de feedback) ni la época CPU del rango. Techo medido en el
+  perfil: 5,3 % de las muestras (~8 % del trabajo, ~1 ms por frame lento); el coste añadido son 5 comparaciones.
+  Verificación: `KYTY_TABLE_WRITTEN_VERIFY=1` (hace la búsqueda y compara; "written memo mismatch" en el log).
+  Contador `table_written_memo`. Se mide en la zona como la pasada 4.
+
