@@ -40,13 +40,11 @@ inline std::optional<SaveDataCapacity> ReadSaveDataCapacity(const std::filesyste
 	const uint64_t used =
 	    bytes / SaveDataCapacity::BlockBytes + (bytes % SaveDataCapacity::BlockBytes != 0);
 	uint64_t      allocated = 0;
+	// The emulator's own bookkeeping: unreadable (a file of zeros after a power cut) counts as none, it is
+	// rewritten at the mount. Refusing the mount for it made every later save of the game fail.
 	std::ifstream file(metadata);
-	if (file) {
-		if (!(file >> allocated)) {
-			return std::nullopt;
-		}
-	} else if (std::filesystem::exists(metadata, ec) || ec) {
-		return std::nullopt;
+	if (file && !(file >> allocated)) {
+		allocated = 0;
 	}
 	allocated = std::max({allocated, used, SaveDataCapacity::MinimumBlocks});
 	return SaveDataCapacity {allocated, allocated - used};

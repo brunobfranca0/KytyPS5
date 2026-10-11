@@ -961,6 +961,7 @@ VulkanImage                            g_ui_backup;
 vk::ImageView                          g_ui_backup_view = nullptr;
 bool                                   g_composite      = false; // this frame's HUD-less image is a composite without HUD
 uint32_t                               g_composite_logs = 0;
+uint32_t                               g_flip_slot_hits = 0;
 uint64_t KeyOf(ImageId id) { return (uint64_t {id.index} << 32u) | id.generation; }
 // KYTY_FSR3_UI_IMAGE=n: the HUD texture is the composite's n-th candidate (the log lists them), not the guess.
 int UiOverride() {
@@ -1020,7 +1021,10 @@ int FlipSlot(std::span<const ImageId> targets) {
 	if (!LiveCensus::g_render || !HudlessWanted() || g_cache == nullptr || g_graphics_ctx == nullptr || g_hudless_taken)
 		return -1;
 	for (size_t i = 0; i < targets.size(); ++i)
-		if (FlipOf(targets[i]) != nullptr) return static_cast<int>(i);
+		if (FlipOf(targets[i]) != nullptr) {
+			++g_flip_slot_hits;
+			return static_cast<int>(i);
+		}
 	return -1;
 }
 
@@ -1189,6 +1193,21 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 		ConfigureAs(graphics, inputs.hudless, inputs.hudless_view, g_hudless.format, vk::Extent3D {g_hudless.extent.width, g_hudless.extent.height, 1});
 		CopyRaw(vk_command, g_hudless, inputs.hudless);
 		inputs.has_hudless = true;
+	}
+	{
+		// Every 600 frames with the TAA pass: how the HUD-less image was had (the composite without its HUD is the
+		// good one; with the HUD, the frame's HUD is interpolated).
+		static uint32_t frames = 0, composites = 0, with_hud = 0, flip_draws_seen = 0;
+		++frames;
+		composites += composite ? 1u : 0u;
+		with_hud += hudless && !composite ? 1u : 0u;
+		flip_draws_seen += std::exchange(g_flip_slot_hits, 0u) != 0 ? 1u : 0u;
+		if (frames == 600) {
+			std::printf("[hudless] 600 frames: composite without HUD %u, copy with HUD %u, none %u; flip draw on the normal path %u\n",
+			            composites, with_hud, frames - composites - with_hud, flip_draws_seen);
+			std::fflush(stdout);
+			frames = composites = with_hud = flip_draws_seen = 0;
+		}
 	}
 	if (g_hudless_logs < 12) {
 		++g_hudless_logs;
