@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -1052,14 +1053,22 @@ void BeforeFlipDraw(CommandBuffer& command, const RenderState& rendering, ImageI
 	if (const int forced = UiOverride(); forced >= 0) {
 		if (forced < static_cast<int>(candidates.size())) chosen = forced;
 	} else {
+		// Demon's Souls: the composite samples the scene at the internal resolution (2560x1440, upscaled by the draw)
+		// and the HUD layer at the output resolution (3840x2160, RGBA16F, drawn on paths that are not counted). So the
+		// HUD is first the image of the flip image's size, then the one with the most draws.
+		const auto rank = [&](const Candidate& c) {
+			auto& image = g_cache->GetImage(c.id);
+			const bool full = image.backing.extent.width == flip.backing.extent.width &&
+			                  image.backing.extent.height == flip.backing.extent.height;
+			return std::tuple {full, c.draws > 0, c.rgba8, c.draws};
+		};
 		for (size_t i = 0; i < candidates.size(); ++i) {
 			const auto& c = candidates[i];
-			if (c.draws == 0) continue;
-			if (chosen < 0 || std::pair {c.rgba8, c.draws} > std::pair {candidates[chosen].rgba8, candidates[chosen].draws})
-				chosen = static_cast<int>(i);
+			if (!std::get<0>(rank(c)) && c.draws == 0) continue;
+			if (chosen < 0 || rank(c) > rank(candidates[chosen])) chosen = static_cast<int>(i);
 		}
 	}
-	if (g_composite_logs < 8) {
+	if (g_composite_logs < 8 || (UiDebug() && g_composite_logs < 200 && (++g_composite_logs % 20) == 0)) {
 		++g_composite_logs;
 		std::printf("HUD-less: the flip image's draw (%ux%u format %d) samples %zu images, candidates:",
 		            flip.backing.extent.width, flip.backing.extent.height, static_cast<int>(flip.backing.format),
