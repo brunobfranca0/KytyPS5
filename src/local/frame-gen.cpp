@@ -220,6 +220,7 @@ struct Api {
 	PFun_slDLSSGSetOptions*      dlssg_set_options   = nullptr;
 	PFun_slDLSSGGetState*        dlssg_get_state     = nullptr;
 	PFun_slReflexSetOptions*     reflex_set_options  = nullptr;
+	PFun_slReflexSleep*          reflex_sleep        = nullptr;
 	PFun_slPCLSetMarker*         pcl_set_marker      = nullptr;
 };
 Api              g_api;
@@ -524,6 +525,10 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	    !FeatureFunction(sl::kFeaturePCL, "slPCLSetMarker", g_api.pcl_set_marker)) {
 		return;
 	}
+	// slReflexSleep each frame (KYTY_DLSSG_SLEEP=0: not): Reflex is then active, as DLSS-G requires; without it its
+	// pacer held every present ~25 ms (the game at ~37 fps), and with Reflex off the game reached ~56 but DLSS-G
+	// reported Reflex missing (a tinted picture).
+	FeatureFunction(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep);
 	sl::ReflexOptions reflex {};
 	reflex.mode = sl::ReflexMode::eLowLatency;
 	// KYTY_DLSSG_REFLEX=off|low|boost (a comparison of DLSS-G's pacing).
@@ -610,6 +615,11 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		return;
 	}
 	auto& token = *g_token;
+	static const bool sleep = [] {
+		const char* value = std::getenv("KYTY_DLSSG_SLEEP");
+		return value == nullptr || *value != '0';
+	}();
+	if (sleep && g_api.reflex_sleep != nullptr) g_api.reflex_sleep(token);
 	g_api.pcl_set_marker(sl::PCLMarker::eSimulationStart, token);
 	g_api.pcl_set_marker(sl::PCLMarker::eSimulationEnd, token);
 	g_api.pcl_set_marker(sl::PCLMarker::eRenderSubmitStart, token);
