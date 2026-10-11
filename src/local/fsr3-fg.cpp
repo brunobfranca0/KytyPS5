@@ -183,7 +183,7 @@ bool EnsurePresentHudless(GraphicContext& graphics, vk::Extent2D extent, vk::For
 	    g_present_hudless.extent.width == extent.width && g_present_hudless.extent.height == extent.height)
 		return true;
 	if (g_present_hudless.image != nullptr) graphics.DeleteImage(g_present_hudless);
-	g_present_hudless = {};
+	g_present_hudless.image = nullptr;
 	vk::ImageCreateInfo create {};
 	create.imageType     = vk::ImageType::e2D;
 	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
@@ -196,7 +196,7 @@ bool EnsurePresentHudless(GraphicContext& graphics, vk::Extent2D extent, vk::For
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, g_present_hudless)) {
-		g_present_hudless = {};
+		g_present_hudless.image = nullptr;
 		return false;
 	}
 	return true;
