@@ -1376,7 +1376,8 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						proof.image_checked = true;
 					}
 					const bool own_plain = Role() == 0 && Spec::Current() == nullptr && !formatted &&
-					                       kyty_local_table_written_memo.load(std::memory_order_relaxed) != 0;
+					                       kyty_local_table_written_memo.load(std::memory_order_relaxed) != 0 &&
+					                       !LaneSync::g_on; // (KYTY_ASYNC_COMPUTE: every write through ObtainBuffer)
 					const auto tick      = m_context.GetCommandScheduler().CurrentTick();
 					if (proof.memo && own_plain && proof.tick == tick &&
 					    proof.registration == buffer_cache.RegistrationEpoch() &&

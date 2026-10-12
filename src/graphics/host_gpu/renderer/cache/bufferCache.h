@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 
+#include "lane-sync.h"
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/lruCache.h"
@@ -60,7 +61,10 @@ public:
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] Buffer* GetBufferIfLive(BufferId id) {
 		auto* buffer = m_slot_buffers.try_get(id);
-		return buffer != nullptr && !buffer->is_deleted ? buffer : nullptr;
+		if (buffer == nullptr || buffer->is_deleted) return nullptr;
+		// KYTY_ASYNC_COMPUTE: the callers reuse a buffer they obtained before (memos, held V#s): a use of it.
+		LaneSync::Note(buffer->lane_marks, false);
+		return buffer;
 	}
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// FindBuffer's registered buffer over the range, none registered: the null id (a speculative translation's
