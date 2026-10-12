@@ -1382,6 +1382,30 @@ void InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemoryForWrite(vaddr, size);
 }
 
+void PrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || UINT64_MAX - vaddr < size || g_gpu_resources == nullptr) return;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// From the first page a store would fault on to the end of the last one.
+	uint64_t first = 0, last = 0;
+	bool     any   = false;
+	for (uint64_t at = vaddr; at < vaddr + size;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) == 0) return;
+		const auto end = std::min(reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize, vaddr + size);
+		if (end <= at) return;
+		const bool writable = info.State == MEM_COMMIT && (info.Protect & PAGE_GUARD) == 0 &&
+		                      (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
+		if (!writable) {
+			if (!any) first = at;
+			any  = true;
+			last = end;
+		}
+		at = end;
+	}
+	if (any) (void)g_gpu_resources->InvalidateMemoryForWrite(first, last - first);
+#endif
+}
+
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
 	       g_gpu_resources->InvalidateMemory(vaddr, size);
@@ -3017,20 +3041,34 @@ static bool FreeGuestMemoryOwner(uint64_t vaddr, uint64_t size) {
 	       g_virtual_ranges->Remove(vaddr, size);
 }
 
+static int UnmapRange(uint64_t vaddr, size_t len, const VirtualRanges::Range& range);
+
 static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 	if (len == 0 || UINT64_MAX - vaddr < len) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	VirtualRanges::Range range {};
-	if (!g_virtual_ranges->Query(vaddr, 0, &range)) {
-		return KERNEL_ERROR_EACCES;
+	// The virtual ranges it spans, one after the other. (A call level for each, as this was, overflowed a job fiber's
+	// stack: the game unmapped a streaming pool of 866 ranges in one call in the Nexus, 10-12.)
+	for (;;) {
+		VirtualRanges::Range range {};
+		if (!g_virtual_ranges->Query(vaddr, 0, &range)) {
+			return KERNEL_ERROR_EACCES;
+		}
+		const auto chunk_len = std::min<uint64_t>(len, range.size - (vaddr - range.start));
+		if (chunk_len == 0) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		if (const int ret = UnmapRange(vaddr, chunk_len, range); ret != OK || chunk_len == len) {
+			return ret;
+		}
+		vaddr += chunk_len;
+		len -= chunk_len;
 	}
-	const auto chunk_len = std::min<uint64_t>(len, range.size - (vaddr - range.start));
-	if (chunk_len < len) {
-		const int ret = UnmapMemoryRange(vaddr, chunk_len);
-		return ret == OK ? UnmapMemoryRange(vaddr + chunk_len, len - chunk_len) : ret;
-	}
+}
+
+// [vaddr, vaddr + len) of one virtual range.
+static int UnmapRange(uint64_t vaddr, size_t len, const VirtualRanges::Range& range) {
 	if (IsReservedRangeType(range.type)) {
 		if (!g_guest_address_space->ReleaseFree(vaddr, len)) {
 			return KERNEL_ERROR_EACCES;
@@ -4652,23 +4690,38 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 	return OK;
 }
 
-static int DecommitMemoryPoolRange(uint64_t vaddr, size_t len) {
-	VirtualRanges::Range old_range {};
-	if (!g_virtual_ranges->Query(vaddr, 0, &old_range)) {
-		return KERNEL_ERROR_EACCES;
-	}
-	const auto chunk_len = std::min<uint64_t>(len, old_range.size - (vaddr - old_range.start));
-	if (old_range.type == VirtualRangeType::PoolReserved) {
-		return chunk_len < len ? DecommitMemoryPoolRange(vaddr + chunk_len, len - chunk_len) : OK;
-	}
-	if (old_range.type != VirtualRangeType::Pooled) {
-		return KERNEL_ERROR_EACCES;
-	}
-	if (chunk_len < len) {
-		const int ret = DecommitMemoryPoolRange(vaddr, chunk_len);
-		return ret == OK ? DecommitMemoryPoolRange(vaddr + chunk_len, len - chunk_len) : ret;
-	}
+static int DecommitPoolRange(uint64_t vaddr, size_t len, const VirtualRanges::Range& old_range);
 
+static int DecommitMemoryPoolRange(uint64_t vaddr, size_t len) {
+	// The virtual ranges it spans, one after the other (as UnmapMemoryRange: not a call level each).
+	for (;;) {
+		VirtualRanges::Range old_range {};
+		if (!g_virtual_ranges->Query(vaddr, 0, &old_range)) {
+			return KERNEL_ERROR_EACCES;
+		}
+		const auto chunk_len = std::min<uint64_t>(len, old_range.size - (vaddr - old_range.start));
+		if (chunk_len == 0) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		// (A reserved part has nothing committed.)
+		if (old_range.type != VirtualRangeType::PoolReserved) {
+			if (old_range.type != VirtualRangeType::Pooled) {
+				return KERNEL_ERROR_EACCES;
+			}
+			if (const int ret = DecommitPoolRange(vaddr, chunk_len, old_range); ret != OK) {
+				return ret;
+			}
+		}
+		if (chunk_len == len) {
+			return OK;
+		}
+		vaddr += chunk_len;
+		len -= chunk_len;
+	}
+}
+
+// [vaddr, vaddr + len) of one pooled virtual range.
+static int DecommitPoolRange(uint64_t vaddr, size_t len, const VirtualRanges::Range& old_range) {
 	std::vector<PooledMemory::Mapping> mappings;
 	if (!g_pooled_memory->Query(vaddr, len, &mappings)) {
 		return KERNEL_ERROR_EACCES;

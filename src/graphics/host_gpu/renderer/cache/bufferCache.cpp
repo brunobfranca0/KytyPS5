@@ -41,6 +41,7 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 }
 
 #include "common/assert.h"
+#include "common/guardedCopy.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -731,7 +732,7 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 	LiveCounters::Add(LiveCounters::GpuRangeEntries, m_gpu_modified_ranges.Count());
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
-		for (const auto& part: request->parts) m_gpu_modified_ranges.Subtract(part.address, part.size);
+		m_gpu_modified_ranges.SubtractSorted(request->parts);
 		MoveWrittenObtainEpoch();
 	}
 	// The renderer may have dirtied other pages in the widened window since handoff.
@@ -940,7 +941,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 	}
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
-		for (const auto& copy: copies) m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+		m_gpu_modified_ranges.SubtractSorted(copies);
 		MoveWrittenObtainEpoch();
 	}
 	// Only complete dirty-page coverage allows dropping protection. CPU-clean bytes
@@ -1240,7 +1241,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	}
 	{
 		const std::unique_lock lock(m_gpu_modified_mutex);
-		for (const auto& copy: copies) m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+		m_gpu_modified_ranges.SubtractSorted(copies);
 		MoveWrittenObtainEpoch();
 	}
 }
@@ -2057,6 +2058,27 @@ void BufferCache::FlushPrologueCopies(vk::CommandBuffer command) {
 	}
 }
 
+// An upload's source bytes (a CPU-dirty range) into host memory, from inside the memory tracker's upload callback: through
+// the backing view, whatever the guest range's protection, else through the guest view without faulting. A read of the
+// guest view that faulted re-entered the tracker from the callback (another tracker's page protection: the fault
+// handler read GPU data back) and ended the emulator (10-12, Tower of Latria, third visit). Bytes not readable at all (no
+// mapping) are uploaded as zeros, reported.
+static void ReadUploadSource(uint8_t* destination, uint64_t address, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryReadBackingToHost(address, destination, size)) return;
+#if defined(_WIN32)
+	if (const auto missed = Common::GuardedCopy(destination, reinterpret_cast<const void*>(address), size); missed != 0) {
+		std::memset(destination + (size - missed), 0, missed);
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("BufferCache: an upload's source 0x%llx+0x%llx is unreadable from +0x%llx: zeros uploaded\n",
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+			            static_cast<unsigned long long>(size - missed));
+	}
+#else
+	std::memcpy(destination, reinterpret_cast<const void*>(address), size);
+#endif
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size, const Buffer** ring_used) {
 	if (copies.empty()) {
@@ -2109,7 +2131,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			if (source != nullptr) {
 				AsyncUpload::Get().Push(mapped + copy.srcOffset, source, copy.size, address);
 			} else {
-				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+				ReadUploadSource(mapped + copy.srcOffset, address, copy.size);
 			}
 			copy.srcOffset += base_offset;
 		}
@@ -2122,9 +2144,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
-		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
+		ReadUploadSource(temporary->Mapped().data() + copy.srcOffset, buffer.CpuAddress() + copy.dstOffset, copy.size);
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();
@@ -2609,6 +2629,15 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid registered-region query\n");
+	}
+	// A short range asks the page table: buffers cover whole caching pages (CreateBuffer aligns them, a split cuts at
+	// mapping bounds) and registration fills their pages. (The map's search was 0.5% of the GPU thread at the 1-1
+	// ramparts: every guest readback asks.)
+	if (const auto first = vaddr >> PageTable::kPageBits, last = (vaddr + size - 1) >> PageTable::kPageBits;
+	    last - first < 4) {
+		for (auto page = first; page <= last; ++page)
+			if (const auto* owner = m_page_table.Find(page); owner != nullptr && *owner) return true;
+		return false;
 	}
 	// Cached buffers are ordered and non-overlapping. The last buffer beginning before the query
 	// end is therefore the only possible intersection.
