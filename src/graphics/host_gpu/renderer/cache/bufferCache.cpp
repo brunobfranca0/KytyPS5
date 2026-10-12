@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "lane-sync.h"
 #include "slow-log.h"
 
 #include "native-buffer-residency.h"
@@ -186,6 +187,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// A request spanning several pending page spans cannot share just one ticket.
 	DrainGuestReadback(address, size);
 	auto& buffer = m_slot_buffers[FindBuffer(address, size)];
+	LaneSync::Note(buffer.lane_marks, false);
 	auto begin = std::max(address & ~(WindowSize - 1), buffer.CpuAddress());
 	auto end = std::min(std::max(begin + WindowSize, address + size),
 	                          buffer.CpuAddress() + buffer.Size());
@@ -386,7 +388,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 			regions.push_back({buffer.Handle(), {envelope.source, envelope.cursor, envelope.size}});
 		request->parts = std::move(parts);
 		request->queue_value = m_readback_queue->Copy(regions, download->Handle(),
-		                                              m_scheduler.GetMasterSemaphore().Handle(),
+		                                              m_scheduler.GetMasterSemaphore().HandleOf(request->producer_tick),
 		                                              request->producer_tick);
 		LiveTrace::Event(LiveTrace::RbFast, begin, (end - begin) | request->producer_tick << 32u);
 		m_download_queue_values[slot] = request->queue_value;
@@ -1163,7 +1165,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 				for (const auto& copy: batch)
 					LiveTrace::Event(LiveTrace::SyncReadback, copy.address, copy.size | m_scheduler.CurrentTick() << 32u);
 			m_readback_queue->Wait(m_readback_queue->Copy(regions, download.Handle(),
-			                                              m_scheduler.GetMasterSemaphore().Handle(), wait_tick));
+			                                              m_scheduler.GetMasterSemaphore().HandleOf(wait_tick), wait_tick));
 			m_scheduler.WaitPriorityOperations(wait_tick);
 			if (kyty_local_readback_queue_mode.load(std::memory_order_relaxed) == 3) {
 				// The reference copy lands in a second reservation; the backing gets its bytes.
@@ -1771,6 +1773,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		if (!IsRegionRegistered(vaddr, size)) return;
 	}
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	LaneSync::Note(buffer.lane_marks, false);
 	if (TryReadCopyFeedback(buffer, vaddr, size)) {
 		if (is_write) m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		return;
@@ -1973,6 +1976,7 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, &ring); }, &last_dirty);
+	if (total_size != 0) LaneSync::Note(buffer.lane_marks, true);
 	if (source) {
 		for (const auto& copy: copies) {
 			InvalidateCopyFeedback(buffer.CpuAddress() + copy.dstOffset, copy.size);
@@ -2240,6 +2244,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		buffer = &m_slot_buffers[id];
 	}
 	TouchBuffer(*buffer);
+	LaneSync::Note(buffer->lane_marks, is_written);
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		// (Not Buffer::written_serial: the write's pages were synchronized above, none of them is a CPU-dirty page an
@@ -2284,6 +2289,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 			path = "buffer";
 			ApplyImageProtects();
 			TouchBuffer(buffer);
+			LaneSync::Note(buffer.lane_marks, false);
 			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 			return {&buffer, buffer.Offset(vaddr)};
 		}

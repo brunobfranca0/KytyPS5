@@ -645,6 +645,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 			queue_create_infos[0].queueCount = 2;
 			graphics.present_queue_created   = true;
 		}
+		// KYTY_ASYNC_COMPUTE: a third graphics-family queue for the game's compute queues (lane-sync.h).
+		if (const char* async = std::getenv("KYTY_ASYNC_COMPUTE");
+		    async != nullptr && *async == '1' && graphics.present_queue_created && families[queue_family].queueCount >= 3) {
+			queue_create_infos[0].queueCount = 3;
+			graphics.compute_queue_created   = true;
+		} else if (async != nullptr && *async == '1') {
+			std::printf("Async compute: the graphics queue family has fewer than 3 queues: off\n");
+		}
 	}
 #endif
 	if (const char* readback = std::getenv("KYTY_READBACK_QUEUE");
@@ -1428,6 +1436,10 @@ void WindowContext::CreateVulkan() {
 	if (graphic_ctx.present_queue_created) {
 		graphic_ctx.device.getQueue(queue_family, 1, &graphic_ctx.present_queue);
 		LOGF("\tpresent queue: family %u index 1\n", queue_family);
+	}
+	if (graphic_ctx.compute_queue_created) {
+		graphic_ctx.device.getQueue(queue_family, 2, &graphic_ctx.compute_queue);
+		LOGF("\tcompute queue: family %u index 2\n", queue_family);
 	}
 	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
 		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);

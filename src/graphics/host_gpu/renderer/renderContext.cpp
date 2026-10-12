@@ -8,6 +8,7 @@
 #include "local-platform.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <thread>
 
 namespace Libs::Graphics {
@@ -67,6 +68,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_gpu_resources(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (const char* async = std::getenv("KYTY_ASYNC_COMPUTE"); async != nullptr && *async == '1')
+		m_command_scheduler.EnableLanes();
 }
 
 RenderContext::~RenderContext() {

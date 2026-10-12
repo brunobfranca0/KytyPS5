@@ -37,6 +37,12 @@ public:
 	void           CompleteDraws(uint32_t draws);
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
+	// KYTY_ASYNC_COMPUTE (lane-sync.h): the queue the open command buffer is submitted on (0 graphics, 1 compute); a
+	// change submits the open buffer first. Lane 1 needs GraphicContext::compute_queue; without it every lane is 0.
+	void           SetLane(int lane);
+	void           AddLaneWaits(SubmitInfo& submit);
+	void           EnableLanes();
+	[[nodiscard]] int Lane() const noexcept { return m_lane; }
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -178,6 +184,8 @@ private:
 	uint32_t                     m_recorded_draws      = 0;
 	// The last tick handed to the driver (its vkQueueSubmit returned: on the recording worker for a deferred one).
 	std::atomic<uint64_t>        m_driver_tick {0};
+	int                          m_lane  = 0;
+	bool                         m_lanes = false;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	// Count of live entries in m_pending_operations, updated under

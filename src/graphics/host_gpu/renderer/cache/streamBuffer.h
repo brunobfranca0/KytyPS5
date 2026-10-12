@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_
 
+#include "lane-sync.h"
 #include "common/abi.h"
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -76,6 +77,7 @@ public:
 
 	// BufferCache state lives directly on the resource (is_deleted also read by a speculative translation's thread).
 	std::atomic<bool> is_deleted {false};
+	LaneSync::Marks   lane_marks; // KYTY_ASYNC_COMPUTE (lane-sync.h)
 	int    stream_score = 0;
 	size_t lru_id       = 0;
 	// A shader read it through the BDA page table while no buffer held its pages (FaultManager): such reads touch no

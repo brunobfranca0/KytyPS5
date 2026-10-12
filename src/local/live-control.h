@@ -23,6 +23,7 @@
 #include "frame-capture.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "lane-sync.h"
 #include "live-trace.h"
 #include "libs/controller.h"
 #include "loader/demonsSoulsWarp.h"
@@ -183,6 +184,15 @@ inline void Flip() {
 					last_guest[i] = value;
 				}
 				std::printf("\n");
+				if (LaneSync::g_on) {
+					static uint64_t last_acq[4] {};
+					const uint64_t  now_acq[4] {LaneSync::g_submits[0].load(), LaneSync::g_submits[1].load(),
+					                            LaneSync::g_waits[0].load(), LaneSync::g_waits[1].load()};
+					std::printf("[acq] submits graphics %llu compute %llu; cross waits on graphics %llu on compute %llu\n",
+					            static_cast<unsigned long long>(now_acq[0] - last_acq[0]), static_cast<unsigned long long>(now_acq[1] - last_acq[1]),
+					            static_cast<unsigned long long>(now_acq[2] - last_acq[2]), static_cast<unsigned long long>(now_acq[3] - last_acq[3]));
+					for (int n = 0; n < 4; ++n) last_acq[n] = now_acq[n];
+				}
 				std::fflush(stdout);
 				second       = {};
 				second.start = now;

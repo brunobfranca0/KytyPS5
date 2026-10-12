@@ -369,11 +369,11 @@ void EndTransitGroup() noexcept {
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+	constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+	                        vk::AccessFlagBits2::eColorAttachmentWrite |
+	                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+	                        vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite;
 	if (LiveTrace::WriteTicks()) {
-		constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
-		                        vk::AccessFlagBits2::eColorAttachmentWrite |
-		                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-		                        vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite;
 		LiveTrace::Event(LiveTrace::ImageUse, info.data.address,
 		                 (info.data.size & 0xffffffffu) |
 		                     (static_cast<bool>(destination_access & writes) ? uint64_t {1} << 63u : 0) |
@@ -392,6 +392,8 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	}
 	const auto& barriers =
 	    GetBarriers(destination_layout, destination_access, destination_stage, range);
+	// KYTY_ASYNC_COMPUTE: a layout transition is a write of the image too (the other lane must be done with it).
+	LaneSync::Note(lane_marks, static_cast<bool>(destination_access & writes) || !barriers.empty());
 	if (barriers.empty()) {
 		return;
 	}

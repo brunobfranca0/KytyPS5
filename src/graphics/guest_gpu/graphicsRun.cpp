@@ -1007,6 +1007,8 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 	const bool first_slice = !submission.started;
 	auto& cp = GetProcessor(submission.queue_id);
+	// KYTY_ASYNC_COMPUTE: the game's compute queues on the second Vulkan queue (lane-sync.h).
+	m_renderer.GetCommandScheduler().SetLane(submission.queue_id != 0 ? 1 : 0);
 
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();

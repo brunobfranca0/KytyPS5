@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 
+#include "lane-sync.h"
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -297,6 +298,7 @@ public:
 	// stamped instead (TextureCache::RegistrationsSince). (Atomic: the fault handler's threads move it too.)
 	std::atomic<uint64_t> validity {0};
 	ImageInfo        info;
+	LaneSync::Marks  lane_marks; // KYTY_ASYNC_COMPUTE (lane-sync.h)
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;

@@ -78,6 +78,9 @@ struct GraphicContext {
 	Common::Mutex                      present_queue_mutex;
 	vk::Queue                          present_queue = nullptr;
 	bool                               present_queue_created = false; // queue index 1 of queue_family
+	// KYTY_ASYNC_COMPUTE: a third queue of the graphics family for the game's compute queues (lane-sync.h).
+	vk::Queue                          compute_queue         = nullptr;
+	bool                               compute_queue_created = false; // queue index 2 of queue_family
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

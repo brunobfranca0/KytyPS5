@@ -12,6 +12,7 @@
 #endif
 #include "live-trace-gpu.h"
 #include "local-platform.h"
+#include "lane-sync.h"
 
 #include <algorithm>
 #include <atomic>
@@ -285,7 +286,7 @@ void CommandScheduler::Shutdown() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.WaitAll();
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -353,7 +354,7 @@ void CommandScheduler::Finish() {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.WaitAll();
 	BeginNext();
 	PopPendingOperations();
 }
@@ -680,8 +681,10 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		DeferredSubmit deferred {};
 		// This thread alone allocates ticks and the worker submits them in stream order: no queue
 		// lock here (it only waited for the worker's vkQueueSubmit, 1.2% of the render thread).
-		deferred.tick = m_master.NextTick();
-		submit.AddSignal(m_master.Handle(), deferred.tick);
+		AddLaneWaits(submit);
+		deferred.tick = m_master.NextTick(m_lane);
+		submit.AddSignal(m_master.Handle(m_lane), deferred.tick);
+		if (m_lanes) LaneSync::g_cur_tick = deferred.tick + 1;
 		deferred.count          = static_cast<uint32_t>(entries.size());
 		deferred.timestamp_slot = UINT32_MAX;
 		deferred.driver_tick    = &m_driver_tick;
@@ -691,7 +694,7 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 			if (!entries[i].ended) deferred.timestamp_slot = entries[i].timestamp_slot;
 		}
 		deferred.upload_sequence = AsyncUpload::SubmitSequence();
-		deferred.queue           = m_graphics.queue;
+		deferred.queue           = m_lane == 1 ? m_graphics.compute_queue : m_graphics.queue;
 		deferred.queue_mutex     = &m_graphics.queue_mutex;
 		deferred.waits           = submit.num_wait_semaphores;
 		deferred.signals         = submit.num_signal_semaphores;
@@ -727,8 +730,10 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 	uint64_t   tick;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
-		submit.AddSignal(m_master.Handle(), tick);
+		AddLaneWaits(submit);
+		tick = m_master.NextTick(m_lane);
+		submit.AddSignal(m_master.Handle(m_lane), tick);
+		if (m_lanes) LaneSync::g_cur_tick = tick + 1;
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
 		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
@@ -746,7 +751,7 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		result = (m_lane == 1 ? graphics.compute_queue : graphics.queue).submit(1, &submit_info, nullptr);
 		m_driver_tick.store(tick, std::memory_order_release);
 	}
 
@@ -900,6 +905,41 @@ void CommandScheduler::DiscardRecorded(Recorder& recorder) {
 void CommandScheduler::BeginNext() {
 	CheckActive();
 	BeginCommand();
+	if (m_lanes) LaneSync::g_cur_tick = m_master.CurrentTick();
+}
+
+void CommandScheduler::EnableLanes() {
+	if (m_lanes || m_graphics.compute_queue == nullptr) return;
+	m_master.EnableLanes();
+	m_lanes          = true;
+	LaneSync::g_on   = true;
+	LaneSync::g_lane = 0;
+	LaneSync::g_cur_tick = m_master.CurrentTick();
+	std::printf("Async compute: the game's compute queues go to a second Vulkan queue (KYTY_ASYNC_COMPUTE)\n");
+}
+
+void CommandScheduler::SetLane(int lane) {
+	if (lane != 0 && !m_lanes) lane = 0;
+	if (lane == m_lane) return;
+	if (t_recorder != nullptr) throw RecorderRefusal {"SetLane"};
+	if (!m_command.IsInvalid()) Submit();
+	m_lane           = lane;
+	LaneSync::g_lane = lane;
+	LaneSync::g_cur_tick = m_master.CurrentTick();
+}
+
+// The cross-lane waits the open command buffer's uses asked for (LaneSync::Note), on the other lane's timeline.
+void CommandScheduler::AddLaneWaits(SubmitInfo& submit) {
+	if (!m_lanes) return;
+	const int other = m_lane ^ 1;
+	if (const auto need = LaneSync::g_required[other]; need != 0) {
+		// (A tick of the other lane not submitted yet cannot be waited for: it is the other lane's open buffer's, which
+		// was submitted when the lane changed; never the case here.)
+		submit.AddWait(m_master.Handle(other), need);
+		LaneSync::g_waits[other].fetch_add(1, std::memory_order_relaxed);
+	}
+	LaneSync::g_required[0] = LaneSync::g_required[1] = 0;
+	LaneSync::g_submits[m_lane].fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace Libs::Graphics

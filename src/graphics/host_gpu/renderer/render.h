@@ -89,7 +89,7 @@ struct DrawAutoArgs {
 };
 
 struct SubmitInfo {
-	static constexpr uint32_t MaxSemaphores = 3;
+	static constexpr uint32_t MaxSemaphores = 4;
 
 	std::array<vk::Semaphore, MaxSemaphores>          wait_semaphores {};
 	std::array<uint64_t, MaxSemaphores>               wait_ticks {};
