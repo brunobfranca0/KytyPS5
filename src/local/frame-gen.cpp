@@ -234,6 +234,8 @@ int              g_mode_set = -1; // the DLSS-G mode last set (1 on, 0 off)
 std::chrono::steady_clock::time_point g_stat_start {};
 uint32_t         g_stat_real = 0, g_stat_on = 0;
 double           g_stat_present_ms = 0, g_stat_present_max = 0;
+double           g_stat_acquire_ms = 0, g_stat_acquire_max = 0, g_stat_gpuwait_ms = 0, g_stat_gpuwait_max = 0,
+                 g_stat_flip_ms = 0, g_stat_flip_max = 0;
 std::chrono::steady_clock::time_point g_present_begin {};
 
 // Matrices in Streamline's convention: row-major, row vectors (p' = p * M).
@@ -376,6 +378,29 @@ bool Capturing() {
 bool Requested() {
 	return g_generate > 0;
 }
+
+int GeneratedFrames() {
+	return g_generate;
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+void NoteAcquireMs(double ms) {
+	g_stat_acquire_ms += ms;
+	g_stat_acquire_max = std::max(g_stat_acquire_max, ms);
+}
+void NoteGpuWaitMs(double ms) {
+	g_stat_gpuwait_ms += ms;
+	g_stat_gpuwait_max = std::max(g_stat_gpuwait_max, ms);
+}
+void NoteFlipPresentMs(double ms) {
+	g_stat_flip_ms += ms;
+	g_stat_flip_max = std::max(g_stat_flip_max, ms);
+}
+#else
+void NoteAcquireMs(double) {}
+void NoteGpuWaitMs(double) {}
+void NoteFlipPresentMs(double) {}
+#endif
 
 void BypassCommandHooks(vk::Device device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -602,14 +627,18 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		if (usable) ++g_stat_on;
 		const double window = std::chrono::duration<double>(now - g_stat_start).count();
 		if (window >= 1.0) {
-			std::printf("[dlssg] real %.1f fps, shown %.1f fps; generation on %u of %u frames; present call %.2f ms (max %.1f)\n",
+			const double n = g_stat_real != 0 ? static_cast<double>(g_stat_real) : 1.0;
+			std::printf("[dlssg] real %.1f fps, shown %.1f fps; generation on %u of %u frames; present call %.2f ms (max %.1f); "
+			            "acquire %.2f (max %.1f), gpu wait %.2f (max %.1f), flip present %.2f (max %.1f)\n",
 			            g_stat_real / window, g_stat_real / window * static_cast<double>(PresentedFrames()), g_stat_on,
-			            g_stat_real, g_stat_real != 0 ? g_stat_present_ms / g_stat_real : 0.0, g_stat_present_max);
+			            g_stat_real, g_stat_present_ms / n, g_stat_present_max, g_stat_acquire_ms / n, g_stat_acquire_max,
+			            g_stat_gpuwait_ms / n, g_stat_gpuwait_max, g_stat_flip_ms / n, g_stat_flip_max);
 			std::fflush(stdout);
 			g_stat_start = now;
 			g_stat_real  = 0;
 			g_stat_on    = 0;
 			g_stat_present_ms = g_stat_present_max = 0;
+			g_stat_acquire_ms = g_stat_acquire_max = g_stat_gpuwait_ms = g_stat_gpuwait_max = g_stat_flip_ms = g_stat_flip_max = 0;
 		}
 	}
 	// DLSS-G options: on while frames carry inputs; sizes are hints for its allocations.

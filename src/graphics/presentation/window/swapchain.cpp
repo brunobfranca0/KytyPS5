@@ -515,9 +515,14 @@ void Swapchain::Create() {
 		               surface.capabilities.maxImageExtent.height);
 	}
 	uint32_t image_count = surface.capabilities.minImageCount + 1;
+	// KYTY_FRAMEGEN: DLSS-G holds the presented image while it generates and shows its frames (one more per generated
+	// frame); with the minimum the acquire of the next image waited for them, and the flip (done when the present
+	// returns) with it: the game then waited for the flip (log 032429: 32 % of the render thread in WaitFlipDone).
+	if (FrameGen::Requested()) image_count += static_cast<uint32_t>(FrameGen::GeneratedFrames());
 	if (surface.capabilities.maxImageCount != 0) {
 		image_count = std::min(image_count, surface.capabilities.maxImageCount);
 	}
+	if (FrameGen::Requested()) std::printf("Frame generation: swapchain of %u images\n", image_count);
 	const auto transform =
 	    surface.capabilities.supportedTransforms & vk::SurfaceTransformFlagBitsKHR::eIdentity
 	        ? vk::SurfaceTransformFlagBitsKHR::eIdentity
@@ -1029,8 +1034,12 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		std::printf("FSR3 FG: the window's size changed (fullscreen or resize): swapchain re-created\n");
 		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
 	}
+	const bool timed      = FrameGen::Enabled();
+	const auto flip_begin = std::chrono::steady_clock::now();
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		const auto acquire_begin = std::chrono::steady_clock::now();
 		auto status = swapchain.AcquireNextImage();
+		if (timed) FrameGen::NoteAcquireMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acquire_begin).count());
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);
 			continue;
@@ -1072,7 +1081,11 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		// GPU work while it holds a device-wide lock: every queue submission waits behind it,
 		// including those the GPU work may still depend on (a deadlock). Wait for the GPU here,
 		// holding nothing; the present on its own queue then finds the semaphore signaled.
-		m_impl->present_scheduler.Wait(frame.present_tick);
+		{
+			const auto wait_begin = std::chrono::steady_clock::now();
+			m_impl->present_scheduler.Wait(frame.present_tick);
+			if (timed) FrameGen::NoteGpuWaitMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_begin).count());
+		}
 #endif
 		// KYTY_FRAMEGEN: Streamline takes the present (vkQueuePresentKHR is its hook) and adds
 		// the generated frames; an idle refresh of the last frame carries no new inputs.
@@ -1091,6 +1104,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		status = swapchain.Present();
 		if (generate) {
 			FrameGen::AfterPresent();
+			FrameGen::NoteFlipPresentMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - flip_begin).count());
 		}
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);

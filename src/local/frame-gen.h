@@ -70,6 +70,13 @@ void Initialize();
 // After Initialize: Streamline is loaded (device creation then adds what it relies on but does
 // not add itself, VK_KHR_present_id for its VK_NV_low_latency2).
 [[nodiscard]] bool Requested();
+// Frames to generate per rendered frame (KYTY_FRAMEGEN; 0 when off).
+[[nodiscard]] int  GeneratedFrames();
+// The present thread's stages around a DLSS-G present, timed into the [dlssg] line: the swapchain image acquire, the
+// wait for the frame's own GPU work (present_scheduler) and the flip's whole Present (the flip is done when it returns).
+void NoteAcquireMs(double ms);
+void NoteGpuWaitMs(double ms);
+void NoteFlipPresentMs(double ms);
 // After the device exists: checks that DLSS-G is available on it.
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device);
 // Right after the dispatcher is loaded for the device (before the recording layer copies it):
