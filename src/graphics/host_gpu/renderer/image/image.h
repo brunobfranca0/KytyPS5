@@ -89,12 +89,6 @@ public:
 	                                   std::optional<ImageSubresourceRange> range);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
-	// As Transit, but the barriers go into `out` (the state moves as if recorded): the caller records them all in one
-	// vkCmdPipelineBarrier2 (Image::RecordTransits) before the one draw or dispatch. Returns whether any were added.
-	bool TransitInto(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	                 std::optional<ImageSubresourceRange> range, Barriers& out);
-	// The barriers TransitInto gathered, in one dependency (rendering ended first); `out` is cleared.
-	static void RecordTransits(CommandScheduler& scheduler, vk::CommandBuffer command_buffer, Barriers& out);
 	// The whole-image barrier state the calling thread's next transition starts from (a speculative translation's
 	// own once it used the image: speculation-state.h).
 	[[nodiscard]] const VulkanImageState& CurrentState() const;

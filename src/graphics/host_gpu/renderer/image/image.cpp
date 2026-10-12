@@ -402,39 +402,6 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	command_buffer.pipelineBarrier2(dependency);
 }
 
-bool Image::TransitInto(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                        std::optional<ImageSubresourceRange> range, Barriers& out) {
-	if (LiveTrace::WriteTicks()) {
-		constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
-		                        vk::AccessFlagBits2::eColorAttachmentWrite |
-		                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-		                        vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite;
-		LiveTrace::Event(LiveTrace::ImageUse, info.data.address,
-		                 (info.data.size & 0xffffffffu) |
-		                     (static_cast<bool>(destination_access & writes) ? uint64_t {1} << 63u : 0) |
-		                     static_cast<uint64_t>(destination_layout) << 32u);
-	}
-	const auto transfer_access = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
-	vk::PipelineStageFlags2 destination_stage {};
-	if (static_cast<bool>(destination_access & transfer_access)) destination_stage |= vk::PipelineStageFlagBits2::eTransfer;
-	if (!destination_access || static_cast<bool>(destination_access & ~vk::AccessFlags2 {transfer_access}))
-		destination_stage |= vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
-	const auto& barriers = GetBarriers(destination_layout, destination_access, destination_stage, range);
-	if (barriers.empty()) return false;
-	out.insert(out.end(), barriers.begin(), barriers.end());
-	return true;
-}
-
-void Image::RecordTransits(CommandScheduler& scheduler, vk::CommandBuffer command_buffer, Barriers& out) {
-	if (out.empty()) return;
-	scheduler.EndRendering();
-	vk::DependencyInfo dependency {};
-	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(out.size());
-	dependency.pImageMemoryBarriers    = out.data();
-	command_buffer.pipelineBarrier2(dependency);
-	out.clear();
-}
-
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
