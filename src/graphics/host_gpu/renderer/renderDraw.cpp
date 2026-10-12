@@ -1,3 +1,4 @@
+#include "local/skip-shader.h"
 #include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "live-trace-gpu.h"
@@ -2212,6 +2213,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	RenderLockGuard lock(m_context.GetMutex());
+	if (SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr)) return true; // live `skipcs` probe
 	if (args.index_count == 0 || args.instance_count == 0) {
 		return true;
 	}
@@ -2385,6 +2387,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	RenderLockGuard lock(m_context.GetMutex());
+	if (SkipShader::Skipped(sh_ctx.GetPs().ps_regs.data_addr)) return true; // live `skipcs` probe
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		return true;
 	}

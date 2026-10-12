@@ -1,3 +1,4 @@
+#include "local/skip-shader.h"
 #include "local/sync-stats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 
@@ -1768,7 +1769,7 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 	SyncStats::g_shader = 0;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	auto& executor = m_renderer.GetRenderExecutor();
-	if (FrameCapture::Active()) { // a recorded frame sees every draw on the normal path
+	if ((FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed))) { // a recorded frame sees every draw on the normal path
 		executor.NativeXprForgetState();
 		return 0;
 	}
@@ -1825,7 +1826,7 @@ uint32_t CommandProcessor::TryNativeMultiDraw(std::span<const uint32_t> packet) 
 	// What CpOpDrawIndirectMulti takes, of a count the packet holds (not read from memory), the arguments one after
 	// another: the draws of as many DRAW_INDEX_INDIRECT (TryNativeXprDraws).
 	constexpr uint32_t max_draws = 64;
-	if (FrameCapture::Active() || packet.size() < 10 || ((packet[4] >> 30u) & 1u) != 0 || packet[5] == 0 ||
+	if ((FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed)) || packet.size() < 10 || ((packet[4] >> 30u) & 1u) != 0 || packet[5] == 0 ||
 	    packet[5] > max_draws || packet[8] != sizeof(DrawIndexedIndirectArgs) || (packet[9] & ~0x20u) != 2u ||
 	    m_index_type_and_size > 1 || !m_index_base_addr || !m_index_buffer_size || !m_draw_indirect_args_base_addr ||
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
@@ -1862,7 +1863,7 @@ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet)
 		executor.NativeXprForgetState();
 		return 0u;
 	};
-	if (FrameCapture::Active() || XprCapture::Enabled() || m_index_type_and_size > 1 ||
+	if ((FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed)) || XprCapture::Enabled() || m_index_type_and_size > 1 ||
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
 		return skip();
 	// What CpOpDrawIndex / CpOpDrawIndexOffset accept (anything else takes them).
@@ -1908,7 +1909,7 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 	// What CpOpDrawIndexAuto accepts and draws (no vertices: nothing), of a type drawn as it is.
 	const auto primitive = m_ucfg.GetPrimType();
 	if (packet.size() < 3 || packet[0] != 0xc0012d00u || (packet[2] & ~0x22u) != 0 || packet[1] == 0 ||
-	    FrameCapture::Active() || XprCapture::Enabled() ||
+	    (FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed)) || XprCapture::Enabled() ||
 	    (primitive != PrimitiveType::kTriList && primitive != PrimitiveType::kTriStrip))
 		return 0;
 	CheckBuffer();
@@ -1924,7 +1925,7 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 
 uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets) {
 	constexpr uint32_t max_draws = 64;
-	if (FrameCapture::Active()) return 0; // one record per draw while a frame is recorded
+	if ((FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed))) return 0; // one record per draw while a frame is recorded
 	if (m_draw_run_skip) {
 		--m_draw_run_skip;
 		return 0;

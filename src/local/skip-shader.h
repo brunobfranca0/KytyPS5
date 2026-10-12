@@ -1,5 +1,5 @@
 #pragma once
-// Live probe `skipcs <guest code address hex>`: dispatches of that compute program are not run (toggles; `skipcs 0`
+// Live probe `skipcs <guest code address hex>`: dispatches of that compute program, or draws of that pixel shader, are not run (toggles; `skipcs 0`
 // clears all). For finding which pass draws an artifact; the image keeps its previous contents. Up to 8 programs.
 #include <atomic>
 #include <cstdint>

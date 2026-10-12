@@ -2097,7 +2097,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	m_dispatch_declined = "dispatch: nothing learned";
 	// (Frame generation, DLSS-G or FSR 3, needs the normal path for one dispatch a frame, the TAA pass's, refused
 	// below; with every dispatch refused under DLSS-G, as before, the game ran at ~30 real fps where FSR 3 ran at 57.)
-	if (catalog == nullptr || FrameCapture::Active() || XprCapture::Enabled()) return false;
+	if (catalog == nullptr || (FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed)) || XprCapture::Enabled()) return false;
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
 	DropStaleCatalog();
