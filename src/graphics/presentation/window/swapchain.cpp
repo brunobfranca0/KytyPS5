@@ -518,7 +518,12 @@ void Swapchain::Create() {
 	// KYTY_FRAMEGEN: DLSS-G holds the presented image while it generates and shows its frames (one more per generated
 	// frame); with the minimum the acquire of the next image waited for them, and the flip (done when the present
 	// returns) with it: the game then waited for the flip (log 032429: 32 % of the render thread in WaitFlipDone).
-	if (FrameGen::Requested()) image_count += static_cast<uint32_t>(FrameGen::GeneratedFrames());
+	// (KYTY_DLSSG_IMAGES=1 asks for them: with them the game closed while its title loaded, logs 040442-040700.)
+	static const bool more_images = [] {
+		const char* value = std::getenv("KYTY_DLSSG_IMAGES");
+		return value != nullptr && *value == '1';
+	}();
+	if (FrameGen::Requested() && more_images) image_count += static_cast<uint32_t>(FrameGen::GeneratedFrames());
 	if (surface.capabilities.maxImageCount != 0) {
 		image_count = std::min(image_count, surface.capabilities.maxImageCount);
 	}
