@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -445,7 +446,8 @@ static void audioout2_report_locked() {
 				if (!ctx.float_main) fate = "dropped: no float main port";
 				else if (port.audio_format != AudioInternal::Format::FloatMono) fate = "dropped: not float mono";
 				else if ((port.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0 &&
-				         (port.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL) > 1)
+				         (port.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL) > 1 && std::getenv("KYTY_AUDIO2_HOA") != nullptr &&
+				         *std::getenv("KYTY_AUDIO2_HOA") == '0')
 					fate = "dropped: ambisonics above first order";
 				else fate = "mixed";
 				char key[160];
@@ -493,6 +495,12 @@ static void audioout2_report_locked() {
 // the context's first float main port. Adding the 36 channels up instead cancelled most directions.
 static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, const AudioOut2PortStateEntry& target) {
 	constexpr float                 HALF_POWER = 0.70710677f;
+	static constexpr float HoaLeft[36]  = {0.265712f, 0.123879f, 0.000000f, 0.214565f, 0.160253f, 0.000000f, -0.106836f, 0.000000f, 0.092522f, 0.131933f, 0.000000f, -0.051098f, 0.000000f, -0.088504f, 0.000000f, 0.000000f, 0.071768f, 0.000000f, -0.054251f, 0.000000f, 0.042023f, 0.000000f, -0.031322f, 0.000000f, -0.041435f, 0.019143f, 0.000000f, -0.028537f, 0.000000f, 0.013210f, 0.000000f, 0.022881f, 0.000000f, 0.000000f, 0.000000f, -0.033157f};
+	static constexpr float HoaRight[36] = {0.265712f, -0.123879f, 0.000000f, 0.214565f, -0.160253f, 0.000000f, -0.106836f, 0.000000f, 0.092522f, -0.131933f, 0.000000f, 0.051098f, 0.000000f, -0.088504f, 0.000000f, 0.000000f, -0.071768f, 0.000000f, 0.054251f, 0.000000f, 0.042023f, 0.000000f, -0.031322f, 0.000000f, -0.041435f, -0.019143f, 0.000000f, 0.028537f, 0.000000f, -0.013210f, 0.000000f, 0.022881f, 0.000000f, 0.000000f, 0.000000f, -0.033157f};
+	static const bool hoa = [] {
+		const char* value = std::getenv("KYTY_AUDIO2_HOA");
+		return value == nullptr || *value != '0';
+	}();
 	thread_local std::vector<float> mix;
 	const auto channels = audioout2_data_format_channels(target.data_format);
 	const auto frames   = target.samples_num;
@@ -506,7 +514,16 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 		float left = HALF_POWER, right = HALF_POWER;
 		if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
 			const auto acn = object.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL;
-			if (acn == 1) {
+			if (hoa) {
+				// KYTY_AUDIO2_HOA (default on): the whole fifth-order scene decoded for two speakers at +-30 degrees
+				// (SN3D real harmonics, max-rE weights), scaled so that a source at a speaker's direction plays as loud
+				// as the first-order decode did. The voices (the Maiden in Black's, 12-10) came only in the orders above
+				// the first, which that decode dropped.
+				if (acn >= 36) continue;
+				left  = HoaLeft[acn];
+				right = HoaRight[acn];
+				if (left == 0.0f && right == 0.0f) continue;
+			} else if (acn == 1) {
 				right = -HALF_POWER;
 			} else if (acn != 0) {
 				continue;
