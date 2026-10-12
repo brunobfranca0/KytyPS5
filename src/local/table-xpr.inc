@@ -1375,7 +1375,8 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						if (image_starts(address)) return false;
 						proof.image_checked = true;
 					}
-					const bool own_plain = Role() == 0 && Spec::Current() == nullptr && !formatted;
+					const bool own_plain = Role() == 0 && Spec::Current() == nullptr && !formatted &&
+					                       kyty_local_table_written_memo.load(std::memory_order_relaxed) != 0;
 					const auto tick      = m_context.GetCommandScheduler().CurrentTick();
 					if (proof.memo && own_plain && proof.tick == tick &&
 					    proof.registration == buffer_cache.RegistrationEpoch() &&
@@ -1737,6 +1738,12 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	const auto registration = buffer_cache.RegistrationEpoch();
 	if (!TableBlocks(pair, user_data, blocks, &writes))
 		return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: blocks"), TableResult::Native;
+	// Frame generation's camera (FrameGen::OnDraw: the G-buffer vertex shaders' view-projection, previous one and
+	// jitter), from the block's slots: dword s of the vertex stage's block is flattened SRT slot s, as the normal path's
+	// flattened_srt. Without it every frame of a session reported "camera default" (the G-buffer draws take this path).
+	if (FrameGen::Capturing() && Spec::Current() == nullptr)
+		FrameGen::OnDraw(pair.programs[0]->shader_hash,
+		                 std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
@@ -2087,7 +2094,9 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
                                    uint64_t indirect_args, bool thread_dimensions) {
 	auto* catalog = CatalogTable();
 	m_dispatch_declined = "dispatch: nothing learned";
-	if (catalog == nullptr || FrameCapture::Active() || XprCapture::Enabled() || FrameGen::Enabled()) return false;
+	// (Frame generation, DLSS-G or FSR 3, needs the normal path for one dispatch a frame, the TAA pass's, refused
+	// below; with every dispatch refused under DLSS-G, as before, the game ran at ~30 real fps where FSR 3 ran at 57.)
+	if (catalog == nullptr || FrameCapture::Active() || XprCapture::Enabled()) return false;
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
 	DropStaleCatalog();

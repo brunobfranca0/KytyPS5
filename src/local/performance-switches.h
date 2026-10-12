@@ -48,6 +48,7 @@ extern volatile std::atomic_uint32_t kyty_local_table_xpr_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_dispatch_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_indirect_mode;
 extern volatile std::atomic_uint32_t kyty_local_table_store_budget;
+extern volatile std::atomic_uint32_t kyty_local_table_written_memo;
 extern volatile std::atomic_uint32_t kyty_local_table_set_proofs;
 #endif
 // Speculative translation of graphics command buffers (src/graphics/guest_gpu/speculation.h).
@@ -139,6 +140,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_TABLE_INDIRECT", &kyty_local_table_indirect_mode},
 	    // Table store requests per frame (0: no limit).
 	    Switch {"KYTY_TABLE_STORE_BUDGET", &kyty_local_table_store_budget, 0, 65536},
+	    // A table draw's or dispatch's written V#s resolved once per tick (TableBlocks' memo; default on, 0 for an A/B).
+	    Switch {"KYTY_TABLE_WRITTEN_MEMO", &kyty_local_table_written_memo},
 	    // Table set image uses checked again only when they changed (default on; 0 checks all, 2 verifies).
 	    Switch {"KYTY_TABLE_SET_PROOFS", &kyty_local_table_set_proofs, 0, 2},
 #endif

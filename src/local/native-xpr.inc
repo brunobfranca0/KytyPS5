@@ -82,6 +82,8 @@ extern "C" {
 // native records (each traced and sorted). Without one, three boots each: 1% low walking 33.3 -> 37.7, p99 20.7 ->
 // 19.6 ms, the slowest frame 44 -> 40 ms; the slow frames' render-thread time 118 -> 86 ms, native stores 699 -> 214.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_store_budget {0};
+// 1: TableBlocks resolves a written V# once per tick while nothing over its range changed (TableXpr::WrittenRange::memo).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_written_memo {1};
 // 1: a table set's image uses proven once are checked again only when their image or the registrations over their
 // pages changed (TableValidateSet); 2: all of them checked, those a proof held for that failed counted.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_set_proofs {1};
