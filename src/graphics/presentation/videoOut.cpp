@@ -1,5 +1,6 @@
 #include "graphics/presentation/videoOut.h"
 #include "live-counters.h"
+#include "local-platform.h"
 #include "live-trace.h"
 #include "time-census.h"
 
@@ -886,6 +887,7 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
+	LocalPlatform::SetThreadName("Kyty.Present");
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 

@@ -235,7 +235,8 @@ std::chrono::steady_clock::time_point g_stat_start {};
 uint32_t         g_stat_real = 0, g_stat_on = 0;
 double           g_stat_present_ms = 0, g_stat_present_max = 0;
 double           g_stat_acquire_ms = 0, g_stat_acquire_max = 0, g_stat_gpuwait_ms = 0, g_stat_gpuwait_max = 0,
-                 g_stat_flip_ms = 0, g_stat_flip_max = 0;
+                 g_stat_flip_ms = 0, g_stat_flip_max = 0, g_stat_submit_ms = 0, g_stat_submit_max = 0,
+                 g_stat_before_ms = 0, g_stat_before_max = 0;
 std::chrono::steady_clock::time_point g_present_begin {};
 
 // Matrices in Streamline's convention: row-major, row vectors (p' = p * M).
@@ -396,7 +397,17 @@ void NoteFlipPresentMs(double ms) {
 	g_stat_flip_ms += ms;
 	g_stat_flip_max = std::max(g_stat_flip_max, ms);
 }
+void NoteSubmitMs(double ms) {
+	g_stat_submit_ms += ms;
+	g_stat_submit_max = std::max(g_stat_submit_max, ms);
+}
+void NoteBeforePresentMs(double ms) {
+	g_stat_before_ms += ms;
+	g_stat_before_max = std::max(g_stat_before_max, ms);
+}
 #else
+void NoteSubmitMs(double) {}
+void NoteBeforePresentMs(double) {}
 void NoteAcquireMs(double) {}
 void NoteGpuWaitMs(double) {}
 void NoteFlipPresentMs(double) {}
@@ -629,16 +640,18 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		if (window >= 1.0) {
 			const double n = g_stat_real != 0 ? static_cast<double>(g_stat_real) : 1.0;
 			std::printf("[dlssg] real %.1f fps, shown %.1f fps; generation on %u of %u frames; present call %.2f ms (max %.1f); "
-			            "acquire %.2f (max %.1f), gpu wait %.2f (max %.1f), flip present %.2f (max %.1f)\n",
+			            "acquire %.2f (max %.1f), record+submit %.2f (max %.1f), gpu wait %.2f (max %.1f), before %.2f (max %.1f), flip present %.2f (max %.1f)\n",
 			            g_stat_real / window, g_stat_real / window * static_cast<double>(PresentedFrames()), g_stat_on,
 			            g_stat_real, g_stat_present_ms / n, g_stat_present_max, g_stat_acquire_ms / n, g_stat_acquire_max,
-			            g_stat_gpuwait_ms / n, g_stat_gpuwait_max, g_stat_flip_ms / n, g_stat_flip_max);
+			            g_stat_submit_ms / n, g_stat_submit_max, g_stat_gpuwait_ms / n, g_stat_gpuwait_max, g_stat_before_ms / n,
+			            g_stat_before_max, g_stat_flip_ms / n, g_stat_flip_max);
 			std::fflush(stdout);
 			g_stat_start = now;
 			g_stat_real  = 0;
 			g_stat_on    = 0;
 			g_stat_present_ms = g_stat_present_max = 0;
 			g_stat_acquire_ms = g_stat_acquire_max = g_stat_gpuwait_ms = g_stat_gpuwait_max = g_stat_flip_ms = g_stat_flip_max = 0;
+			g_stat_submit_ms = g_stat_submit_max = g_stat_before_ms = g_stat_before_max = 0;
 		}
 	}
 	// DLSS-G options: on while frames carry inputs; sizes are hints for its allocations.

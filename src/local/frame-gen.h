@@ -77,6 +77,8 @@ void Initialize();
 void NoteAcquireMs(double ms);
 void NoteGpuWaitMs(double ms);
 void NoteFlipPresentMs(double ms);
+void NoteSubmitMs(double ms);        // present thread: record + submit of the copy into the swapchain
+void NoteBeforePresentMs(double ms); // BeforePresent (Streamline tags and options)
 // After the device exists: checks that DLSS-G is available on it.
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device);
 // Right after the dispatcher is loaded for the device (before the recording layer copies it):

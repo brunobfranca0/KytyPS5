@@ -1056,6 +1056,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			// and submission once a frame (~60 us, ~110 us with the wake-up). Frame generation shares the renderer's.
 			// (Frame generation's inputs are the frame's own copies: no renderer lock. Under it the GPU thread waited for
 			// DLSS-G's present pacing: ~13 real fps.)
+			const auto        submit_begin     = std::chrono::steady_clock::now();
 			auto&             command          = m_impl->present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    (overlay_visual.active || hud != nullptr) && swapchain.PrepareSystemOverlay(hud);
@@ -1080,6 +1081,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			if (FrameGen::Enabled() && frame.fg.valid && !frame.reusing_last)
 				FrameGen::ScaleHudless(m_impl->window.graphic_ctx, command.Handle(), frame.fg, swapchain.Extent(), swapchain.Format());
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
+			if (timed) FrameGen::NoteSubmitMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_begin).count());
 		}
 #if defined(_WIN32)
 		// The Windows driver waits in vkQueuePresentKHR, inside the kernel, for the semaphore's
@@ -1096,9 +1098,11 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		// the generated frames; an idle refresh of the last frame carries no new inputs.
 		const bool generate = FrameGen::Enabled();
 		if (generate) {
+			const auto before_begin = std::chrono::steady_clock::now();
 			FrameGen::BeforePresent(frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
 			                        swapchain.Extent(), swapchain.PresentRegion(), swapchain.Format(),
 			                        swapchain.ImageCount());
+			FrameGen::NoteBeforePresentMs(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before_begin).count());
 		}
 		if (swapchain.IsFsr3()) {
 			// KYTY_FSR3_FG: this frame's depth and motion vectors (none: a menu, a loading screen, a movie, an idle
