@@ -186,4 +186,17 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   perfil: 5,3 % de las muestras (~8 % del trabajo, ~1 ms por frame lento); el coste añadido son 5 comparaciones.
   Verificación: `KYTY_TABLE_WRITTEN_VERIFY=1` (hace la búsqueda y compara; "written memo mismatch" en el log).
   Contador `table_written_memo`. Se mide en la zona como la pasada 4.
+- 2026-10-12, **escena fija del castillo** (c128d6b con FSR 3 x2, log 041505 y 043x; el jugador quieto donde "suele
+  caer"): real 51–52 fps, frame 19,6 ms = **cpu del hilo de render 12,3 + reposo 6,8** (esperando comandos del juego).
+  Traza GPU de 5 s (`_measure/trace-castillo.bin`): GPU ocupada 69 % = **13,6 ms por frame** (sin contar la generación
+  FSR 3, que va en otra cola: con ella ~16 ms), huecos > 1 ms casi ninguno (31 000 microhuecos entre envíos). Readbacks
+  del juego: **107 por frame**, 78 ms de espera por frame sumando sus hilos. Es la cadena en serie: traducción (12,3) →
+  GPU (13,6, solapada en parte) → readbacks → el juego manda lo siguiente. A 60 fps la GPU iría al 82 % + FG: muy justa.
+  Perfil CPU (`prof-castillo.bin`): TableDraw 27,7 % inclusivo, NativeXprTry 23,8 %, DispatchDirect 12,1 %,
+  TableEvaluate 9,0 % propio, ProcessPm4 7,2 %.
+  **Conclusión**: en el castillo quitar CPU sola no llega (12,3 ya está por debajo de 16,7); hay que acortar la cadena:
+  menos tiempo de GPU por frame (medir por shader con `tracem`: niebla volumétrica, sombras en cascada, pases de post;
+  el desarrollador midió fog off +1,9 fps, sombras off +3,5 fps) y/o que los readbacks no esperen la cola entera.
+  DLSS-G: descartado hoy (fps reales 35 frente a 57 con FSR 3 por bloqueos del hilo de render en WaitFlipDone, y cierre
+  del juego con 5 imágenes de swapchain, logs 040442/040552/040700); configs `dlss-*.json` quedan fuera del menú.
 
