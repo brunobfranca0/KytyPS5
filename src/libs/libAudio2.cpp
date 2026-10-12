@@ -305,7 +305,15 @@ static int audioout2_port_type_to_audio_out_type(uint16_t port_type) {
 		case 3: return AUDIO_OUT_PORT_TYPE_PADSPK;
 		case 4: return AUDIO_OUT_PORT_TYPE_PERSONAL;
 		case 5: return AUDIO_OUT_PORT_TYPE_AUX;
-		case 6: return AUDIO_OUT_PORT_TYPE_VIBRATION;
+		case 6: {
+			// KYTY_AUDIO2_PORT6_MAIN=1 (experiment): type 6 plays on the speakers instead of the vibration device (it
+			// carried the loud signal while the Maiden in Black spoke and the rest was silent, log 20261012-213558).
+			static const bool to_main = [] {
+				const char* value = std::getenv("KYTY_AUDIO2_PORT6_MAIN");
+				return value != nullptr && *value == '1';
+			}();
+			return to_main ? AUDIO_OUT_PORT_TYPE_MAIN : AUDIO_OUT_PORT_TYPE_VIBRATION;
+		}
 		default: return AUDIO_OUT_PORT_TYPE_MAIN;
 	}
 }
