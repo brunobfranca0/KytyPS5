@@ -942,6 +942,12 @@ void CommandScheduler::AddLaneWaits(SubmitInfo& submit) {
 		const auto last = m_master.LastTick(1);
 		if (last > LaneSync::g_required[1]) LaneSync::g_required[1] = last;
 	}
+	// KYTY_ACQ_NO_GFX_WAIT=1 (diagnostic only, may show wrong frames): the compute lane never waits for graphics.
+	static const bool no_gfx_wait = [] {
+		const char* value = std::getenv("KYTY_ACQ_NO_GFX_WAIT");
+		return value != nullptr && *value == '1';
+	}();
+	if (m_lane == 1 && no_gfx_wait) LaneSync::g_required[0] = 0;
 	if (const auto need = LaneSync::g_required[other]; need != 0) {
 		// (A tick of the other lane not submitted yet cannot be waited for: it is the other lane's open buffer's, which
 		// was submitted when the lane changed; never the case here.)

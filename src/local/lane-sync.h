@@ -28,6 +28,9 @@ inline uint64_t g_cur_tick = 0;     // the tick the open command buffer will be 
 inline uint64_t g_required[2] {};   // before the open buffer's submit: wait on lane X's timeline for this tick
 inline std::atomic<uint64_t> g_waits[2] {};  // statistics: cross-lane waits added (per lane waited on)
 inline std::atomic<uint64_t> g_submits[2] {};
+// Statistics: why a compute-lane buffer waited for graphics: [source * 2 + written], source 0 image, 1 range, 2 reuse.
+inline uint64_t g_why[6] {};
+inline int      g_src = 0;
 
 // A use of the resource with `marks` by the open command buffer (written: the GPU writes it).
 inline void Note(Marks& marks, bool written) noexcept {
@@ -35,7 +38,10 @@ inline void Note(Marks& marks, bool written) noexcept {
 	const int      lane  = g_lane;
 	const int      other = lane ^ 1;
 	const uint64_t need  = written ? marks.use[other] : marks.write[other];
-	if (need > g_required[other]) g_required[other] = need;
+	if (need > g_required[other]) {
+		g_required[other] = need;
+		if (lane == 1) ++g_why[g_src * 2 + (written ? 1 : 0)];
+	}
 	marks.use[lane] = g_cur_tick;
 	if (written) marks.write[lane] = g_cur_tick;
 }
@@ -55,7 +61,9 @@ inline void NoteRange(Marks& buffer, uint64_t vaddr, uint64_t size, bool written
 		Note(buffer, written);
 		return;
 	}
+	g_src = 1;
 	for (uint64_t page = first; page <= last; ++page) Note(g_pages[page & (PageSlots - 1)], written);
+	g_src = 0;
 	buffer.use[g_lane] = g_cur_tick;
 	if (written) buffer.write[g_lane] = g_cur_tick;
 }
@@ -76,7 +84,10 @@ inline int WriterLane(uint64_t vaddr, uint64_t size) noexcept {
 inline void NoteReuse(Marks& buffer) noexcept {
 	if (!g_on) return;
 	const int other = g_lane ^ 1;
-	if (buffer.write[other] > g_required[other]) g_required[other] = buffer.write[other];
+	if (buffer.write[other] > g_required[other]) {
+		g_required[other] = buffer.write[other];
+		if (g_lane == 1) ++g_why[4];
+	}
 	buffer.use[g_lane] = g_cur_tick;
 }
 

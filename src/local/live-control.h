@@ -192,6 +192,12 @@ inline void Flip() {
 					            static_cast<unsigned long long>(now_acq[0] - last_acq[0]), static_cast<unsigned long long>(now_acq[1] - last_acq[1]),
 					            static_cast<unsigned long long>(now_acq[2] - last_acq[2]), static_cast<unsigned long long>(now_acq[3] - last_acq[3]));
 					for (int n = 0; n < 4; ++n) last_acq[n] = now_acq[n];
+					static uint64_t last_why[6] {};
+					std::printf("[acq] compute waited for graphics by: image read %llu, image write %llu, range read %llu, range write %llu, reuse %llu\n",
+					            static_cast<unsigned long long>(LaneSync::g_why[0] - last_why[0]), static_cast<unsigned long long>(LaneSync::g_why[1] - last_why[1]),
+					            static_cast<unsigned long long>(LaneSync::g_why[2] - last_why[2]), static_cast<unsigned long long>(LaneSync::g_why[3] - last_why[3]),
+					            static_cast<unsigned long long>(LaneSync::g_why[4] - last_why[4]));
+					for (int n = 0; n < 6; ++n) last_why[n] = LaneSync::g_why[n];
 				}
 				std::fflush(stdout);
 				second       = {};
