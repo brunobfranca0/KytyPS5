@@ -20,7 +20,8 @@ struct Marks {
 	uint64_t write[2] {};
 };
 
-inline bool     g_on       = false; // KYTY_ASYNC_COMPUTE=1 and the compute queue exists
+inline bool     g_on       = false; // KYTY_ASYNC_COMPUTE=1/2 and the compute queue exists
+inline bool     g_safe     = true;  // graphics waits for all earlier compute (KYTY_ASYNC_COMPUTE=1; 2: data marks only)
 inline int      g_lane     = 0;     // lane of the open command buffer
 inline uint64_t g_cur_tick = 0;     // the tick the open command buffer will be submitted with
 inline uint64_t g_required[2] {};   // before the open buffer's submit: wait on lane X's timeline for this tick

@@ -68,7 +68,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_gpu_resources(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	if (const char* async = std::getenv("KYTY_ASYNC_COMPUTE"); async != nullptr && *async == '1')
+	if (const char* async = std::getenv("KYTY_ASYNC_COMPUTE"); async != nullptr && (*async == '1' || *async == '2'))
 		m_command_scheduler.EnableLanes();
 }
 

@@ -647,10 +647,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		}
 		// KYTY_ASYNC_COMPUTE: a third graphics-family queue for the game's compute queues (lane-sync.h).
 		if (const char* async = std::getenv("KYTY_ASYNC_COMPUTE");
-		    async != nullptr && *async == '1' && graphics.present_queue_created && families[queue_family].queueCount >= 3) {
+		    async != nullptr && (*async == '1' || *async == '2') && graphics.present_queue_created && families[queue_family].queueCount >= 3) {
 			queue_create_infos[0].queueCount = 3;
 			graphics.compute_queue_created   = true;
-		} else if (async != nullptr && *async == '1') {
+		} else if (async != nullptr && (*async == '1' || *async == '2')) {
 			std::printf("Async compute: the graphics queue family has fewer than 3 queues: off\n");
 		}
 	}

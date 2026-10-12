@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 extern "C" {
@@ -913,6 +914,7 @@ void CommandScheduler::EnableLanes() {
 	m_master.EnableLanes();
 	m_lanes          = true;
 	LaneSync::g_on   = true;
+	if (const char* async = std::getenv("KYTY_ASYNC_COMPUTE"); async != nullptr && *async == '2') LaneSync::g_safe = false;
 	LaneSync::g_lane = 0;
 	LaneSync::g_cur_tick = m_master.CurrentTick();
 	std::printf("Async compute: the game's compute queues go to a second Vulkan queue (KYTY_ASYNC_COMPUTE)\n");
@@ -932,6 +934,14 @@ void CommandScheduler::SetLane(int lane) {
 void CommandScheduler::AddLaneWaits(SubmitInfo& submit) {
 	if (!m_lanes) return;
 	const int other = m_lane ^ 1;
+	// KYTY_ASYNC_COMPUTE=1 (safe): a graphics submission also waits for every compute submission before it. Some
+	// paths reuse buffers and images without asking the caches again (memos, held V#s, deduplicated barriers) and
+	// note no use: the graphics lane, which reads what the culling writes, never sees a compute result early. The
+	// compute lane still runs ahead of graphics, which is where the game's readbacks waited. =2: data marks only.
+	if (m_lane == 0 && LaneSync::g_safe) {
+		const auto last = m_master.LastTick(1);
+		if (last > LaneSync::g_required[1]) LaneSync::g_required[1] = last;
+	}
 	if (const auto need = LaneSync::g_required[other]; need != 0) {
 		// (A tick of the other lane not submitted yet cannot be waited for: it is the other lane's open buffer's, which
 		// was submitted when the lane changed; never the case here.)
