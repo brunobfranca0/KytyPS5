@@ -242,3 +242,13 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   y ganancia x4 de los órdenes altos (71da595, KYTY_AUDIO2_HOA_GAIN): **la voz sigue sin oírse**. AJM decodifica
   sonidos nuevos al hablar (peaks 0,1–1,0) pero no llegan a la mezcla de objetos: pendiente seguir el audio desde AJM
   (qué instancia es la voz, a qué puerto/bus de Wwise va).
+- 2026-10-12 (noche), **audio por streaming** (KYTY_APR_LOG=1, log 20261012-213558): lo que no suena son fuentes de
+  `sound/streams/` (música y voces de la intro `pr_demons_souls_intro_{music,vo,sfx}.at9`, voces de NPC
+  `02_dialogue/en/04_maideninblack/v1310001*.at9`); los bancos en memoria sí suenan. Dos síntomas distintos:
+  (1) voz de la Doncella: el juego lee los 8 bloques de precarga (0x1864 + 7x0x3000) y **nunca pide el siguiente**
+  — la voz no llega a consumirse (no arranca); a la vez se leen sus `v1310000NN_face.cani`. (2) intro: los tres
+  streams sí se consumen (relleno cada ~0,17–0,45 s) y AJM decodifica (instancias 8 canales 0x4003/0x4004 con pico
+  0,002/0,000, 0x4005 0,17) pero la salida (puerto principal 8 ch y objetos) va casi en silencio. El puerto tipo 6
+  (pico 0,56) es la vibración del mando (probado redirigido: no es la voz). Siguiente paso: qué espera Wwise para
+  arrancar una fuente streaming (callbacks/estado de AJM o APR que devolvemos) y comprobar la decodificación ATRAC9
+  de 8 canales contra una referencia (VGAudio) con un .at9 de la intro.
