@@ -262,3 +262,10 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   del frame 3 (ERR_UNPACK_SCALE_FACTOR_OOB); cada superframe acaba en relleno 0x01. Falta averiguar el empaquetado
   exacto de esta variante (posible codificación conjunta entre canales) — o tomar otra ruta: decodificar sólo W
   (canal 0) como mono si se consigue separar su bloque.
+  Más pruebas (tools/local/at9-16ch/probe16.c, gcc con 3rdparty/LibAtrac9): con 16 decodificadores mono, bloques
+  alineados a byte en orden frame→canal y saltando el relleno 0x01, el superframe 0 entero decodifica (silencio: filas
+  de 16x37, 16x32, 16x29 y la 4.ª fila de 16 huecos de 286 B = 28 B + 258 B de relleno, total exacto 6144). En el
+  superframe 1 (empieza la voz: canal 0 usa 95/92/160 B) aparecen tamaños sospechosos en canales que deberían ir en
+  silencio (ch14 34 B, ch8 95 B) y la 4.ª fila falla en el canal 1 (ERR_UNPACK_SCALE_FACTOR_OOB) → el modelo "16 mono
+  independientes" no es exacto (probable: modo de scale factors que referencia otro canal, o bloques estéreo
+  mezclados). Descartados: 8 estéreo x 768 B, 16 mono x 384 B, config 16 mono con frame fijo de 1536 B.
