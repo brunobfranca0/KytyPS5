@@ -416,7 +416,12 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// KYTY_ASYNC_COMPUTE: the copy goes on the lane that wrote the bytes last (a culling result: the compute lane,
 	// not behind the graphics work queued on the other one).
 	const int lane_before = m_scheduler.Lane();
-	const int lane        = CommandScheduler::ThreadRecorder() == nullptr ? LaneSync::WriterLane(begin, end - begin) : lane_before;
+	// (Measured 12-10: on the compute lane the copy took longer, ~6 ms; KYTY_ACQ_READBACK_LANE=1 turns it on.)
+	static const bool by_writer = [] {
+		const char* value = std::getenv("KYTY_ACQ_READBACK_LANE");
+		return value != nullptr && *value == '1';
+	}();
+	const int lane = by_writer && CommandScheduler::ThreadRecorder() == nullptr ? LaneSync::WriterLane(begin, end - begin) : lane_before;
 	if (lane != lane_before) m_scheduler.SetLane(lane);
 	LaneSync::NoteRange(buffer.lane_marks, begin, end - begin, false);
 	for (const auto& envelope: envelopes)
