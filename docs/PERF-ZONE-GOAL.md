@@ -252,3 +252,13 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   (pico 0,56) es la vibración del mando (probado redirigido: no es la voz). Siguiente paso: qué espera Wwise para
   arrancar una fuente streaming (callbacks/estado de AJM o APR que devolvemos) y comprobar la decodificación ATRAC9
   de 8 canales contra una referencia (VGAudio) con un .at9 de la intro.
+- 2026-10-12 (noche), **causa de las voces que faltan**: los diálogos (`sound/streams/02_dialogue/*/*.at9`, p. ej.
+  `04_maideninblack/v131000120.at9`) son ATRAC9 de **16 canales** (ambisonics de 3.er orden, máscara 0x1fff,
+  superframe 0x1800 = 6144 B, 1024 muestras) con config `30 73 c1 7e` (sin el 0xFE de ATRAC9); la música de la intro es
+  ATRAC9 normal de 4 canales (config `fe 7a 17 f0`) y LibAtrac9 la decodifica bien fuera del emulador (pico 0,42).
+  `AjmDecAt9ParseConfigData` rechaza la config de 16 canales → el juego no crea el decodificador → la voz se precarga
+  y nunca se consume. Pruebas fuera del emulador (scratchpad/at9): 16 decodificadores mono con bloques alineados a
+  byte, frame tras frame, decodifican los 3 primeros frames (silencio: 16x37, 16x32, 16x29 B) y fallan en el bloque 1
+  del frame 3 (ERR_UNPACK_SCALE_FACTOR_OOB); cada superframe acaba en relleno 0x01. Falta averiguar el empaquetado
+  exacto de esta variante (posible codificación conjunta entre canales) — o tomar otra ruta: decodificar sólo W
+  (canal 0) como mono si se consigue separar su bloque.
