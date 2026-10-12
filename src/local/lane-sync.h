@@ -10,6 +10,7 @@
 // each lane's semaphore is signaled with the ticks of its own submissions (gaps are fine for a timeline).
 // Render thread only (the lane and the required waits are the render thread's).
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 
@@ -37,6 +38,46 @@ inline void Note(Marks& marks, bool written) noexcept {
 	if (need > g_required[other]) g_required[other] = need;
 	marks.use[lane] = g_cur_tick;
 	if (written) marks.write[lane] = g_cur_tick;
+}
+
+// Buffers are big (one Vulkan buffer can cover a whole guest heap): their marks are kept per 64 KiB of guest address
+// (a direct-mapped table; two addresses on one slot share it, which only adds waits). The buffer's own marks keep its
+// last write per lane, for the paths that reuse a buffer without an address (GetBufferIfLive: memos, held V#s).
+constexpr uint32_t PageBits  = 16;
+constexpr size_t   PageSlots = size_t {1} << 18;
+inline Marks       g_pages[PageSlots];
+
+inline void NoteRange(Marks& buffer, uint64_t vaddr, uint64_t size, bool written) noexcept {
+	if (!g_on) return;
+	const uint64_t first = vaddr >> PageBits;
+	const uint64_t last  = (vaddr + (size != 0 ? size : 1) - 1) >> PageBits;
+	if (last - first >= 4096) {
+		Note(buffer, written);
+		return;
+	}
+	for (uint64_t page = first; page <= last; ++page) Note(g_pages[page & (PageSlots - 1)], written);
+	buffer.use[g_lane] = g_cur_tick;
+	if (written) buffer.write[g_lane] = g_cur_tick;
+}
+
+// The lane whose write of the range is the latest (a copy of the range is recorded there: it waits for nothing else).
+inline int WriterLane(uint64_t vaddr, uint64_t size) noexcept {
+	if (!g_on) return 0;
+	uint64_t       latest[2] {};
+	const uint64_t first = vaddr >> PageBits;
+	const uint64_t last  = std::min((vaddr + (size != 0 ? size : 1) - 1) >> PageBits, first + 64);
+	for (uint64_t page = first; page <= last; ++page)
+		for (int lane = 0; lane < 2; ++lane)
+			latest[lane] = std::max(latest[lane], g_pages[page & (PageSlots - 1)].write[lane]);
+	return latest[1] > latest[0] ? 1 : 0;
+}
+
+// A reuse of a buffer obtained before: it waits for the other lane's last write anywhere in the buffer.
+inline void NoteReuse(Marks& buffer) noexcept {
+	if (!g_on) return;
+	const int other = g_lane ^ 1;
+	if (buffer.write[other] > g_required[other]) g_required[other] = buffer.write[other];
+	buffer.use[g_lane] = g_cur_tick;
 }
 
 } // namespace LaneSync

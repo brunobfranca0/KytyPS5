@@ -63,7 +63,7 @@ public:
 		auto* buffer = m_slot_buffers.try_get(id);
 		if (buffer == nullptr || buffer->is_deleted) return nullptr;
 		// KYTY_ASYNC_COMPUTE: the callers reuse a buffer they obtained before (memos, held V#s): a use of it.
-		LaneSync::Note(buffer->lane_marks, false);
+		LaneSync::NoteReuse(buffer->lane_marks);
 		return buffer;
 	}
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
