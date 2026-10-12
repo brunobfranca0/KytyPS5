@@ -162,6 +162,9 @@ jobs:
           Copy-Item "$build\kyty_emulator.exe", "$build\kyty_shader_precompile.exe", "$build\libwinpthread-1.dll",
             run-windows.ps1, precompile-windows.ps1, launcher.ps1, launcher.cmd, LICENSE $out
           Copy-Item LICENSES $out -Recurse
+          # Demon's Souls launcher (window with frame generation choice) and its two configs.
+          Copy-Item Launcher-souls.ps1, Launcher-souls.cmd $out
+          Copy-Item config "$out\config" -Recurse
           Copy-Item run-windows.json "$out\launch.json"
           Copy-Item docs\PORTABLE-README.md "$out\README.md"
           # The linker map of this exact build: render-thread profiles (live `prof`) are symbolized against it.
