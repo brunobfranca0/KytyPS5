@@ -231,3 +231,14 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   q49 lee q49/q33 (11 500) y q0 (~1 000, <5 ms); q0 lee q49 del frame anterior (~3 650). **Techo −6 ms/frame de
   cadena**; diseño y encargo en `docs/PROMPT-ASYNC-COMPUTE.md` (segunda cola/timeline para las colas de cómputo
   del juego, `KYTY_ASYNC_COMPUTE`).
+- 2026-10-12 (noche), **KYTY_ASYNC_COMPUTE** (1782c95 → 846034f, Launcher-paralelo): segunda cola Vulkan para las colas
+  de cómputo del juego. Andando por el castillo: picos de 130 → ~30 ms, pero en el punto fijo del castillo (19 ms/frame)
+  la lectura del culling (eboot+0xad8c20) sigue en ~6 ms con todas las variantes (marcas por búfer, por 64 KiB, copia en
+  el carril del escritor, sin esperas WAR) y aparecen fallos (temblores de animación, niebla volumétrica verde sin
+  WAR). **Descartado**; código detrás del interruptor, apagado por defecto. Perfil del punto fijo (prof-fijo.bin,
+  a1b2b83): espera 17 %, TableDraw 34 %, dispatches 18 % (TableEvaluate 12 %), ProcessPm4 8 %, VirtualProtect 4 %.
+- 2026-10-12, **voces que no suenan** (Doncella de Negro): el juego manda su mezcla como dos escenas ambisonics de
+  orden 5 en puertos de objeto; sólo se decodificaban W e Y. Decodificación completa a estéreo (KYTY_AUDIO2_HOA, ba6ff12)
+  y ganancia x4 de los órdenes altos (71da595, KYTY_AUDIO2_HOA_GAIN): **la voz sigue sin oírse**. AJM decodifica
+  sonidos nuevos al hablar (peaks 0,1–1,0) pero no llegan a la mezcla de objetos: pendiente seguir el audio desde AJM
+  (qué instancia es la voz, a qué puerto/bus de Wwise va).
