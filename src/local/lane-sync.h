@@ -31,13 +31,16 @@ inline std::atomic<uint64_t> g_submits[2] {};
 // Statistics: why a compute-lane buffer waited for graphics: [source * 2 + written], source 0 image, 1 range, 2 reuse.
 inline uint64_t g_why[6] {};
 inline int      g_src = 0;
+// KYTY_ACQ_WAR=0: a compute-lane write does not wait for graphics' earlier reads of the range (the game orders those
+// itself, as on the PS5, where its compute queues run beside graphics); it still waits for graphics' writes.
+inline bool     g_war = true;
 
 // A use of the resource with `marks` by the open command buffer (written: the GPU writes it).
 inline void Note(Marks& marks, bool written) noexcept {
 	if (!g_on) return;
 	const int      lane  = g_lane;
 	const int      other = lane ^ 1;
-	const uint64_t need  = written ? marks.use[other] : marks.write[other];
+	const uint64_t need  = written ? (lane == 1 && !g_war ? marks.write[other] : marks.use[other]) : marks.write[other];
 	if (need > g_required[other]) {
 		g_required[other] = need;
 		if (lane == 1) ++g_why[g_src * 2 + (written ? 1 : 0)];

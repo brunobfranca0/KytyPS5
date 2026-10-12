@@ -915,6 +915,7 @@ void CommandScheduler::EnableLanes() {
 	m_lanes          = true;
 	LaneSync::g_on   = true;
 	if (const char* async = std::getenv("KYTY_ASYNC_COMPUTE"); async != nullptr && *async == '2') LaneSync::g_safe = false;
+	if (const char* war = std::getenv("KYTY_ACQ_WAR"); war != nullptr && *war == '0') LaneSync::g_war = false;
 	LaneSync::g_lane = 0;
 	LaneSync::g_cur_tick = m_master.CurrentTick();
 	std::printf("Async compute: the game's compute queues go to a second Vulkan queue (KYTY_ASYNC_COMPUTE)\n");
