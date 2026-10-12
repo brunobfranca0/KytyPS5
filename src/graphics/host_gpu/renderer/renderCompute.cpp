@@ -1,3 +1,4 @@
+#include "local/skip-shader.h"
 #include "local/sync-stats.h"
 #include "common/assert.h"
 #include "live-trace-gpu.h"
@@ -400,6 +401,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (!ShaderAddressValid(sh_ctx.GetCs().cs_regs.data_addr)) {
 		return;
 	}
+	if (SkipShader::Skipped(sh_ctx.GetCs().cs_regs.data_addr)) return; // live `skipcs` probe
 
 	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
 	// A compute shader the normal path dispatched before (TableDispatchSeen) whose program allows table mode (an

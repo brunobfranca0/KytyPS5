@@ -19,6 +19,7 @@
 //   sleep <seconds>
 // Without KYTY_LIVE_FILE nothing runs; the flip hook is one relaxed increment.
 
+#include "local/skip-shader.h"
 #include "common/assert.h"
 #include "frame-capture.h"
 #include "live-census.h"
@@ -699,6 +700,9 @@ inline void Run(uint64_t id, const std::string& line) {
 		EXIT("live fatal: a test of the fatal-error exit\n");
 	} else if (cmd == "sleep" && n >= 2) {
 		std::this_thread::sleep_for(std::chrono::duration<double>(std::strtod(arg1, nullptr)));
+	} else if (cmd == "skipcs" && n >= 2) {
+		SkipShader::Toggle(std::strtoull(arg1, nullptr, 16));
+		std::printf("LIVE_SKIPCS id=%" PRIu64 " cs=%s\n", id, arg1);
 	} else if (cmd == "capture" && n >= 2) {
 		// capture <dir> [frames] [hash,hash,...]: every draw/dispatch of the next frames, with
 		// the constants of the listed shaders (frame-capture.h).
