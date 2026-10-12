@@ -199,4 +199,14 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   el desarrollador midió fog off +1,9 fps, sombras off +3,5 fps) y/o que los readbacks no esperen la cola entera.
   DLSS-G: descartado hoy (fps reales 35 frente a 57 con FSR 3 por bloqueos del hilo de render en WaitFlipDone, y cierre
   del juego con 5 imágenes de swapchain, logs 040442/040552/040700); configs `dlss-*.json` quedan fuera del menú.
+- 2026-10-12, **punto fijo del dragón** (route-20261011-220103 punto 4, `glide` desde el spawn; medidas `measure 10`
+  en el mismo proceso, ruido ±0,5 fps): c128d6b 50,3–52,6 fps, render 16,3–16,9 ms. **Pasada 6** (76215d2, las
+  transiciones de un set en una barrera): 53,4–54,4 fps, render 16,4–16,8 ms, barreras v2 por frame 934 → 862 (−8 %):
+  dentro del ruido, **revertida** (la mayoría de los draws transitan una sola imagen). A/B en vivo de
+  KYTY_DISPATCH_BATCH (128 → 32, 8, 1): 53,0/53,4/53,6/51,9 fps: sin efecto. Perfil en el punto (prof-d4-7621): esperas
+  12,8 % (hilo saturado: 16 ms de 18,9), TableEvaluate 10,8 % + 1,2 % memcpy (~2,1 ms: lecturas frías de las tablas del
+  juego, forma plana ya), ProcessPm4 7,5 %, VirtualProtect 5,5 %, TableBlocks 5,0 %, TableDraw 4,6 %, TableGather 3,0 %.
+  Aquí el límite es la traducción (no la cadena): faltan ~2,3 ms de CPU por frame para 60, repartidos en trozos de
+  ~1 ms sin un culpable claro. Alternativas que dan estabilidad ya: tope de 45 fps reales + FSR 3 x2 (90 fijos; el
+  punto nunca baja de 50), o modo cinemático (30 fijos) + FSR 3 x2.
 
