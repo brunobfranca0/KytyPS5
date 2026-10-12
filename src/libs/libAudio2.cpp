@@ -520,8 +520,14 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 				// as the first-order decode did. The voices (the Maiden in Black's, 12-10) came only in the orders above
 				// the first, which that decode dropped.
 				if (acn >= 36) continue;
-				left  = HoaLeft[acn];
-				right = HoaRight[acn];
+				// KYTY_AUDIO2_HOA_GAIN: the orders above the first scaled (an experiment: the voices' level there).
+				static const float high_gain = [] {
+					const char* value = std::getenv("KYTY_AUDIO2_HOA_GAIN");
+					return value != nullptr ? static_cast<float>(std::atof(value)) : 1.0f;
+				}();
+				const float scale = acn >= 4 ? high_gain : 1.0f;
+				left  = HoaLeft[acn] * scale;
+				right = HoaRight[acn] * scale;
 				if (left == 0.0f && right == 0.0f) continue;
 			} else if (acn == 1) {
 				right = -HALF_POWER;
