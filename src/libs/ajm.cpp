@@ -183,6 +183,31 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
 
+	if (static_cast<const uint8_t*>(config_data)[0] == 0x30) {
+		// Multichannel (ambisonic) ATRAC9: a mono stream per channel (atrac9_decoder.h).
+		const auto* c = static_cast<const uint8_t*>(config_data);
+		const uint32_t bits = (uint32_t {c[0]} << 24u) | (uint32_t {c[1]} << 16u) | (uint32_t {c[2]} << 8u) | uint32_t {c[3]};
+		const uint32_t srate = (bits >> 20u) & 0xfu, channels = ((bits >> 14u) & 0x3fu) + 1u;
+		const uint32_t frame_bytes = ((bits >> 2u) & 0x7ffu) + 1u, sf_index = bits & 3u;
+		if (((bits >> 13u) & 1u) != 0) return AJM_ERROR_INVALID_PARAMETER;
+		uint8_t mono[ATRAC9_CONFIG_DATA_SIZE] {0xfe, static_cast<uint8_t>(srate << 4u), 0, 0};
+		const uint32_t low = ((frame_bytes - 1u) << 5u) | (sf_index << 3u);
+		mono[2] = static_cast<uint8_t>(low >> 8u);
+		mono[3] = static_cast<uint8_t>(low);
+		auto* mh = Atrac9GetHandle();
+		if (mh == nullptr) return AJM_ERROR_INVALID_PARAMETER;
+		Atrac9CodecInfo info {};
+		const int r = Atrac9InitDecoder(mh, mono) == 0 ? Atrac9GetCodecInfo(mh, &info) : -1;
+		Atrac9ReleaseHandle(mh);
+		if (r != 0 || info.frameSamples <= 0 || info.framesInSuperframe <= 0) return AJM_ERROR_INVALID_PARAMETER;
+		config_info->channels                       = channels;
+		config_info->sample_rate                    = static_cast<uint32_t>(info.samplingRate);
+		config_info->frame_samples_per_channel      = static_cast<uint32_t>(info.frameSamples);
+		config_info->superframe_samples_per_channel = static_cast<uint32_t>(info.frameSamples * info.framesInSuperframe);
+		config_info->superframe_size                = channels * frame_bytes * static_cast<uint32_t>(info.framesInSuperframe);
+		return OK;
+	}
+
 	auto* handle = Atrac9GetHandle();
 	if (handle == nullptr) {
 		return AJM_ERROR_INVALID_PARAMETER;
