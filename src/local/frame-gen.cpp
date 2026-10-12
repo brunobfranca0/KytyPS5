@@ -400,10 +400,49 @@ void BypassCommandHooks(vk::Device device) {
             ++replaced;
         }
 	};
+	// Every per-command entry point the translation uses (10 000 draws and 3 000 dispatches a frame at the dragon's
+	// path, each with its push constants, barriers and bindings): Streamline's wrappers only track state the emulator
+	// does not need (eDisableCLStateTracking). Queue submission, presentation and the swapchain stay hooked.
 	direct(dispatcher.vkBeginCommandBuffer, "vkBeginCommandBuffer");
+	direct(dispatcher.vkEndCommandBuffer, "vkEndCommandBuffer");
 	direct(dispatcher.vkCmdBindPipeline, "vkCmdBindPipeline");
 	direct(dispatcher.vkCmdBindDescriptorSets, "vkCmdBindDescriptorSets");
 	direct(dispatcher.vkCmdPipelineBarrier, "vkCmdPipelineBarrier");
+	direct(dispatcher.vkCmdPipelineBarrier2, "vkCmdPipelineBarrier2");
+	direct(dispatcher.vkCmdPushConstants, "vkCmdPushConstants");
+	direct(dispatcher.vkCmdBindIndexBuffer, "vkCmdBindIndexBuffer");
+	direct(dispatcher.vkCmdBindVertexBuffers, "vkCmdBindVertexBuffers");
+	direct(dispatcher.vkCmdDraw, "vkCmdDraw");
+	direct(dispatcher.vkCmdDrawIndexed, "vkCmdDrawIndexed");
+	direct(dispatcher.vkCmdDrawIndirect, "vkCmdDrawIndirect");
+	direct(dispatcher.vkCmdDrawIndexedIndirect, "vkCmdDrawIndexedIndirect");
+	direct(dispatcher.vkCmdDispatch, "vkCmdDispatch");
+	direct(dispatcher.vkCmdDispatchIndirect, "vkCmdDispatchIndirect");
+	direct(dispatcher.vkCmdCopyBuffer, "vkCmdCopyBuffer");
+	direct(dispatcher.vkCmdCopyBufferToImage, "vkCmdCopyBufferToImage");
+	direct(dispatcher.vkCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer");
+	direct(dispatcher.vkCmdCopyImage, "vkCmdCopyImage");
+	direct(dispatcher.vkCmdBlitImage, "vkCmdBlitImage");
+	direct(dispatcher.vkCmdFillBuffer, "vkCmdFillBuffer");
+	direct(dispatcher.vkCmdUpdateBuffer, "vkCmdUpdateBuffer");
+	direct(dispatcher.vkCmdClearColorImage, "vkCmdClearColorImage");
+	direct(dispatcher.vkCmdClearDepthStencilImage, "vkCmdClearDepthStencilImage");
+	direct(dispatcher.vkCmdClearAttachments, "vkCmdClearAttachments");
+	direct(dispatcher.vkCmdBeginRendering, "vkCmdBeginRendering");
+	direct(dispatcher.vkCmdEndRendering, "vkCmdEndRendering");
+	direct(dispatcher.vkCmdSetViewport, "vkCmdSetViewport");
+	direct(dispatcher.vkCmdSetScissor, "vkCmdSetScissor");
+	direct(dispatcher.vkCmdSetDepthBias, "vkCmdSetDepthBias");
+	direct(dispatcher.vkCmdSetStencilReference, "vkCmdSetStencilReference");
+	direct(dispatcher.vkCmdSetBlendConstants, "vkCmdSetBlendConstants");
+	direct(dispatcher.vkCmdSetEvent, "vkCmdSetEvent");
+	direct(dispatcher.vkCmdWaitEvents, "vkCmdWaitEvents");
+	direct(dispatcher.vkCmdWriteTimestamp, "vkCmdWriteTimestamp");
+	direct(dispatcher.vkCmdResetQueryPool, "vkCmdResetQueryPool");
+	direct(dispatcher.vkCmdBeginQuery, "vkCmdBeginQuery");
+	direct(dispatcher.vkCmdEndQuery, "vkCmdEndQuery");
+	direct(dispatcher.vkCmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
+	direct(dispatcher.vkCmdExecuteCommands, "vkCmdExecuteCommands");
 	std::printf("Frame generation: %u command-buffer calls bypass Streamline\n", replaced);
 #else
 	(void)device;
