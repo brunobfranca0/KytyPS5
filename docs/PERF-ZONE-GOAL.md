@@ -210,3 +210,24 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   ~1 ms sin un culpable claro. Alternativas que dan estabilidad ya: tope de 45 fps reales + FSR 3 x2 (90 fijos; el
   punto nunca baja de 50), o modo cinemático (30 fijos) + FSR 3 x2.
 
+- 2026-10-12 (tarde), **DLSS-G x3/x4 con tope 50/60** (878c87f → a1b2b83, instrumentación del hilo de presentación
+  `Kyty.Present`: acquire / record+submit / gpu wait / before / present por flip). Carga ligera: 50 reales / 150
+  mostrados perfectos. Zona pesada: el flip tarda 22–27 ms y el culpable medido es `slReflexSleep` dentro de
+  `BeforePresent` (24–27 ms/frame: Reflex duerme al hilo que da por hecho el flip). Sin el sleep
+  (`KYTY_DLSSG_SLEEP=0`) el bloqueo pasa a `vkQueuePresentKHR` (35 ms, 27 fps reales con CPU en 2 ms) y la generación
+  se enciende/apaga sola (`presented=1`). Modo paralelo (`KYTY_DLSSG_PARALLEL=1`): generación intermitente
+  (150 ↔ 50 mostrados). Conclusión: el pacing interno de DLSS-G limita los fps reales; **descartado**, fuera del
+  Launcher; FSR 3 x2 se queda como única FG.
+- 2026-10-12, **traducción en 2 hilos** (`KYTY_SPECULATE=4`, `KYTY_SPECULATE_THREADS=2`, `Launcher-paralelo`), castillo
+  cámara fija sin FG: **50 fps (20 ms)** frente a **60 fijos (16,7; cpu 10,8 + idle 2)** en modo normal; el hilo
+  principal espera ~8 ms/frame a los traductores. Igual que midió el desarrollador el 6-10 (−15 %). No se sigue.
+- 2026-10-12, **picos al andar por el castillo** (log 165046 + `KYTY_STALL_DUMP_MS=12` + `tracew-andar.bin`):
+  en cada tirón (27–130 ms) `cpu`=12 constante e `idle`=14–42: el hilo de render espera al juego; en los 14 volcados
+  los hilos del juego (2–3 por volcado, 37 en total) están en `HandleFault → ReadMemory` esperando al driver, 34 de
+  37 en la misma instrucción `eboot.bin+0xad8c20`. Traza de 3,9 s (226 frames, 17,2 ms): **una ráfaga por frame a
+  los 11,6 ms: ~10 hilos del juego esperan 6,1 ms** un readback cuyo escritor es un dispatch de la cola de cómputo
+  q49 grabado 0,3 ms antes; la copia se envía al instante (0,04 ms de GPU) pero completa 6,0 ms después porque hay
+  ~40 ticks de gráficos delante en la única cola Vulkan. GPU ocupada 12,8 ms/frame (no saturada). Dependencias:
+  q49 lee q49/q33 (11 500) y q0 (~1 000, <5 ms); q0 lee q49 del frame anterior (~3 650). **Techo −6 ms/frame de
+  cadena**; diseño y encargo en `docs/PROMPT-ASYNC-COMPUTE.md` (segunda cola/timeline para las colas de cómputo
+  del juego, `KYTY_ASYNC_COMPUTE`).
