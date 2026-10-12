@@ -269,3 +269,11 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   silencio (ch14 34 B, ch8 95 B) y la 4.ª fila falla en el canal 1 (ERR_UNPACK_SCALE_FACTOR_OOB) → el modelo "16 mono
   independientes" no es exacto (probable: modo de scale factors que referencia otro canal, o bloques estéreo
   mezclados). Descartados: 8 estéreo x 768 B, 16 mono x 384 B, config 16 mono con frame fijo de 1536 B.
+
+- 2026-10-13, **trama de rayitas negras en el agua** (Nexo, 1-1; con y sin FG): rayitas verticales de 1-2 px en
+  columnas x mod 16 = 14-15 (pantalla 2560x1440), solo sobre agua. Captura `capture` + sonda nueva `skipcs <cs_va>`
+  (26f3b5c). Apagar 9fb5cc274b5e4f82 (wave64, reducciones DPP/permlanex16, escribe 1280x1440) no la quita; los pasos
+  a media resolución 8x8 (f2b8b99a, ba3ce0ee, a2444a86, 5098ae0e, b4a64911, d00de9dd) dejan imagen fantasma con
+  rayitas (no concluyente: la imagen vieja conserva la trama); 2d7e7a4d/afb8ba8c (16x16) = exposición (todo blanco,
+  se queda bloqueada un rato). Sin culpable aún. Siguiente: el pixel shader de la superficie del agua (draw,
+  no compute) y una sonda que borre la salida en vez de saltarla.
