@@ -287,3 +287,10 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   2b78f0000, 291300000, 291a80000). Decodificador offline: tools/local/rdna-decode.cpp (ver cabecera). Siguiente:
   hacer las reducciones de onda en PS con OpGroupNonUniformBitwiseOr (robusto a carriles inactivos) o
   ReadLane(lane & 31) y probar.
+
+## Wolverine (para cuando se trabaje con él)
+- Carpeta: `E:\Wolverine-KytyPS5-v1` (Marvel's Wolverine PPSA03671 01.001.005). Emulador propio en `emulator\`
+  (kyty_emulator.exe 25.9 MB + launcher Qt, Kyty.ini), arranque `Play Wolverine.bat`; README dice: KytyPS5 upstream
+  release 2026-10-03 (f53e5d2) + PR #937 + arreglos. Es OTRO árbol de código, no esta rama: los arreglos genéricos
+  (ATRAC9 multicanal 0x30, FSR3 FG, wave OR en PS, skipcs) habría que portarlos a ese código; lo específico de
+  Demon's Souls (seeds, hints, DemonsSouls::*) no aplica.
