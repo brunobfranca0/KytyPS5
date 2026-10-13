@@ -70,7 +70,7 @@ $form.StartPosition   = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox     = $false
 $form.BackColor       = [System.Drawing.Color]::FromArgb(14, 16, 22)
-$fondo = Join-Path $root 'fondo-souls3.jpg'
+$fondo = Join-Path $root 'fondo-souls.jpg'
 if (Test-Path -LiteralPath $fondo) {
 	$form.BackgroundImage       = [System.Drawing.Image]::FromFile($fondo)
 	$form.BackgroundImageLayout = 'Stretch'
@@ -132,16 +132,30 @@ $cmbFg = New-Object System.Windows.Forms.ComboBox
 $cmbFg.DropDownStyle = 'DropDownList'
 $cmbFg.Font      = $subFont
 $cmbFg.Location  = New-Object System.Drawing.Point(350, 56)
-$cmbFg.Size      = New-Object System.Drawing.Size(400, 34)
+$cmbFg.Size      = New-Object System.Drawing.Size(300, 34)
 foreach ($m in $fgModes) { [void]$cmbFg.Items.Add($m[0]) }
 $cmbFg.SelectedIndex = [math]::Min([math]::Max(0, (Get-FgIndex)), $fgModes.Count - 1)
 $cmbFg.Add_SelectedIndexChanged({ Set-FgIndex $cmbFg.SelectedIndex })
 $panel.Controls.Add($cmbFg)
 
-$btnSettings = New-Button 'Settings' ($W - 470) 46 200 58 $false
+# Precompilar los shaders del juego (todos, de los archivos del juego): la primera vez puede tardar horas.
+$btnPre = New-Button 'Precompilar shaders' ($W - 610) 46 230 58 $false
+$btnPre.Add_Click({
+	if (-not (Get-GamePath) -or -not (Test-Path -LiteralPath (Get-GamePath))) {
+		[System.Windows.Forms.MessageBox]::Show('Pon la carpeta del juego en Settings.', 'Launcher', 'OK', 'Warning') | Out-Null
+		return
+	}
+	$pre = Join-Path $root 'precompile-windows.ps1'
+	if (-not (Test-Path -LiteralPath $pre)) { [System.Windows.Forms.MessageBox]::Show('Falta precompile-windows.ps1', 'Launcher', 'OK', 'Error') | Out-Null; return }
+	$a = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$pre`"", '-Game', "`"$(Get-GamePath)`"")
+	Start-Process -FilePath 'powershell' -ArgumentList $a -WorkingDirectory $root | Out-Null
+})
+$panel.Controls.Add($btnPre)
+
+$btnSettings = New-Button 'Settings' ($W - 365) 46 160 58 $false
 $panel.Controls.Add($btnSettings)
 
-$btnExit = New-Button 'Salir' ($W - 250) 46 200 58 $false
+$btnExit = New-Button 'Salir' ($W - 190) 46 140 58 $false
 $btnExit.Add_Click({ $form.Close() })
 $panel.Controls.Add($btnExit)
 
