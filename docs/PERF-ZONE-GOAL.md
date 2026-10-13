@@ -277,3 +277,13 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   rayitas (no concluyente: la imagen vieja conserva la trama); 2d7e7a4d/afb8ba8c (16x16) = exposición (todo blanco,
   se queda bloqueada un rato). Sin culpable aún. Siguiente: el pixel shader de la superficie del agua (draw,
   no compute) y una sonda que borre la salida en vez de saltarla.
+- 2026-10-13 (2), **trama del agua: culpable encontrado** con `skipcs` sobre draws (6224851): el pixel shader de la
+  superficie del agua `7a59c1a20cbe5d4a` (en el Nexo ps_va 20e100c00; la dirección cambia entre partidas: capturar
+  antes de sondear). Apagarlo quita el agua, sus reflejos dorados y la trama. Es un PS wave64 con bucles
+  "waterfall" sobre máscaras de luces/clusters: OR de onda por DPP row_shr 1/2/4/8 + v_permlanex16 + v_readlane 31 y
+  63, luego S_FF1 sobre la máscara de 64 bits. En PS no hay emulación de dos mitades (other_half == nullptr):
+  ReadLane(63) es un OpGroupNonUniformShuffle con índice 63 en un subgrupo de 32 (indefinido) y los DPP/permlane leen
+  carriles que en NVIDIA pueden no tener fragmento. Lee además buffers a media resolución (1280x720: 28a410000,
+  2b78f0000, 291300000, 291a80000). Decodificador offline: tools/local/rdna-decode.cpp (ver cabecera). Siguiente:
+  hacer las reducciones de onda en PS con OpGroupNonUniformBitwiseOr (robusto a carriles inactivos) o
+  ReadLane(lane & 31) y probar.
