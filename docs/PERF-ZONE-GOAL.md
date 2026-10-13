@@ -299,3 +299,8 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   OpGroupNonUniformBitwiseOr (spirvEmitterFlow.cpp, IsWaveOrScanRead; KYTY_PS_WAVE_OR=0 lo apaga). El primer intento
   (aa159bb) no casaba: la escritura del permlane en su VGPR va envuelta en SelectU32(exec). En el Nexo lo aplica a 11
   shaders (log `PS_WAVE_OR <hash>`), así que puede corregir más superficies con el mismo patrón.
+- 2026-10-13 (4), **vídeo del menú de archipiedras con rayas/escalones unos segundos: ARREGLADO** (c38c76b,
+  confirmado en juego). El recuadro es un vídeo (NV12: luma 2048x1088 R8 + croma 1024x544 R8G8). Las escrituras del
+  host sobre memoria que la GPU lee como textura (fotogramas de VideoDec2/AvPlayer, lecturas APR) ahora refrescan las
+  imágenes del rango al acabar (Memory::FinishHostOverwrite; KYTY_HOST_WRITE_REFRESH=0 lo apaga): una subida a mitad
+  de la copia leía páginas antes de que la copia llegara y las protegía después.
