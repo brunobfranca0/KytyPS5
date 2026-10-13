@@ -1416,7 +1416,9 @@ void FinishHostOverwrite(uint64_t vaddr, uint64_t size, bool prepared) {
 	}();
 	if (!enabled || size == 0 || UINT64_MAX - vaddr < size || g_gpu_resources == nullptr) return;
 	if (!prepared && size < 256u * 1024u) return;
-	(void)TryPrepareHostImageWrite(vaddr, size);
+	// Buffers too, not only images: the GPU-decoded archstone videos read their bitstream (streamed in by file reads)
+	// as a storage buffer, and a stale copy of it decoded as garbage until the next key frame.
+	(void)TryPrepareHostOverwrite(vaddr, size); // (the bytes there are the new ones: GPU copies are dropped, not read back)
 }
 
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
