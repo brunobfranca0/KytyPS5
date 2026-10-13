@@ -1026,4 +1026,16 @@ bool QuerySharedGpuMemory(uint64_t* /*usage*/) {
 
 #endif
 
+size_t ReadableBytes(const void* address, size_t size) noexcept {
+#if defined(_WIN32)
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(address, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || info.Protect == 0 ||
+	    (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
+		return 0;
+	const auto end = reinterpret_cast<const uint8_t*>(info.BaseAddress) + info.RegionSize;
+	return std::min<size_t>(size, static_cast<size_t>(end - static_cast<const uint8_t*>(address)));
+#else
+	return size;
+#endif
+}
 } // namespace LocalPlatform

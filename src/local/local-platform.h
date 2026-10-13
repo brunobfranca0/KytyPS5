@@ -124,4 +124,6 @@ void     CloseThreadForSampling(uint64_t handle);
 bool ModuleOf(const void* address, uint64_t* base, char* path, size_t path_size);
 #endif
 
+// How many of the `size` bytes at `address` can be read (0: not committed or not readable). Windows; elsewhere `size`.
+size_t ReadableBytes(const void* address, size_t size) noexcept;
 } // namespace LocalPlatform

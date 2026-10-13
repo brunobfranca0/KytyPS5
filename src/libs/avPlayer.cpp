@@ -1,3 +1,4 @@
+#include <chrono>
 #include "kernel/memory.h"
 #include "common/archive.h"
 #include "common/common.h"
@@ -503,6 +504,10 @@ public:
 		queue.push_back(std::move(value));
 		available.notify_all();
 	}
+	size_t Size() {
+		std::lock_guard lock(mutex);
+		return queue.size();
+	}
 	std::optional<T> TryPop() {
 		std::lock_guard lock(mutex);
 		if (queue.empty()) {
@@ -971,7 +976,32 @@ public:
 			return now == 0 || candidate.info.time_stamp <= now;
 		});
 		if (!frame) {
+			// (Diagnosis of the archstone menu's garbled preview: how long the game asked for frames in vain.)
+			const auto now_wait = std::chrono::steady_clock::now();
+			if (!waiting_since) waiting_since = now_wait;
+			const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(now_wait - *waiting_since).count();
+			if (waited >= 100 && !wait_logged) {
+				wait_logged = true;
+				std::printf("AVPLAYER_WAIT %p no video frame for %lld ms (delivered=%llu queued=%zu free_buffers=%zu)\n",
+				            static_cast<void*>(this), static_cast<long long>(waited),
+				            static_cast<unsigned long long>(delivered_frames), video_frames.Size(), video_buffers.Size());
+				std::fflush(stdout);
+			}
 			return false;
+		}
+		if (waiting_since) {
+			const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+			                                                                          *waiting_since).count();
+			if (wait_logged)
+				std::printf("AVPLAYER_RESUME %p after %lld ms (frame %llu, data=%p)\n", static_cast<void*>(this),
+				            static_cast<long long>(waited), static_cast<unsigned long long>(delivered_frames),
+				            frame->info.data);
+			waiting_since.reset();
+			wait_logged = false;
+		}
+		if (delivered_frames++ == 0) {
+			std::printf("AVPLAYER_FIRST %p frame data=%p\n", static_cast<void*>(this), frame->info.data);
+			std::fflush(stdout);
 		}
 		if (current_video) {
 			retired_video.push_back(std::move(current_video->buffer));
@@ -1638,6 +1668,9 @@ private:
 	AvPlayerMemAllocator                     mem;
 	AvPlayerFileReplacement                  file;
 	int                                      max_video_buffers = 2;
+	std::optional<std::chrono::steady_clock::time_point> waiting_since;
+	bool                                     wait_logged      = false;
+	uint64_t                                 delivered_frames = 0;
 	bool                                     use_vdec2         = false;
 	AvPlayerSourceType                       source_type       = AvPlayerSourceUnknown;
 	std::string                              path;

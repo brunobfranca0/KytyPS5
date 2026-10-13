@@ -466,7 +466,9 @@ inline void Run(uint64_t id, const std::string& line) {
 		std::memcpy(target, &value, 4);
 	} else if (cmd == "peek" && n == 3) {
 		const auto* data  = reinterpret_cast<const uint8_t*>(std::strtoull(arg1, nullptr, 16));
-		const auto  bytes = std::min<size_t>(std::strtoul(arg2, nullptr, 0), 256);
+		auto        bytes = std::min<size_t>(std::strtoul(arg2, nullptr, 0), 256);
+		// Only committed, readable memory (an unmapped address closed the game, 13-10).
+		bytes = LocalPlatform::ReadableBytes(data, bytes);
 		std::string hex;
 		for (size_t i = 0; i < bytes; ++i) {
 			char b[4];
