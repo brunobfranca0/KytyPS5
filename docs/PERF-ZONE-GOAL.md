@@ -328,3 +328,6 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   Release borrador KytyPS5-2026-10-13-cf264f4. Instalado como `emulator\kyty_emulator-dev.exe` + `Play Wolverine -
   dev.bat` (WORKERS=12 por defecto; 4 = línea base). Ese fork NO tiene table path, KYTY_RENDER_CPUS ni seeds: portar
   es trabajo grande. Occlusion: ya hay techo medible con el interruptor vivo KYTY_OCCLUSION_CULL=1.
+- 2026-10-13 (8): **KYTY_OVERLAP_WRITEBACK hizo el juego muy lento** (3a5b3ab: 45-57 ms/frame, el log llegó al tope de
+  200 OVERLAP-WRITEBACK enseguida: se dispara con imágenes compute del juego en cada frame, no solo con el vídeo).
+  Apagado en config\*.json y por defecto en el código (=1 lo activa). Hay que limitarlo a los planos del vídeo.

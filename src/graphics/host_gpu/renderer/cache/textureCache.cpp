@@ -1330,7 +1330,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const auto current_frame = m_frame.load(std::memory_order_relaxed);
 	const bool safe_to_delete =
 	    current_frame - std::min(current_frame, cached.frame_accessed_last) > NumFramesBeforeRemoval;
-	// KYTY_OVERLAP_WRITEBACK (on unless 0): a compute-written image partly under the requested one, used in the last
+	// KYTY_OVERLAP_WRITEBACK=1 (off by default): a compute-written image partly under the requested one, used in the last
 	// frames, is written back to guest memory and freed now instead of living on beside it. The archstone menu's
 	// preview video is decoded on the GPU into Y/UV planes whose addresses shift by 0x200000 from one video to the
 	// next: the old planes stayed (gpu-modified, not in memory) and the new video's first reference frames came out of
@@ -1339,7 +1339,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const auto retire_written = [&]() {
 		static const bool enabled = [] {
 			const char* value = std::getenv("KYTY_OVERLAP_WRITEBACK");
-			return value == nullptr || value[0] != '0';
+			return value != nullptr && value[0] == '1'; // off by default: it fired on every frame's images (slow)
 		}();
 		if (!enabled || safe_to_delete || !cached.IsGpuModified() || !cached.usage.storage ||
 		    cached.usage.render_target || cached.usage.depth_target || cached.binding.is_target || cached.depth_id)
