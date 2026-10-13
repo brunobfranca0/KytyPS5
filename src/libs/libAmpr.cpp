@@ -1525,7 +1525,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		// Decompressed on the archive's host threads, copied into the guest range on this one (pages may fault). One
 		// call for the whole read keeps its chunks in flight on all the lanes.
 		const auto readable = std::min<uint64_t>(size, archive->Size() - file_offset);
-		LibKernel::Memory::PrepareHostOverwrite(destination, readable);
+		const bool prepared = LibKernel::Memory::PrepareHostOverwrite(destination, readable);
 		while (*bytes_read < readable) {
 			const auto request = static_cast<uint32_t>(std::min<uint64_t>(uint64_t {1} << 30u, readable - *bytes_read));
 			const auto read    = archive->ReadAt(file_offset + *bytes_read, reinterpret_cast<void*>(destination + *bytes_read), request);
@@ -1535,6 +1535,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 			*bytes_read += read;
 		}
 		reading = Clock::now() - start - opening;
+		LibKernel::Memory::FinishHostOverwrite(destination, *bytes_read, prepared);
 		LogAprRead(host_path, destination, *bytes_read, file_offset);
 		return OK;
 	}
@@ -1560,7 +1561,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 			LocalPlatform::PrefetchKeptFile(host_path);
 		thread_local std::vector<uint8_t> kept_buffer;
 		kept_buffer.resize(static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
-		LibKernel::Memory::PrepareHostOverwrite(destination, readable);
+		const bool prepared = LibKernel::Memory::PrepareHostOverwrite(destination, readable);
 		while (*bytes_read < readable) {
 			const auto request = static_cast<uint32_t>(std::min<uint64_t>(kept_buffer.size(), readable - *bytes_read));
 			const auto before  = Clock::now();
@@ -1574,6 +1575,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 			copying += Clock::now() - after;
 			*bytes_read += read;
 		}
+		LibKernel::Memory::FinishHostOverwrite(destination, *bytes_read, prepared);
 		LogAprRead(host_path, destination, *bytes_read, file_offset);
 		return OK;
 	}
@@ -1602,7 +1604,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 
 	std::vector<uint8_t> buffer(
 	    static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
-	LibKernel::Memory::PrepareHostOverwrite(destination, readable);
+	const bool prepared = LibKernel::Memory::PrepareHostOverwrite(destination, readable);
 	while (*bytes_read < readable) {
 		const auto request =
 		    static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), readable - *bytes_read));
@@ -1618,6 +1620,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		copying += Clock::now() - after;
 		*bytes_read += read;
 	}
+	LibKernel::Memory::FinishHostOverwrite(destination, *bytes_read, prepared);
 
 	file.Close();
 	return OK;

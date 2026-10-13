@@ -1,3 +1,4 @@
+#include "kernel/memory.h"
 #include "common/archive.h"
 #include "common/common.h"
 #include "common/logging/log.h"
@@ -1540,6 +1541,12 @@ private:
 			return false;
 		}
 		auto* dst = buffer->Get();
+		// Over guest memory the GPU may read as a texture: prepared, and the images over it refreshed after.
+		const bool prepared = Libs::LibKernel::Memory::PrepareHostOverwrite(reinterpret_cast<uint64_t>(dst), size);
+		struct Refresh {
+			uint64_t at, size; bool prepared;
+			~Refresh() { Libs::LibKernel::Memory::FinishHostOverwrite(at, size, prepared); }
+		} refresh {reinterpret_cast<uint64_t>(dst), static_cast<uint64_t>(size), prepared};
 		std::memset(dst, 0, static_cast<size_t>(size));
 		for (int y = 0; y < src->height; y++) {
 			std::memcpy(dst + y * pitch, nv12->data[0] + y * nv12->linesize[0], src->width);

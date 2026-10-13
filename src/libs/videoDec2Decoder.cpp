@@ -1,3 +1,4 @@
+#include "kernel/memory.h"
 #include "libs/videoDec2Decoder.h"
 
 #include "common/logging/log.h"
@@ -284,6 +285,13 @@ private:
 		}
 
 		auto* dst = static_cast<uint8_t*>(frame_buffer.data);
+		// The frame is written over guest memory the GPU may read as a texture: prepared, and the images over it
+		// refreshed after (an upload during the copy left the archstone menu's preview video garbled).
+		const bool prepared = Libs::LibKernel::Memory::PrepareHostOverwrite(reinterpret_cast<uint64_t>(dst), required);
+		struct Refresh {
+			uint64_t at, size; bool prepared;
+			~Refresh() { Libs::LibKernel::Memory::FinishHostOverwrite(at, size, prepared); }
+		} refresh {reinterpret_cast<uint64_t>(dst), required, prepared};
 		std::memset(dst, 0, static_cast<size_t>(required));
 		if (frame->format == AV_PIX_FMT_NV12) {
 			for (uint32_t y = 0; y < height; y++) {

@@ -1382,17 +1382,17 @@ void InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemoryForWrite(vaddr, size);
 }
 
-void PrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
-	if (size == 0 || UINT64_MAX - vaddr < size || g_gpu_resources == nullptr) return;
+bool PrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || UINT64_MAX - vaddr < size || g_gpu_resources == nullptr) return false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// From the first page a store would fault on to the end of the last one.
 	uint64_t first = 0, last = 0;
 	bool     any   = false;
 	for (uint64_t at = vaddr; at < vaddr + size;) {
 		MEMORY_BASIC_INFORMATION info {};
-		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) == 0) return;
+		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) == 0) return any;
 		const auto end = std::min(reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize, vaddr + size);
-		if (end <= at) return;
+		if (end <= at) return any;
 		const bool writable = info.State == MEM_COMMIT && (info.Protect & PAGE_GUARD) == 0 &&
 		                      (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
 		if (!writable) {
@@ -1403,7 +1403,20 @@ void PrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
 		at = end;
 	}
 	if (any) (void)g_gpu_resources->InvalidateMemoryForWrite(first, last - first);
+	return any;
+#else
+	return false;
 #endif
+}
+
+void FinishHostOverwrite(uint64_t vaddr, uint64_t size, bool prepared) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_HOST_WRITE_REFRESH");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || size == 0 || UINT64_MAX - vaddr < size || g_gpu_resources == nullptr) return;
+	if (!prepared && size < 256u * 1024u) return;
+	(void)TryPrepareHostImageWrite(vaddr, size);
 }
 
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
