@@ -164,7 +164,12 @@ void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 // pages' protection (Windows), the span of those a store would fault on (the trackers' write or read protection) is
 // made the host's at once (InvalidateMemoryForWrite). Nothing when no page would fault: the trackers and their locks are
 // left alone (InvalidateMemoryForWrite takes the texture cache's lock, which the render thread holds for long).
-void PrepareHostOverwrite(uint64_t vaddr, uint64_t size);
+bool PrepareHostOverwrite(uint64_t vaddr, uint64_t size);
+// After such a write (PrepareHostOverwrite's result `prepared`): the images over the range are refreshed from the bytes
+// now there. An image the render thread uploaded while the copy was under way could read pages before the copy reached
+// them and protect them after (the archstone menu's preview pictures stayed garbled until the menu was opened again).
+// Not for small reads with nothing protected (audio pieces). KYTY_HOST_WRITE_REFRESH=0: off.
+void FinishHostOverwrite(uint64_t vaddr, uint64_t size, bool prepared);
 // Prepare a host write using normal coherent invalidation; false means use guest faults.
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
 // The same for a write of all of the range that reads none of it (InvalidateMemoryForWrite).
