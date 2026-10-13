@@ -222,7 +222,7 @@ index 2340d04..b5fdf33 100644
  
  FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext* context, const FfxFrameInterpolationDispatchDescription* params);
 diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
-index 5c47b25..5738258 100644
+index 5c47b25..e011352 100644
 --- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
 +++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
 @@ -22,6 +22,7 @@
@@ -440,6 +440,15 @@ index 5c47b25..5738258 100644
  
      if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnGameQueue)
      {
+@@ -2695,7 +2749,7 @@ VkResult FrameInterpolationSwapChainVK::queuePresent(VkQueue queue, const VkPres
+     // Unregister any potential command list
+     registeredInterpolationCommandLists[currentBackBufferIndex] = nullptr;
+     presentCount++;
+-    interpolationBufferIndex = presentCount % _countof(interpolationOutputs);
++    interpolationBufferIndex = presentCount % 2;  // Kyty MFG: two slots (outputs are [slot * 2 + generated frame])
+ 
+     // update active backbuffer and block when no buffer is available
+     replacementSwapBufferIndex = presentCount % gameBufferCount;
 diff --git a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
 index 0218ade..2eb0eef 100644
 --- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
