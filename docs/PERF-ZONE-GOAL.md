@@ -304,3 +304,8 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   host sobre memoria que la GPU lee como textura (fotogramas de VideoDec2/AvPlayer, lecturas APR) ahora refrescan las
   imágenes del rango al acabar (Memory::FinishHostOverwrite; KYTY_HOST_WRITE_REFRESH=0 lo apaga): una subida a mitad
   de la copia leía páginas antes de que la copia llegara y las protegía después.
+- 2026-10-13 (5): el glitch del menú de archipiedras **volvió a salir** con c38c76b (04:05): FinishHostOverwrite no lo
+  cubre del todo. Si el vídeo lo decodifica el propio juego (Bink en CPU invitada, escrituras por fallo de página) el
+  arreglo no aplica. Sospechas: carrera de lectura-antes-de-proteger en la subida (KYTY_ASYNC_REPROTECT) o el atajo
+  MaybeCpuDirty (HashGuestEdges solo mira las páginas de los bordes: un fotograma con los mismos bordes no se sube).
+  Imágenes del vídeo en el Nexo: 0x429dde000 2048x1088 R8 y 0x429ffe000 1024x544 R8G8 (tile 5), 0x42a10e000.

@@ -2,7 +2,8 @@
 > **todojuegos67-bot build (13-10-2026): [download KytyPS5-20261013-c38c76bf](https://github.com/todojuegos67-bot/KytyPS5/releases/tag/KytyPS5-20261013-c38c76bf)**
 > - NPC voices and cutscene audio now play (16-channel ambisonic ATRAC9, PS5 multichannel format, is decoded).
 > - Fixed the black dotted pattern on water (wave64 OR reductions in pixel shaders use a subgroup OR on 32-wide GPUs).
-> - Fixed the garbled archstone menu preview video (textures over memory the emulator writes are refreshed after the write).
+> - Archstone menu preview video garbled for a few seconds: less often (textures over memory the emulator writes are
+>   refreshed after the write); it can still happen, under investigation.
 > - AMD frame generation (FSR 3 x2), and a Demon's Souls launcher (`Launcher-souls.cmd`): no frame generation or AMD
 >   frame generation; saves are backed up before playing. Console language defaults to Spanish (Spain).
 
