@@ -26,6 +26,12 @@
 #include <random>
 #include <system_error>
 #include <vector>
+#ifdef _WIN32
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+#include <cstdlib>
 
 namespace Libs::LibKernel::FileSystem {
 
@@ -401,6 +407,16 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+// KYTY_APR_LOG: plain kernel reads too (files the game streams without APR, e.g. movies).
+static void LogKernelRead(const char* kind, const std::filesystem::path& name, uint64_t bytes, int64_t offset, uint32_t got) {
+	static const bool log_reads = std::getenv("KYTY_APR_LOG") != nullptr;
+	if (!log_reads) return;
+	const auto text = Common::PathToString(name);
+	if (text.find("movie") == std::string::npos && text.find("Movie") == std::string::npos && got == bytes) return;
+	std::printf("[tsc %llu] KREAD %s size=0x%llx offset=%lld got=0x%x file=%s\n", static_cast<unsigned long long>(__rdtsc()), kind,
+	            static_cast<unsigned long long>(bytes), static_cast<long long>(offset), got, text.c_str());
+}
+
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
 
@@ -409,6 +425,8 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	auto flags_u = static_cast<uint32_t>(flags);
+	if (std::getenv("KYTY_APR_LOG") != nullptr && (std::strstr(path, "movie") != nullptr || std::strstr(path, "Movie") != nullptr))
+		std::printf("[tsc %llu] KOPEN %s flags=%x\n", static_cast<unsigned long long>(__rdtsc()), path, flags_u);
 
 	LOGF("\t path = %s\n"
 	     "\t flags = %08" PRIx32 "\n"
@@ -671,6 +689,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		return KERNEL_ERROR_EIO;
 	}
 
+	LogKernelRead("read", file->real_name, nbytes, -1, bytes_read);
 	LOGF("\tRead %u bytes from: %s\n", bytes_read, Common::PathToString(file->real_name).c_str());
 
 	return bytes_read;
@@ -792,6 +811,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return KERNEL_ERROR_EIO;
 	}
 
+	LogKernelRead("pread", file->real_name, nbytes, offset, bytes_read);
 	LOGF("\tRead %u bytes (pos = %" PRId64 ") from: %s\n", bytes_read, offset,
 	     Common::PathToString(file->real_name).c_str());
 
