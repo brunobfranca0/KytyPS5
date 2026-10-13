@@ -309,3 +309,16 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   arreglo no aplica. Sospechas: carrera de lectura-antes-de-proteger en la subida (KYTY_ASYNC_REPROTECT) o el atajo
   MaybeCpuDirty (HashGuestEdges solo mira las páginas de los bordes: un fotograma con los mismos bordes no se sube).
   Imágenes del vídeo en el Nexo: 0x429dde000 2048x1088 R8 y 0x429ffe000 1024x544 R8G8 (tile 5), 0x42a10e000.
+- 2026-10-13 (6), **vídeo de archipiedras: diagnóstico con datos** (bf25cc3). No es AvPlayer (sin AVPLAYER_* en el log)
+  ni escrituras del host: el vídeo se decodifica EN LA GPU con compute (Bink 2 GPU o similar): 009d07c027d68a8f /
+  0b24b686264ed132 escriben Y (R8_UINT 2048x1088), 6339eb05.../23ba0347... UV (R8G8_UINT 1024x544), y leen como
+  referencia el fotograma anterior (img 0x36dd00000); el draw e2be869cda25bebf los muestrea (UNORM). La memoria del
+  invitado no tiene los píxeles (todo es gpu_modified; contiene un patrón viejo 00..3c). En la caché hay juegos de
+  planos SOLAPADOS desplazados 0x200000 entre sesiones de vídeo (p. ej. Y 0x36dd00000 vivo y Y 0x36df00000 viejo,
+  UV 0x36df20000 / 0x36e120000; 0x36edde000 / 0x36efde000...), todos gpu_modified: ResolveOverlap solo borra el
+  solapado si lleva >32 frames sin usarse (NumFramesBeforeRemoval), así que al cambiar de vídeo rápido conviven y
+  no se reconcilian. Hipótesis: la referencia de los primeros fotogramas de la sesión nueva sale de una imagen
+  creada desde memoria sin los datos GPU (o de la vieja) → basura con movimiento hasta el siguiente fotograma clave
+  (encaja con "se quita a los pocos segundos"). El corte de sonido es aparte. Siguiente: al crear/escribir por
+  storage una imagen que solapa parcialmente otra gpu_modified de otra base, volcar (write-back) la vieja a memoria
+  y liberarla antes de inicializar la nueva.
