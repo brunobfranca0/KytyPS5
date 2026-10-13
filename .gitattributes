@@ -3,3 +3,5 @@
 *.bat text eol=crlf
 # Specialization hints (tools/local/static-precompile/hints-*.hints): zstd-compressed, never converted.
 *.hints binary
+# FidelityFX SDK patches (tools/local/fsr3-mfg): applied with git apply, keep LF.
+*.patch text eol=lf

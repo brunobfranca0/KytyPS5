@@ -1,6 +1,6 @@
 ﻿# KytyPS5 - Demon's Souls: lanzador (ventana). Launcher.cmd lo abre.
-#   Jugar                -> arranca el juego; con la casilla "Frame generation x2" marcada, con frame generation AMD (FSR 3)
-#                           (config\fsr3.json), si no, sin FG (config\sin-fg.json). Copia de las partidas antes.
+#   Jugar                -> arranca el juego; con "Frame generation AMD x2" (config\fsr3.json) o
+#                           "x3" (config\fsr3-x3.json, 2 frames generados), si no, sin FG (config\sin-fg.json). Copia de las partidas antes.
 #   Settings             -> carpeta del juego volcado (game-path.txt). La casilla se recuerda en launcher.ini.
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -13,7 +13,8 @@ $iniFile  = Join-Path $root 'launcher.ini'
 # Modos de frame generation: texto del desplegable -> config. Se recuerda el indice en launcher.ini.
 $fgModes = @(
 	@('Sin frame generation',                          'sin-fg.json'),
-	@('Frame generation AMD',                             'fsr3.json')
+	@('Frame generation AMD x2',                          'fsr3.json'),
+	@('Frame generation AMD x3',                          'fsr3-x3.json')
 )
 function Get-FgIndex {
 	if (Test-Path -LiteralPath $iniFile) {
