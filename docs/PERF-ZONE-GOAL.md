@@ -322,3 +322,9 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   (encaja con "se quita a los pocos segundos"). El corte de sonido es aparte. Siguiente: al crear/escribir por
   storage una imagen que solapa parcialmente otra gpu_modified de otra base, volcar (write-back) la vieja a memoria
   y liberarla antes de inicializar la nueva.
+- 2026-10-13 (7): **vídeo de archipiedras**: build 3a5b3ab (KYTY_OVERLAP_WRITEBACK) instalada, sin probar (log
+  `OVERLAP-WRITEBACK`). **Wolverine**: rama `wolverine-dev` en todojuegos67-bot/KytyPS5 (base IDXTRI/KytyPS5
+  wolverine-v1 fe1d8b1): línea `Frames (5 s)` (fps, ms medio/p99/máx) y `KYTY_PIPELINE_WORKERS` (antes fijo 4).
+  Release borrador KytyPS5-2026-10-13-cf264f4. Instalado como `emulator\kyty_emulator-dev.exe` + `Play Wolverine -
+  dev.bat` (WORKERS=12 por defecto; 4 = línea base). Ese fork NO tiene table path, KYTY_RENDER_CPUS ni seeds: portar
+  es trabajo grande. Occlusion: ya hay techo medible con el interruptor vivo KYTY_OCCLUSION_CULL=1.
