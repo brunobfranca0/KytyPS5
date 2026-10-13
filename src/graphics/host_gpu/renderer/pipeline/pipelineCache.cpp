@@ -21,6 +21,7 @@
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
+#include "local/skip-shader.h"
 #include "native-preparation-scratch.h"
 #include "native-resource-state.h"
 #include "shader-warmup-cache.h"
@@ -775,6 +776,7 @@ struct PipelineCache::ProgramCache {
 			default: EXIT("invalid pipeline shader stage\n");
 		}
 
+		if (SkipShader::HashSkipped(Config::GetSkipShaderHashes(), params.hash)) return {}; // --skip-shaders
 		Libs::LibKernel::Memory::g_srt_shader_hash = params.hash;
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;

@@ -119,6 +119,18 @@ bool RenderDocEnabled() {
 	return g_config->renderdoc_enabled;
 }
 
+bool TessellationEnabled() {
+	return g_config->tessellation_enabled;
+}
+
+bool AmdCpuEnabled() {
+	return g_config->amd_cpu_enabled;
+}
+
+const std::string& GetSkipShaderHashes() {
+	return g_config->skip_shader_hashes;
+}
+
 bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }

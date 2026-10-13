@@ -68,6 +68,9 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   playgo_hack_enabled         = false;
+	bool                   tessellation_enabled        = false;
+	bool                   amd_cpu_enabled             = false;
+	std::string            skip_shader_hashes;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -109,6 +112,9 @@ bool GpuAssistedValidationEnabled();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool PlayGoHackEnabled();
+bool TessellationEnabled();
+bool AmdCpuEnabled();
+const std::string& GetSkipShaderHashes();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

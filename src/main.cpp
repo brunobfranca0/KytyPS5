@@ -80,6 +80,10 @@ static void PrintUsage() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
+	::printf("  --tessellation                       Draw tessellation patches; skipped by default.\n");
+	::printf("  --amd-cpu                            Emulate guest VRSQRTPS (AMD CPU results).\n");
+	::printf("  --skip-shaders <hash,hash,...>       Skip draws/dispatches of these shader hashes (hex).\n");
+	::printf("  --bindless                           Accepted and ignored (not supported in this build).\n");
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
@@ -170,12 +174,29 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (arg == "--redzone") {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			options.config.red_zone_protection_enabled = true;
+#else
+			::printf("warning: --redzone only applies to Windows hosts; ignored\n");
+#endif
 			continue;
 		}
-#endif
+
+		if (arg == "--tessellation") {
+			options.config.tessellation_enabled = true;
+			continue;
+		}
+
+		if (arg == "--amd-cpu") {
+			options.config.amd_cpu_enabled = true;
+			continue;
+		}
+
+		if (arg == "--bindless") {
+			::printf("warning: --bindless is not supported in this build; ignored\n");
+			continue;
+		}
 
 		if (!Common::StartsWith(arg, "--")) {
 			::printf("game input must be provided with --game\n");
@@ -315,6 +336,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--skip-shaders") {
+			options.config.skip_shader_hashes = value;
 		} else if (arg == "--readback-linear-images") {
 			if (!ParseBool(value, options.config.readback_linear_images)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
