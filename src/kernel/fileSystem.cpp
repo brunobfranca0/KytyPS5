@@ -627,6 +627,9 @@ static uint32_t ReadIntoGuest(Common::File& f, void* buf, uint32_t nbytes) {
 		const auto destination = reinterpret_cast<uint64_t>(buf) + total;
 		Memory::InvalidateMemoryForWrite(destination, got);
 		std::memcpy(reinterpret_cast<void*>(destination), bounce.data(), got);
+		// Again after the copy: a GPU copy of these bytes registered while they were being written (a Bink video's
+		// bitstream, read by the GPU decoder) is dropped, so the decoder sees the new bytes, not a stale mix.
+		Memory::FinishHostOverwrite(destination, got, true);
 		total += got;
 		if (got < want) break;
 	}
