@@ -821,6 +821,20 @@ int KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle) {
 	return OK;
 }
 
+// The base does not track user handles (UserCreate hands out a counter), so any handle is
+// accepted; the fork rejects handles it did not create.
+int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle,
+                                                       uint32_t* context_attributes,
+                                                       uint32_t* port_attributes) {
+	(void)handle;
+	if (context_attributes == nullptr || port_attributes == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	*context_attributes = 0;
+	*port_attributes    = 1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM;
+	return OK;
+}
+
 size_t KYTY_SYSV_ABI AudioOut2GetSpeakerArrayMemorySize(uint32_t num_speakers, uint8_t is_3d,
                                                         uint8_t is_ambisonics) {
 	PRINT_NAME();

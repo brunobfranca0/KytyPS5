@@ -70,6 +70,9 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 int KYTY_SYSV_ABI AudioOut2GetSystemState(AudioOut2SystemState* state);
 int KYTY_SYSV_ABI AudioOut2UserCreate(uint32_t user_id, AudioOut2UserHandle* handle);
 int KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle);
+int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle,
+                                                       uint32_t* context_attributes,
+                                                       uint32_t* port_attributes);
 size_t KYTY_SYSV_ABI AudioOut2GetSpeakerArrayMemorySize(uint32_t num_speakers, uint8_t is_3d,
                                                         uint8_t is_ambisonics);
 int KYTY_SYSV_ABI    AudioOut2SpeakerArrayCreate(AudioOut2SpeakerArrayHandle* handle,
@@ -98,6 +101,9 @@ namespace AudioIn {
 
 int KYTY_SYSV_ABI AudioInOpen(int user_id, uint32_t type, uint32_t index, uint32_t len,
                               uint32_t freq, uint32_t param);
+int KYTY_SYSV_ABI AudioInHqOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                                uint32_t param);
+int KYTY_SYSV_ABI AudioInClose(int handle);
 int KYTY_SYSV_ABI AudioInInput(int handle, void* dest);
 int KYTY_SYSV_ABI AudioInGetSilentState(int handle);
 
@@ -205,6 +211,7 @@ int KYTY_SYSV_ABI AcmBatchStartBuffers(AcmContextId context, uint32_t batch_info
                                        AcmBatchError* batch_error, AcmBatchId* batch);
 int KYTY_SYSV_ABI AcmBatchWait(AcmContextId context, AcmBatchId batch, uint32_t timeout);
 int KYTY_SYSV_ABI AcmBatchJobNotification(AcmBatchInfo* batch_info);
+int KYTY_SYSV_ABI AcmBatchJobPriority(AcmBatchInfo* batch_info, uint32_t priority);
 int KYTY_SYSV_ABI AcmConvReverbSharedInput(AcmBatchInfo* batch_info, uint32_t block_count, void* in,
                                            uint32_t count, const void* const ir[],
                                            const float* gain, void* const out[]);

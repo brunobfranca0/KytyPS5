@@ -180,6 +180,7 @@ LIB_DEFINE(InitAudio_1_AudioOut2) {
 	LIB_FUNC("bkBN+CMLwRc", AudioOut2::AudioOut2GetSystemState);
 	LIB_FUNC("xywYcRB7nbQ", AudioOut2::AudioOut2UserCreate);
 	LIB_FUNC("IaZXJ9M79uo", AudioOut2::AudioOut2UserDestroy);
+	LIB_FUNC("iE8trxPKnAg", AudioOut2::AudioOut2UserGetSupportedAttributes);
 	LIB_FUNC("G1YOKDJYX2Y", AudioOut2::AudioOut2GetSpeakerArrayMemorySize);
 	LIB_FUNC("+k91hoTuoA8", AudioOut2::AudioOut2SpeakerArrayCreate);
 	LIB_FUNC("erCWQR5eKiQ", AudioOut2::AudioOut2SpeakerArrayDestroy);
@@ -206,6 +207,8 @@ LIB_DEFINE(InitAudio_1_AudioIn) {
 	LIB_FUNC("5NE8Sjc7VC8", AudioIn::AudioInOpen);
 	LIB_FUNC("LozEOU8+anM", AudioIn::AudioInInput);
 	LIB_FUNC("BohEAQ7DlUE", AudioIn::AudioInGetSilentState);
+	LIB_FUNC("nya-R5gDYhM", AudioIn::AudioInHqOpen);
+	LIB_FUNC("Jh6WbHhnI68", AudioIn::AudioInClose);
 }
 
 } // namespace LibAudioIn
@@ -597,6 +600,7 @@ LIB_DEFINE(InitAudio_1_Acm) {
 	LIB_FUNC("8fe55ktlNVo", Acm::AcmBatchStartBuffers);
 	LIB_FUNC("RLN3gRlXJLE", Acm::AcmBatchWait);
 	LIB_FUNC("r7z5YQFZo+U", Acm::AcmBatchJobNotification);
+	LIB_FUNC("GTfJ64qFCPw", Acm::AcmBatchJobPriority);
 	LIB_FUNC("u70oWo92SYQ", Acm::AcmConvReverbSharedInput);
 	LIB_FUNC("9nLbWmRDpa8", Acm::AcmConvReverbSharedIr);
 	LIB_FUNC("KovqaFbmtsM", Acm::AcmFft);
