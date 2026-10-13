@@ -337,3 +337,8 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
 - Wolverine dev (12 hilos), 13-10 06:04: 9-13 fps en juego tras la zona inicial (60 fps al principio); sin línea
   base aún (el original no registra fps). Pendiente: misma zona con Play Wolverine.bat y con WORKERS=4. Prioridad
   del usuario: precompilación de shaders tipo Demon's Souls + estructura de carpetas/launcher como DS.
+- 2026-10-13 (10): con 6a944f8 el write-back actuó 11 veces solo sobre planos de vídeo (rendimiento normal) pero el
+  glitch siguió. Hipótesis: el volcado pisa lo que el juego preparó en memoria para el vídeo nuevo. a163aa6 añade
+  KYTY_OVERLAP_WRITEBACK=2 (liberar sin volcar). PENDIENTE DE INSTALAR (el PC se desconectó): exe de la release
+  KytyPS5-20261013-a163aa68 + Launcher.ps1 apuntando a kyty_emulator-a163aa6.exe + KYTY_OVERLAP_WRITEBACK=2 en
+  config\sin-fg.json y config\fsr3.json.
