@@ -43,6 +43,9 @@ void AddOutput(ShaderInfo& info, StageOutputKind kind, uint32_t index, uint32_t 
 void ValidateOptions(const Program& program, const ShaderInfoOptions& options) {
 	switch (program.stage) {
 		case ShaderType::Vertex:
+		case ShaderType::Local:
+		case ShaderType::TessellationControl:
+		case ShaderType::TessellationEvaluation:
 		case ShaderType::Mesh:
 			if (options.vertex == nullptr) {
 				return Fail("vertex shader has no input metadata");
@@ -81,7 +84,8 @@ void ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 					    !inst.Arg(1).IsImmediate() || inst.Arg(1).GetType() != Type::U32) {
 						return Fail("typed attribute reference is not constant");
 					}
-					if (program.stage == ShaderType::Vertex &&
+					if ((program.stage == ShaderType::Vertex ||
+					     program.stage == ShaderType::Local) &&
 					    (inst.Arg(1).U32() >= 4u ||
 					     inst.Arg(0).U32() >=
 					         static_cast<uint32_t>(options.vertex->resources_num))) {
@@ -124,6 +128,8 @@ void ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 							}
 							break;
 						case StageInputKind::VertexIndex:
+						case StageInputKind::InvocationId:
+						case StageInputKind::PrimitiveId:
 						case StageInputKind::InstanceIndex:
 						case StageInputKind::BaseInstance:
 						case StageInputKind::FrontFacing:
@@ -143,6 +149,7 @@ void ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 								return Fail("typed barycentric component is out of range");
 							}
 							break;
+						case StageInputKind::TessCoord:
 						case StageInputKind::WorkgroupId:
 						case StageInputKind::LocalInvocationId:
 						case StageInputKind::GlobalInvocationId:
@@ -279,6 +286,10 @@ void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& inf
 void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
+			if (program.stage == ShaderType::TessellationControl &&
+			    inst.GetOpcode() == ValueOpcode::LaneId) {
+				AddInput(info, StageInputKind::InvocationId, 0, 1, "gl_InvocationID");
+			}
 			if (inst.GetOpcode() != ValueOpcode::GetBuiltin) {
 				continue;
 			}
@@ -293,6 +304,13 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::BaseInstance:
 					AddInput(info, kind, 0, 1, "gl_BaseInstance");
 					break;
+				case StageInputKind::InvocationId:
+					AddInput(info, kind, 0, 1, "gl_InvocationID");
+					break;
+				case StageInputKind::PrimitiveId:
+					AddInput(info, kind, 0, 1, "gl_PrimitiveID");
+					break;
+				case StageInputKind::TessCoord: AddInput(info, kind, 0, 3, "gl_TessCoord"); break;
 				case StageInputKind::FragCoord: AddInput(info, kind, 0, 4, "gl_FragCoord"); break;
 				case StageInputKind::FrontFacing:
 					AddInput(info, kind, 0, 1, "gl_FrontFacing");
@@ -414,7 +432,10 @@ void CollectShaderInfo(Program& program, const ShaderInfoOptions& options) {
 		    });
 	    });
 	switch (program.stage) {
-		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
+		case ShaderType::Vertex:
+		case ShaderType::Local: CollectVertexInputs(program, options.vertex, next); break;
+		case ShaderType::TessellationControl:
+		case ShaderType::TessellationEvaluation:
 		case ShaderType::Mesh: break;
 		case ShaderType::Pixel: CollectPixelInputs(program, options.pixel, next); break;
 		case ShaderType::Compute: CollectComputeInputs(options.compute, next); break;

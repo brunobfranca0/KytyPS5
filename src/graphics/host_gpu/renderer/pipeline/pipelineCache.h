@@ -119,6 +119,15 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
+// The hull (TessellationControl) and domain (TessellationEvaluation) stages of a tessellated draw
+// (--tessellation): the vertex stage of such a draw is the LS program. Null for every other draw.
+struct TessellationPipelineStages {
+	const ShaderVertexInputInfo* control    = nullptr;
+	const ShaderVertexInputInfo* evaluation = nullptr;
+	ShaderProgram                control_program;
+	ShaderProgram                evaluation_program;
+};
+
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
@@ -191,8 +200,13 @@ public:
 	[[nodiscard]] static bool TakeMaterializationFailure();
 
 	struct GraphicsPrograms {
-		ShaderProgram vertex;
+		ShaderProgram vertex; // the LS program of a tessellated draw
 		ShaderProgram pixel;
+		// A tessellated draw's HS and TES programs (--tessellation), else empty.
+		ShaderProgram tess_control;
+		ShaderProgram tess_evaluation;
+
+		[[nodiscard]] bool Tessellated() const { return static_cast<bool>(tess_control); }
 	};
 
 	// `table_mode`: both programs in table mode (ShaderRecompiler::IR::EnterTableMode), each empty when it does not
@@ -204,7 +218,16 @@ public:
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, ShaderVertexInputInfo& vertex_info,
 	                    ShaderPixelInputInfo& pixel_info, bool table_mode = false,
-	                    std::array<uint32_t, 2> table_portable = {});
+	                    std::array<uint32_t, 2> table_portable = {},
+	                    std::array<ShaderVertexInputInfo, 2>* tess_info = nullptr);
+	// A tessellated draw's programs (GetGraphicsPrograms with --tessellation).
+	GraphicsPrograms GetTessellationPrograms(const HW::VertexShaderInfo& vertex_regs,
+	                                         const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
+	                                         const HW::Context&                                  context,
+	                                         std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	                                         bool pixel_active, ShaderVertexInputInfo& vertex_info,
+	                                         ShaderPixelInputInfo&                 pixel_info,
+	                                         std::array<ShaderVertexInputInfo, 2>& tess_info);
 	// `unevaluated`: a resource table that does not evaluate returns an empty program with the error here
 	// (an indirect dispatch decides) instead of stopping the emulator.
 	// `table_mode`: the program in table mode (ShaderRecompiler::IR::EnterTableMode), empty when it does not allow
@@ -221,7 +244,7 @@ public:
 	                       const ShaderPixelInputInfo* ps_input_info,
 	                       vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program,
-	                       bool native_bindings = false);
+	                       bool native_bindings = false, const TessellationPipelineStages* tess = nullptr);
 	// The same pipeline without blocking the caller on the driver compile: null while a
 	// background worker creates it (the native XPR variants, whose draws take the normal path
 	// until then). A later call with the same state returns the finished pipeline.
@@ -279,10 +302,13 @@ private:
 		PipelineVertexInputState vertex_input;
 		PipelineStaticParameters static_params;
 		bool                     native_bindings = false;
+		uint64_t                 hs_shader_id    = 0; // tessellated draws only (--tessellation)
+		uint64_t                 ds_shader_id    = 0;
 
 		bool operator==(const GraphicsPipelineKey& other) const {
 			return rendering == other.rendering && vs_shader_id == other.vs_shader_id &&
-			       ps_shader_id == other.ps_shader_id && vertex_input == other.vertex_input &&
+			       ps_shader_id == other.ps_shader_id && hs_shader_id == other.hs_shader_id &&
+			       ds_shader_id == other.ds_shader_id && vertex_input == other.vertex_input &&
 			       static_params == other.static_params &&
 			       native_bindings == other.native_bindings;
 		}
@@ -317,6 +343,10 @@ private:
 			PipelineKeyHash::MixRendering(hash, key.rendering);
 			PipelineKeyHash::Mix(hash, key.vs_shader_id);
 			PipelineKeyHash::Mix(hash, key.ps_shader_id);
+			if (key.hs_shader_id != 0 || key.ds_shader_id != 0) {
+				PipelineKeyHash::Mix(hash, key.hs_shader_id);
+				PipelineKeyHash::Mix(hash, key.ds_shader_id);
+			}
 			PipelineKeyHash::Mix(hash, key.native_bindings);
 			PipelineKeyHash::Mix(hash, key.vertex_input.binding_count);
 			for (uint32_t i = 0; i < key.vertex_input.binding_count; i++) {
@@ -405,7 +435,8 @@ private:
 	                                     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	                                     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
 	                                     bool primitive_restart_enable, const ShaderProgram& vertex_program,
-	                                     const ShaderProgram& pixel_program, bool native_bindings, bool async);
+	                                     const ShaderProgram& pixel_program, bool native_bindings, bool async,
+	                                     const TessellationPipelineStages* tess = nullptr);
 	void      FinishCompileWorkers();
 	CompileWorkers& Workers();
 	CompileWorkers& TableWorkers();
@@ -439,7 +470,8 @@ void CreatePipelineInternal(
     const ShaderVertexInputInfo& vs_input_info, const ShaderProgram& vertex_program,
     const ShaderPixelInputInfo* ps_input_info, const ShaderProgram& pixel_program,
     const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache,
-    bool native_bindings = false, PipelineBuild build = PipelineBuild::Full);
+    bool native_bindings = false, PipelineBuild build = PipelineBuild::Full,
+    const TessellationPipelineStages* tess = nullptr);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,

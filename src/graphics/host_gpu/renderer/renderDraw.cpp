@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -1104,6 +1105,17 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 		case Prospero::PrimitiveType::kRectList:
 			topology = vk::PrimitiveTopology::ePatchList;
 			break;
+		case Prospero::PrimitiveType::kPatch:
+			// Tessellated draws (native LS, HS and TES stages) only with --tessellation; skipped otherwise.
+			if (!Config::TessellationEnabled()) {
+				static std::atomic_bool logged = false;
+				if (!logged.exchange(true, std::memory_order_relaxed)) {
+					std::printf("Skipping tessellated draws (patch primitives): --tessellation draws them\n");
+				}
+				return false;
+			}
+			topology = vk::PrimitiveTopology::ePatchList;
+			break;
 		case Prospero::PrimitiveType::kRectListLegacy:
 			if (!auto_draw) {
 				EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
@@ -1223,9 +1235,20 @@ static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 		LogDrawPhase(draw.name, "GetGraphicsPrograms");
 	}
 	(void)PipelineCache::TakeMaterializationFailure();
+	std::array<ShaderVertexInputInfo, 2>* tess_info = nullptr;
+	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		if (state.tess_info == nullptr) state.tess_info = std::make_shared<std::array<ShaderVertexInputInfo, 2>>();
+		tess_info = state.tess_info.get();
+	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vs_input_info, state.ps_input_info);
+	    target_export_mapping, state.ps_active, state.vs_input_info, state.ps_input_info, false, {}, tess_info);
+	if (tess_info != nullptr && (!state.programs.vertex || !state.programs.Tessellated() ||
+	                             !state.programs.tess_evaluation || (state.ps_active && !state.programs.pixel))) {
+		// A tessellated draw whose programs did not all compile (or were skipped: --skip-shaders) is not drawn.
+		(void)PipelineCache::TakeMaterializationFailure();
+		return false;
+	}
 	return !PipelineCache::TakeMaterializationFailure();
 }
 
@@ -1307,6 +1330,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip:
 		case Prospero::PrimitiveType::kRectList:
+		case Prospero::PrimitiveType::kPatch: // (--tessellation)
 			if (emit.indexed) {
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      emit.first_instance);
@@ -1504,6 +1528,29 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& bindings = binding_storage.Get();
 	PrepareGraphicsBindingsInto(state.vs_input_info.stage, state.ps_input_info.stage,
 	                            state.ps_active, bindings);
+	// A tessellated draw (--tessellation): the HS and TES stages' bindings, and their pipeline stages.
+	const bool tess_active = state.programs.Tessellated();
+	std::unique_ptr<std::array<PreparedBindings, 2>> tess_bindings;
+	TessellationPipelineStages                       tess_stages;
+	if (tess_active) {
+		EXIT_IF(state.tess_info == nullptr);
+		auto& info    = *state.tess_info;
+		tess_bindings = std::make_unique<std::array<PreparedBindings, 2>>();
+		auto& tess    = *tess_bindings;
+		PrepareBindingsInto(info[0].stage, tess[0]);
+		PrepareBindingsInto(info[1].stage, tess[1]);
+		FindBuffers(tess[0]);
+		FindBuffers(tess[1]);
+		PrepareBdaBindings(tess[0], &tess[1]);
+		RebindBuffers(tess[0]);
+		RebindBuffers(tess[1]);
+		RebindImages(tess[0]);
+		RebindImages(tess[1]);
+		tess_stages = {.control            = &info[0],
+		               .evaluation         = &info[1],
+		               .control_program    = state.programs.tess_control,
+		               .evaluation_program = state.programs.tess_evaluation};
+	}
 	if (FrameCapture::Active()) {
 		CaptureFrameDraw(buffer, draw, state, bindings.vertex, bindings.pixel);
 	}
@@ -1569,7 +1616,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		return true;
 	};
 	const bool full_screen_pass = full_screen && (AsyncDrawSyncSmall() || !targets_written());
-	if (AsyncDrawPipelines() && !full_screen_pass) {
+	if (AsyncDrawPipelines() && !full_screen_pass && !tess_active) {
 		auto& cache    = m_context.GetPipelineCache();
 		const auto try_create = [&] {
 			return cache.TryCreateGraphicsPipeline(std::span {state.color_info, state.color_count}, state.depth_info,
@@ -1642,7 +1689,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                     : m_context.GetPipelineCache().CreateGraphicsPipeline(
 	                           std::span {state.color_info, state.color_count}, state.depth_info,
 	                           state.vs_input_info, buffer, state.ps_active ? &state.ps_input_info : nullptr,
-	                           topology, primitive_restart_enable, state.programs.vertex, state.programs.pixel);
+	                           topology, primitive_restart_enable, state.programs.vertex, state.programs.pixel,
+	                           false, tess_active ? &tess_stages : nullptr);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1687,10 +1735,14 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 		}
 	}
-	std::array<PreparedBindings*, 2> descriptor_stages {&bindings.vertex, nullptr};
-	const size_t                     descriptor_stage_count = bindings.pixel.has_value() ? 2u : 1u;
+	std::array<PreparedBindings*, 4> descriptor_stages {&bindings.vertex, nullptr};
+	size_t                           descriptor_stage_count = bindings.pixel.has_value() ? 2u : 1u;
 	if (bindings.pixel) {
 		descriptor_stages[1] = &*bindings.pixel;
+	}
+	if (tess_active) {
+		descriptor_stages[descriptor_stage_count++] = &(*tess_bindings)[0];
+		descriptor_stages[descriptor_stage_count++] = &(*tess_bindings)[1];
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
 	               std::span {descriptor_stages.data(), descriptor_stage_count});
@@ -1789,6 +1841,12 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
+	if (tess_active) {
+		if (HasShaderBufferWrites((*state.tess_info)[0].stage))
+			shader_write_stages |= vk::PipelineStageFlagBits::eTessellationControlShader;
+		if (HasShaderBufferWrites((*state.tess_info)[1].stage))
+			shader_write_stages |= vk::PipelineStageFlagBits::eTessellationEvaluationShader;
+	}
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
@@ -1803,11 +1861,11 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (m_native_xpr_verify.record != nullptr)
 		NativeXprVerify(buffer, state, rendering, std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
 	// (A table draw of vertices too: TableStore stores what a table try asked for.)
-	if (m_table_xpr && flip_slot < 0)
+	if (m_table_xpr && flip_slot < 0 && !tess_active)
 		TableStore(buffer, state, topology, primitive_restart_enable, rendering, !mesh_active && vertex_bindings.count == 0);
 	if (m_native_xpr_store) {
 		m_native_xpr_store = false;
-		if (flip_slot < 0 && !mesh_active && emit.indexed && vertex_bindings.count == 0)
+		if (flip_slot < 0 && !mesh_active && !tess_active && emit.indexed && vertex_bindings.count == 0)
 			NativeXprStore(buffer, state, topology, primitive_restart_enable, rendering,
 			               std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
 		else
@@ -2452,7 +2510,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return false;
 	}
 
-	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
+	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList && !state.programs.Tessellated();
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&
 	    state.vs_input_info.stage.program->param_export_mask == 0 &&
 	    state.ps_input_info.input_num != 0) {

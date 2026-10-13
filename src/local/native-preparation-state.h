@@ -19,6 +19,8 @@ inline void ResetNativeVertexInput(ShaderVertexInputInfo& info) {
     info.scratch_size_dwords = info.pa_cl_vs_out_cntl = 0;
     info.clip_space = {};
     info.mesh = {};
+    info.logical_stage = ShaderType::Vertex;
+    info.tess = {};
     info.fetch_external = info.fetch_embedded = false;
 }
 

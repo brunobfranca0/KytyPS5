@@ -699,6 +699,9 @@ struct PipelineCache::ProgramCache {
 		switch (stage) {
 			case ShaderType::Vertex: name = "vs"; break;
 			case ShaderType::Mesh: name = "ms"; break;
+			case ShaderType::Local: name = "ls"; break;
+			case ShaderType::TessellationControl: name = "hs"; break;
+			case ShaderType::TessellationEvaluation: name = "ds"; break;
 			case ShaderType::Pixel: name = "ps"; break;
 			case ShaderType::Compute: name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
@@ -760,7 +763,10 @@ struct PipelineCache::ProgramCache {
 	                  uint32_t& push_data_cursor, bool table_mode = false, uint32_t table_portable = 0) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			stage = input_info.mesh.threads_num[0] != 0 ? ShaderType::Mesh : ShaderType::Vertex;
+			// (A tessellated draw's stages, --tessellation: LS, HS and TES.)
+			stage = input_info.mesh.threads_num[0] != 0    ? ShaderType::Mesh
+			        : input_info.tess.input_control_points != 0 ? input_info.logical_stage
+			                                                    : ShaderType::Vertex;
 		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 			stage = ShaderType::Pixel;
 		} else {
@@ -771,6 +777,9 @@ struct PipelineCache::ProgramCache {
 		switch (stage) {
 			case ShaderType::Vertex: label = "ShaderRecompiler VS"; break;
 			case ShaderType::Mesh: label = "ShaderRecompiler MS"; break;
+			case ShaderType::Local: label = "ShaderRecompiler LS"; break;
+			case ShaderType::TessellationControl: label = "ShaderRecompiler HS"; break;
+			case ShaderType::TessellationEvaluation: label = "ShaderRecompiler DS"; break;
 			case ShaderType::Pixel: label = "ShaderRecompiler PS"; break;
 			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
 			default: EXIT("invalid pipeline shader stage\n");
@@ -914,6 +923,10 @@ struct PipelineCache::ProgramCache {
 				options.user_data_base = 0;
 				options.wave_size      = input_info.mesh.wave_size;
 				options.scratch_dwords = input_info.mesh.scratch_size_dwords;
+			} else if (stage == ShaderType::TessellationControl) {
+				// The HS back half's user data starts at s0 (its user-data address in s0:s1).
+				options.user_data_base = 0;
+				options.wave_size      = 64u;
 			}
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
@@ -1081,7 +1094,7 @@ struct PipelineCache::ProgramCache {
 		publish_stage(permutation.program);
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
-		std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> counts {};
+		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
 		for (const auto& [key, source]: programs) {
 			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
 		}
@@ -2237,10 +2250,17 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info, bool table_mode,
-    std::array<uint32_t, 2> table_portable) {
+    std::array<uint32_t, 2> table_portable, std::array<ShaderVertexInputInfo, 2>* tess_info) {
 	LiveCensus::Scope census(LiveCensus::GraphicsPrograms, 0);
 	m_program_cache->table_pending = false;
 	m_program_cache->table_waiting.reset();
+	// A tessellated draw (--tessellation): its LS, HS and TES programs, compiled as native Vulkan stages. Only the
+	// normal path draws them (the table and native record paths get no programs, and refuse the draw).
+	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		if (tess_info == nullptr || table_mode || !Config::TessellationEnabled()) return {};
+		return GetTessellationPrograms(vertex_regs, pixel_regs, sh, context, target_export_mapping, pixel_active,
+		                               vertex_info, pixel_info, *tess_info);
+	}
 	// Reused per thread: every normal-path draw prepares both (their user data were new vectors).
 	thread_local ShaderParams vertex_params, pixel_params;
 	PrepareProgramInto(vertex_regs, context, user_config, vertex_info, vertex_params);
@@ -2292,6 +2312,49 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	return result;
 }
 
+PipelineCache::GraphicsPrograms PipelineCache::GetTessellationPrograms(
+    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+    const HW::ShaderRegisters& sh, const HW::Context& context,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info,
+    std::array<ShaderVertexInputInfo, 2>& tess_info) {
+	std::array<ShaderVertexInputInfo, 3> stages;
+	auto params  = PrepareTessellationPrograms(vertex_regs, context, stages);
+	vertex_info  = std::move(stages[0]);
+	tess_info[0] = std::move(stages[1]);
+	tess_info[1] = std::move(stages[2]);
+	ShaderParams pixel_params;
+	if (pixel_active) {
+		PrepareProgramInto(pixel_regs, sh, target_export_mapping, pixel_info, pixel_params);
+	}
+	if (context.GetClipControl().clip_disable) {
+		// The domain stage writes the position.
+		const auto& viewport = context.GetScreenViewport().viewports[0];
+		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
+		auto&       clip     = tess_info[1].clip_space;
+		clip.scale[0]        = viewport.xscale;
+		clip.scale[1]        = viewport.yscale;
+		clip.offset[0]       = viewport.xoffset;
+		clip.offset[1]       = viewport.yoffset;
+		clip.half_extent[0] =
+		    static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
+		clip.half_extent[1] =
+		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
+		clip.enabled = true;
+	}
+	Common::LockGuard lock(m_mutex);
+	uint32_t          push_data_cursor = 0;
+	GraphicsPrograms  result;
+	if (pixel_active) {
+		pixel_info.lod_stats_subgroup = m_graphics.fragment_subgroup_reduction;
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+	}
+	result.vertex          = m_program_cache->Get(params[0], vertex_info, push_data_cursor);
+	result.tess_control    = m_program_cache->Get(params[1], tess_info[0], push_data_cursor);
+	result.tess_evaluation = m_program_cache->Get(params[2], tess_info[1], push_data_cursor);
+	return result;
+}
+
 bool PipelineCache::TakeMaterializationFailure() {
 	return std::exchange(g_materialization_failed, false);
 }
@@ -2331,10 +2394,10 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const ShaderProgram& vertex_program,
-    const ShaderProgram& pixel_program, bool native_bindings) {
+    const ShaderProgram& pixel_program, bool native_bindings, const TessellationPipelineStages* tess) {
 	return *CreateGraphicsPipelineImpl(colors, depth, vs_input_info, command, ps_input_info, topology,
 	                                   primitive_restart_enable, vertex_program, pixel_program,
-	                                   native_bindings, false);
+	                                   native_bindings, false, tess);
 }
 
 PipelineCache::Pipeline* PipelineCache::TryCreateGraphicsPipeline(
@@ -2353,8 +2416,12 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const ShaderProgram& vertex_program,
-    const ShaderProgram& pixel_program, bool native_bindings, bool async) {
+    const ShaderProgram& pixel_program, bool native_bindings, bool async,
+    const TessellationPipelineStages* tess) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+	// A tessellated draw's pipeline (--tessellation) is compiled here, fully, and is not recorded for warmup.
+	EXIT_IF(tess != nullptr && (async || tess->control == nullptr || tess->evaluation == nullptr ||
+	                            !tess->control_program || !tess->evaluation_program));
 
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
 	EXIT_IF(!vertex_program);
@@ -2375,6 +2442,10 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	key.vs_shader_id            = vs_id;
 	key.ps_shader_id            = ps_id;
 	key.native_bindings         = native_bindings;
+	if (tess != nullptr) {
+		key.hs_shader_id = tess->control_program.id;
+		key.ds_shader_id = tess->evaluation_program.id;
+	}
 	auto& static_params         = key.static_params;
 	auto& rendering             = key.rendering;
 	rendering.color_count       = color_count;
@@ -2441,7 +2512,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	static_params.stencil_test_enable      = depth.stencil_test_enable;
 	static_params.stencil_front            = depth.stencil_static_front;
 	static_params.stencil_back             = depth.stencil_static_back;
-	const bool rect_list     = topology == vk::PrimitiveTopology::ePatchList;
+	const bool rect_list     = topology == vk::PrimitiveTopology::ePatchList && tess == nullptr;
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
 	static_params.face       = mc.face;
@@ -2582,7 +2653,8 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program, ps_input_info, pixel_program, static_params,
-	                       m_driver_cache, native_bindings, FirstBuild(m_graphics));
+	                       m_driver_cache, native_bindings,
+	                       tess != nullptr ? PipelineBuild::Full : FirstBuild(m_graphics), tess);
 	MainPipelineDone();
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
@@ -2593,6 +2665,9 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	EXIT_IF(!inserted);
 	if (indexed) {
 		m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+	}
+	if (tess != nullptr) {
+		return iter->second.get();
 	}
 	std::optional<ShaderPixelInputInfo> pixel_info;
 	if (ps_active) pixel_info = *ps_input_info;

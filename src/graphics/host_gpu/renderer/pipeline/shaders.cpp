@@ -581,7 +581,7 @@ void CreatePipelineInternal(
     const ShaderVertexInputInfo& vs_input_info, const ShaderProgram& vertex_program,
     const ShaderPixelInputInfo* ps_input_info, const ShaderProgram& pixel_program,
     const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache,
-    bool native_bindings, PipelineBuild build) {
+    bool native_bindings, PipelineBuild build, const TessellationPipelineStages* tess) {
 	const auto source_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	t_layout_us             = 0.0;
 	const bool ps_active = ps_input_info != nullptr;
@@ -594,7 +594,13 @@ void CreatePipelineInternal(
 	const auto vertex_stage =
 	    mesh ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex;
 
-	const bool rect_list = !mesh && static_params.topology == vk::PrimitiveTopology::ePatchList;
+	// A tessellated draw (--tessellation): the guest's LS, HS and TES programs as the vertex and
+	// tessellation stages; otherwise a patch list is a rect list, expanded by our own stages.
+	const bool tessellation = tess != nullptr;
+	EXIT_NOT_IMPLEMENTED(tessellation && (mesh || tess->control == nullptr || tess->evaluation == nullptr ||
+	                                      !tess->control->stage || !tess->evaluation->stage));
+	const bool rect_list =
+	    !mesh && !tessellation && static_params.topology == vk::PrimitiveTopology::ePatchList;
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
@@ -647,11 +653,15 @@ void CreatePipelineInternal(
 	tess_eval_shader_stage_info.stage  = vk::ShaderStageFlagBits::eTessellationEvaluation;
 	tess_eval_shader_stage_info.module = tess_eval_shader_module;
 	tess_eval_shader_stage_info.pName  = "main";
+	if (tessellation) {
+		tess_control_shader_stage_info.module = tess->control_program.module;
+		tess_eval_shader_stage_info.module    = tess->evaluation_program.module;
+	}
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4]   = {};
 	uint32_t                          shader_stage_count = 0;
 	shader_stages[shader_stage_count++]                  = vert_shader_stage_info;
-	if (rect_list) {
+	if (rect_list || tessellation) {
 		shader_stages[shader_stage_count++] = tess_control_shader_stage_info;
 		shader_stages[shader_stage_count++] = tess_eval_shader_stage_info;
 	}
@@ -821,6 +831,15 @@ void CreatePipelineInternal(
 		std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 		AddLayoutBindings(descriptor_bindings, *vs_input_info.stage.program, vertex_stage,
 		                  native_bindings);
+		vk::ShaderStageFlags push_stages = vertex_stage | vk::ShaderStageFlagBits::eFragment;
+		if (tessellation) {
+			AddLayoutBindings(descriptor_bindings, *tess->control->stage.program,
+			                  vk::ShaderStageFlagBits::eTessellationControl, native_bindings);
+			AddLayoutBindings(descriptor_bindings, *tess->evaluation->stage.program,
+			                  vk::ShaderStageFlagBits::eTessellationEvaluation, native_bindings);
+			push_stages |= vk::ShaderStageFlagBits::eTessellationControl |
+			               vk::ShaderStageFlagBits::eTessellationEvaluation;
+		}
 		if (ps_active) {
 			EXIT_IF(!ps_input_info->stage);
 			AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
@@ -828,8 +847,7 @@ void CreatePipelineInternal(
 		}
 		const auto layout_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		EXIT_IF(pipeline.pipeline_layout != nullptr);
-		SharedLayouts(graphics, pipeline, descriptor_bindings, native_bindings,
-		              vertex_stage | vk::ShaderStageFlagBits::eFragment);
+		SharedLayouts(graphics, pipeline, descriptor_bindings, native_bindings, push_stages);
 		if (PipelineSourceLog()) t_layout_us = MicrosecondsSince(layout_start);
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: pipeline layout VS=%" PRIu64 " PS=%" PRIu64 " layout=%p\n", vertex_program.id,
@@ -896,8 +914,8 @@ void CreatePipelineInternal(
 	pipeline_info.pVertexInputState        = mesh ? nullptr : &vertex_input_info;
 	pipeline_info.pInputAssemblyState      = mesh ? nullptr : &input_assembly;
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
-	tessellation_state.patchControlPoints = 3;
-	pipeline_info.pTessellationState      = (rect_list ? &tessellation_state : nullptr);
+	tessellation_state.patchControlPoints = tessellation ? vs_input_info.tess.input_control_points : 3u;
+	pipeline_info.pTessellationState      = (rect_list || tessellation ? &tessellation_state : nullptr);
 	pipeline_info.pViewportState          = &viewport_state;
 	pipeline_info.pRasterizationState     = &rasterizer;
 	pipeline_info.pMultisampleState       = &multisampling;
@@ -920,8 +938,9 @@ void CreatePipelineInternal(
 	}
 	// Its identity: for pipeline cache blobs and the source log.
 	const auto     identity_start = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	// (None for a tessellated pipeline: the identity does not cover its hull and domain stages.)
 	const uint64_t identity =
-	    PipelineSourceLog() || graphics.pipeline_blobs != nullptr || graphics.pipeline_blob_writer != nullptr
+	    !tessellation && (PipelineSourceLog() || graphics.pipeline_blobs != nullptr || graphics.pipeline_blob_writer != nullptr)
 	        ? GraphicsPipelineIdentity(ModuleSpirvHash(vertex_program.module),
 	                                   ps_active ? ModuleSpirvHash(pixel_program.module) : 0, rendering, vertex_input,
 	                                   static_params, vs_input_info, ps_input_info, native_bindings)

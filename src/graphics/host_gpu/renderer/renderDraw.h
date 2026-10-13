@@ -1,7 +1,9 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERDRAW_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERDRAW_H_
 
+#include <array>
 #include <cstdint>
+#include <memory>
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -16,6 +18,8 @@ struct DrawRenderState {
 	ShaderVertexInputInfo vs_input_info;
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
+	// A tessellated draw's HS and TES inputs (--tessellation; programs.tess_*): made at the first one.
+	std::shared_ptr<std::array<ShaderVertexInputInfo, 2>> tess_info;
 };
 
 struct DrawCallInfo {

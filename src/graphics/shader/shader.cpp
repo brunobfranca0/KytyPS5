@@ -12,6 +12,8 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
@@ -608,33 +610,28 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	return reg;
 }
 
-static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
-	                                   const HW::ShaderRegisters& sh,
-	                                   const ShaderMappedData& data,
-	                                   ShaderVertexInputInfo& info) {
+static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
+                                           uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
+                                           const ShaderMappedData& data,
+                                           ShaderVertexInputInfo&  info) {
 	KYTY_PROFILER_FUNCTION();
 
 	ResetNativeVertexInput(info);
 
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
-	EXIT_NOT_IMPLEMENTED(regs.es_regs.data_addr == 0);
-
-	uint64_t                shader_addr   = regs.es_regs.data_addr;
-	const HW::UserSgprInfo& user_sgpr     = regs.gs_user_sgpr;
-	auto                    user_sgpr_num = regs.gs_regs.rsrc2.user_sgpr;
+	EXIT_NOT_IMPLEMENTED(shader_addr == 0);
 	info.scratch_size_dwords = data.scratch_size_dwords;
 
 	if (data.user_data == nullptr) {
-		LOGF("ShaderGetInputInfoVS(): no AGC user data for shader=0x%016" PRIx64 " es=0x%016" PRIx64
-		     " gs=0x%016" PRIx64 " user_sgpr_num=%u\n",
-		     shader_addr, regs.es_regs.data_addr, regs.gs_regs.data_addr,
-		     static_cast<uint32_t>(user_sgpr_num));
+		LOGF("ShaderGetVertexInputInfo(): no AGC user data for shader=0x%016" PRIx64
+		     " user_sgpr_num=%u\n",
+		     shader_addr, user_sgpr_num);
 	}
 	ShaderVertexMetadata metadata;
 	std::string          metadata_error;
 	if (!ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, metadata, &metadata_error)) {
-		LOGF("ShaderGetInputInfoVS(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
+		LOGF("ShaderGetVertexInputInfo(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
 		     shader_addr, metadata_error.c_str());
 		return false;
 	}
@@ -653,7 +650,7 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
 
 		if (attrib == nullptr || buffer == nullptr) {
-			LOGF("ShaderGetInputInfoVS(): null vertex table pointer shader=0x%016" PRIx64 "\n",
+			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
 			     shader_addr);
 			return false;
 		}
@@ -771,6 +768,14 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.primitives_per_group, mesh.vertices_per_group,
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex});
 	}
+	// Tessellation stages only (--tessellation): the keys of other programs keep their layout, so caches
+	// built without tessellation stay valid.
+	if (info.tess.input_control_points != 0) {
+		const auto& tess = info.tess;
+		key.insert(key.end(), {0x7e55u, static_cast<uint32_t>(info.logical_stage), tess.input_control_points,
+		                       tess.output_control_points, tess.ls_stride, tess.hs_stride, tess.domain,
+		                       tess.partitioning, tess.output_topology});
+	}
 
 	for (int i = 0; i < info.resources_num; i++) {
 		const auto& resource    = info.resources[i];
@@ -860,7 +865,8 @@ void PrepareProgramInto(const HW::VertexShaderInfo& regs, const HW::Context& con
 	    start_instance >= 0 && static_cast<uint32_t>(start_instance) < regs.gs_regs.rsrc2.user_sgpr
 	        ? 8 + start_instance : -1;
 	if ((context.GetShaderStages() & 0x20u) == 0) {
-		if (!ShaderGetStaticInputInfoVS(regs, sh, data, info)) {
+		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
+		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
 		}
 		info.start_instance_sgpr = start_instance_sgpr;
@@ -871,6 +877,7 @@ void PrepareProgramInto(const HW::VertexShaderInfo& regs, const HW::Context& con
 	params.user_data.insert(params.user_data.begin(), 8u, 0u);
 	ResetNativeVertexInput(info);
 	info.start_instance_sgpr = start_instance_sgpr;
+	info.logical_stage       = ShaderType::Mesh;
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
 	mesh.input_primitive     = static_cast<uint32_t>(user_config.GetPrimType());
@@ -914,6 +921,61 @@ void PrepareProgramInto(const HW::VertexShaderInfo& regs, const HW::Context& con
 	mesh.threads_num[0] =
 	    ((mesh.max_vertices + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
+}
+
+std::array<ShaderParams, 3>
+PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                            std::array<ShaderVertexInputInfo, 3>& input_info) {
+	const auto& sh        = context.GetShaderRegisters();
+	const auto  local     = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
+	const auto  control   = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
+	const auto evaluation = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
+	EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
+	                     control.type != Prospero::ShaderBinaryType::kHsBack ||
+	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
+	EXIT_NOT_IMPLEMENTED((context.GetShaderStages() & 0x4u) == 0 ||
+	                     (context.GetShaderStages() & 0x00600020u) != 0);
+	EXIT_IF(regs.hs_regs.user_data_addr == 0);
+
+	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
+	const auto evaluation_users = std::span(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
+	std::array<ShaderParams, 3> params {
+	    GetShaderParams(regs.ls_regs.data_addr, "ShaderRecompiler LS", local_users, local),
+	    GetShaderParams(regs.hs_regs.data_addr, "ShaderRecompiler HS", local_users, control),
+	    GetShaderParams(regs.es_regs.data_addr, "ShaderRecompiler TES", evaluation_users, evaluation),
+	};
+	// The fused HS back half receives its separate user-data address in s0:s1.
+	// RDNA2 reserves s0:s7 before the native HS user SGPRs.
+	params[1].user_data.insert(params[1].user_data.begin(), 8u, 0u);
+	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
+	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
+
+	input_info = {};
+	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
+	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
+		EXIT("failed to prepare local shader program\n");
+	}
+	input_info[0].logical_stage       = ShaderType::Local;
+	input_info[1].logical_stage       = ShaderType::TessellationControl;
+	input_info[1].scratch_size_dwords = control.scratch_size_dwords;
+	input_info[2].logical_stage       = ShaderType::TessellationEvaluation;
+	input_info[2].scratch_size_dwords = evaluation.scratch_size_dwords;
+	input_info[2].pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
+
+	ShaderTessellationInputInfo tess {
+	    .input_control_points  = (sh.m_vgtLsHsConfig >> 8u) & 0x3fu,
+	    .output_control_points = (sh.m_vgtLsHsConfig >> 14u) & 0x3fu,
+	    .domain                = sh.m_vgtTfParam & 0x3u,
+	    .partitioning          = (sh.m_vgtTfParam >> 2u) & 0x3u,
+	    .output_topology       = (sh.m_vgtTfParam >> 5u) & 0x3u,
+	};
+	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
+	        tess.output_control_points == 0 || tess.output_control_points > 32);
+	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+	for (auto& stage: input_info) {
+		stage.tess = tess;
+	}
+	return params;
 }
 
 ShaderParams PrepareProgram(

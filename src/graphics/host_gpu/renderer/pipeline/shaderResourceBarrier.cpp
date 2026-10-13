@@ -16,6 +16,12 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 	if (stages & vk::ShaderStageFlagBits::eMeshEXT) {
 		result |= vk::PipelineStageFlagBits::eMeshShaderEXT;
 	}
+	if (stages & vk::ShaderStageFlagBits::eTessellationControl) {
+		result |= vk::PipelineStageFlagBits::eTessellationControlShader;
+	}
+	if (stages & vk::ShaderStageFlagBits::eTessellationEvaluation) {
+		result |= vk::PipelineStageFlagBits::eTessellationEvaluationShader;
+	}
 	if (stages & vk::ShaderStageFlagBits::eFragment) {
 		result |= vk::PipelineStageFlagBits::eFragmentShader;
 	}

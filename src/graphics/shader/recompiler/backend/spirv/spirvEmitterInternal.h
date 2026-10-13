@@ -26,7 +26,14 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 enum : uint32_t {
 	ExecutionModelVertex                     = 0,
+	ExecutionModelTessellationControl        = 1,
+	ExecutionModelTessellationEvaluation     = 2,
 	ExecutionModelFragment                   = 4,
+	ExecutionModeSpacingFractionalOdd        = 3,
+	ExecutionModeVertexOrderCw               = 4,
+	ExecutionModeTriangles                   = 22,
+	ExecutionModeOutputVertices              = 26,
+	CapabilityTessellation                   = 3,
 	ExecutionModelGLCompute                  = 5,
 	ExecutionModeOriginUpperLeft             = 7,
 	ExecutionModeEarlyFragmentTests          = 9,
@@ -80,6 +87,7 @@ enum : uint32_t {
 	DecorationBuiltIn       = 11,
 	DecorationNoPerspective = 13,
 	DecorationFlat          = 14,
+	DecorationPatch         = 15,
 	DecorationAliased       = 20,
 	DecorationLocation      = 30,
 	DecorationArrayStride   = 6,
@@ -94,8 +102,13 @@ enum : uint32_t {
 	BuiltInPointSize                 = 1,
 	BuiltInClipDistance              = 3,
 	BuiltInCullDistance              = 4,
+	BuiltInPrimitiveId               = 7,
+	BuiltInInvocationId              = 8,
 	BuiltInLayer                     = 9,
 	BuiltInViewportIndex              = 10,
+	BuiltInTessLevelOuter            = 11,
+	BuiltInTessLevelInner            = 12,
+	BuiltInTessCoord                 = 13,
 	BuiltInFragCoord                 = 15,
 	BuiltInFrontFacing               = 17,
 	BuiltInSampleId                  = 18,
@@ -136,6 +149,7 @@ enum : uint32_t {
 	ScopeDevice                    = 1,
 	ScopeWorkgroup                 = 2,
 	ScopeSubgroup                  = 3,
+	ScopeInvocation                = 4,
 	MemorySemanticsNone            = 0,
 	MemorySemanticsAcquireRelease  = 0x00000008u,
 	MemorySemanticsUniformMemory   = 0x00000040u,
@@ -442,6 +456,11 @@ struct EmitterState {
 	uint32_t                   cull_distance_count                   = 0;
 	uint32_t                   depth_variable                        = 0;
 	uint32_t                   sample_mask_variable                  = 0;
+	// Tessellation stages (spirvEmitterTessellation.cpp): the interface variable of each
+	// IR::TessellationAttribute, the inner tessellation levels and the first patch output byte.
+	std::array<uint32_t, 6>    tess_variables {};
+	uint32_t                   tess_inner_variable                   = 0;
+	uint32_t                   tess_patch_base                       = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
@@ -651,6 +670,12 @@ void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name
 void AddDescriptorAnnotationsAndNames(EmitterState& state);
 
 void DefineModule(EmitterState& state);
+void     DefineTessellationInterfaces(EmitterState& state);
+void     DefineTessellationExecutionModes(EmitterState& state);
+uint32_t EmitTessellationLaneId(EmitterState& state);
+void     EmitTessellationBarrier(EmitterState& state);
+uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
+void     EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 void     DefineMeshOutputs(EmitterState& state);
 void     EmitMeshEntryPoint(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);

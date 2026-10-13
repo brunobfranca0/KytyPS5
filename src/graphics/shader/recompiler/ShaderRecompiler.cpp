@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -51,6 +52,9 @@ const char* StageName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Compute: return "CS";
 		case ShaderType::Vertex: return "VS";
+		case ShaderType::Local: return "LS";
+		case ShaderType::TessellationControl: return "HS";
+		case ShaderType::TessellationEvaluation: return "TES";
 		case ShaderType::Mesh: return "MS";
 		case ShaderType::Pixel: return "PS";
 		default: return "unknown";
@@ -290,6 +294,8 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
                                             const ShaderVertexInputInfo* input_info,
                                             uint32_t user_data_base, uint32_t user_data_count,
                                             uint32_t wave_size) {
+	const uint32_t    vertex_index_reg   = input_info->logical_stage == ShaderType::Local ? 2u : 5u;
+	const uint32_t    instance_index_reg = input_info->logical_stage == ShaderType::Local ? 5u : 8u;
 	EmbeddedFetchData data;
 	data.loads.reserve(input_info->resources_num);
 	int32_t vertex_offset_candidate   = -1;
@@ -330,16 +336,17 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 		// corresponding direct-draw offsets before fetching.
 		const bool vertex_index_accumulator =
 		    IsDecodedVgpr(inst.dst) &&
-		    (inst.dst.reg == 0 || (user_data_base == 8 && inst.dst.reg == 5));
+		    (inst.dst.reg == 0 || (user_data_base == 8 && inst.dst.reg == vertex_index_reg));
 		const bool instance_index_accumulator =
-		    IsDecodedVgpr(inst.dst) && (inst.dst.reg == (user_data_base == 8 ? 8u : 3u));
+		    IsDecodedVgpr(inst.dst) &&
+		    (inst.dst.reg == (user_data_base == 8 ? instance_index_reg : 3u));
 		uint32_t   sad_zero = 0;
 		const bool index_offset_add =
-		    (vertex_index_accumulator || instance_index_accumulator) &&
-		    IsDecodedSgpr(inst.src0) &&
+		    (vertex_index_accumulator || instance_index_accumulator) && IsDecodedSgpr(inst.src0) &&
 		    ((inst.opcode == Decoder::Opcode::V_ADD_I32 && IsDecodedVgpr(inst.src1) &&
 		      inst.src1.reg == inst.dst.reg) ||
-		     (user_data_base == 8 && (inst.dst.reg == 5 || inst.dst.reg == 8) &&
+		     (user_data_base == 8 &&
+		      (inst.dst.reg == vertex_index_reg || inst.dst.reg == instance_index_reg) &&
 		      inst.opcode == Decoder::Opcode::V_SAD_U32 && IsDecodedVgpr(inst.src2) &&
 		      inst.src2.reg == inst.dst.reg &&
 		      TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
@@ -470,8 +477,8 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 						ClearEmbeddedFetchVectorLanes(&vector_lanes, inst.dst.reg);
 					}
 					if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgpr_is_index.size() &&
-					    IsDecodedVgpr(inst.src0) && inst.src0.reg == 8 &&
-					    IsDecodedVgpr(inst.src1) && inst.src1.reg == 5) {
+					    IsDecodedVgpr(inst.src0) && inst.src0.reg == instance_index_reg &&
+					    IsDecodedVgpr(inst.src1) && inst.src1.reg == vertex_index_reg) {
 						vgpr_is_index[inst.dst.reg] = true;
 					}
 				} else if (IsEmbeddedFetchAttribPropagationAlu(inst)) {
@@ -541,22 +548,9 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<const uint32_t> back,
                                     std::vector<uint32_t>& joined_code) {
 	EXIT_IF(back.empty());
-	Decoder::Program result;
-	uint32_t         front_words = 0;
-	while (front_words < front.size()) {
-		auto& inst = result.instructions.emplace_back();
-		Decoder::DecodeInstruction(front, front_words, inst);
-		front_words += inst.word_count;
-		if (inst.opcode == Decoder::Opcode::S_SETPC_B64) {
-			EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr ||
-			                     inst.src0.reg != 6u);
-			break;
-		}
-		EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_ENDPGM);
-	}
-	EXIT_IF(result.instructions.empty() ||
-	        result.instructions.back().opcode != Decoder::Opcode::S_SETPC_B64);
-	joined_code.assign(front.begin(), front.begin() + front_words);
+	auto       result      = Decoder::DecodeFrontProgram(front);
+	const auto front_words = static_cast<uint32_t>(result.code.size());
+	joined_code.assign(result.code.begin(), result.code.end());
 	joined_code.insert(joined_code.end(), back.begin(), back.end());
 	// The merged-stage ABI passes the back shader in s[6:7]. Give that handoff an
 	// ordinary CFG edge, retaining both bodies in one register and LDS lifetime.
@@ -584,10 +578,21 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		EXIT("shader recompiler input is empty\n");
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh) {
+	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
+	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
+	    options.stage != ShaderType::TessellationEvaluation) {
 		EXIT("shader recompiler received unsupported stage %u\n",
 		     static_cast<unsigned>(options.stage));
 	}
+	// (Tessellation stages only: see IR::g_fold_shifted_bitfield_extracts.)
+	struct TessellationFolds {
+		bool previous;
+		explicit TessellationFolds(bool enable): previous(IR::g_fold_shifted_bitfield_extracts) {
+			IR::g_fold_shifted_bitfield_extracts = enable;
+		}
+		~TessellationFolds() { IR::g_fold_shifted_bitfield_extracts = previous; }
+	} tessellation_folds {options.stage == ShaderType::Local || options.stage == ShaderType::TessellationControl ||
+	                      options.stage == ShaderType::TessellationEvaluation};
 
 	const auto compile_begin = std::chrono::steady_clock::now();
 	const auto phase_ms      = [&compile_begin]() {
@@ -604,6 +609,12 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	std::vector<uint32_t> joined_code;
 	if (!options.back_code.empty()) {
 		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
+	} else if (options.stage == ShaderType::Local) {
+		decoded = Decoder::DecodeFrontProgram(code);
+		// The separately compiled hull half runs in the next Vulkan stage.
+		auto& handoff     = decoded.instructions.back();
+		handoff.opcode    = Decoder::Opcode::S_ENDPGM;
+		handoff.src_count = 0;
 	} else {
 		Decoder::DecodeProgram(code, decoded);
 	}
@@ -667,6 +678,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	const ShaderComputeInputInfo* compute = nullptr;
 	switch (options.stage) {
 		case ShaderType::Vertex:
+		case ShaderType::Local:
+		case ShaderType::TessellationControl:
+		case ShaderType::TessellationEvaluation:
 		case ShaderType::Mesh: vertex = options.input_info.vertex; break;
 		case ShaderType::Pixel:
 			pixel = options.input_info.pixel;
@@ -677,7 +691,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		default: break;
 	}
 	EmbeddedFetchData embedded_fetch;
-	if (options.stage == ShaderType::Vertex && vertex->fetch_embedded) {
+	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) && vertex->fetch_embedded) {
 		embedded_fetch = DetectEmbeddedVertexFetch(decoded, vertex, options.user_data_base,
 		                                           static_cast<uint32_t>(options.user_data.size()),
 		                                           options.wave_size);
@@ -733,6 +747,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	LowerTessellationMemory(ir, options);
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	if (options.dump_ir && options.early_dump) {
@@ -764,6 +779,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const ShaderComputeInputInfo* compute = nullptr;
 	switch (options.stage) {
 		case ShaderType::Vertex:
+		case ShaderType::Local:
+		case ShaderType::TessellationControl:
+		case ShaderType::TessellationEvaluation:
 		case ShaderType::Mesh: vertex = options.input_info.vertex; break;
 		case ShaderType::Pixel: pixel = options.input_info.pixel; break;
 		case ShaderType::Compute: compute = options.input_info.compute; break;

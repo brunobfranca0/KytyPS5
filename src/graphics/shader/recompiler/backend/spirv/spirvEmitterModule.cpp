@@ -315,7 +315,8 @@ uint32_t GlslStd450(EmitterState& state) {
 }
 
 VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location) {
-	if (state.stage != ShaderType::Vertex || location >= ShaderVertexInputInfo::RES_MAX ||
+	if ((state.stage != ShaderType::Vertex && state.stage != ShaderType::Local) ||
+	    location >= ShaderVertexInputInfo::RES_MAX ||
 	    location >= static_cast<uint32_t>(state.input_info.vertex->resources_num)) {
 		return VertexInputScalarKind::Float;
 	}
@@ -487,6 +488,9 @@ void AllocateOutputVariables(EmitterState& state) {
 uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	switch (kind) {
 		case IR::StageInputKind::VertexIndex: return BuiltInVertexIndex;
+		case IR::StageInputKind::InvocationId: return BuiltInInvocationId;
+		case IR::StageInputKind::PrimitiveId: return BuiltInPrimitiveId;
+		case IR::StageInputKind::TessCoord: return BuiltInTessCoord;
 		case IR::StageInputKind::InstanceIndex: return BuiltInInstanceIndex;
 		case IR::StageInputKind::BaseInstance: return BuiltInBaseInstance;
 		case IR::StageInputKind::FragCoord: return BuiltInFragCoord;
@@ -679,6 +683,10 @@ void DefineModule(EmitterState& state) {
 		state.builder.AddExecutionMode(
 		    {state.main_func, 5270u, state.input_info.vertex->mesh.max_primitives});
 	}
+	if (state.stage == ShaderType::TessellationControl || state.stage == ShaderType::TessellationEvaluation) {
+		DefineTessellationExecutionModes(state);
+	}
+	DefineTessellationInterfaces(state);
 	state.entry_label = state.builder.AllocateId();
 
 	state.builder.RequireCapability(CapabilityShader);
@@ -813,6 +821,8 @@ void DefineModule(EmitterState& state) {
 		uint32_t ptr_type = TypePointer(state, StorageClassInput, TypeU32(state));
 		switch (input.kind) {
 			case IR::StageInputKind::VertexIndex:
+			case IR::StageInputKind::InvocationId:
+			case IR::StageInputKind::PrimitiveId:
 			case IR::StageInputKind::InstanceIndex:
 			case IR::StageInputKind::BaseInstance:
 			case IR::StageInputKind::Layer:
@@ -827,6 +837,7 @@ void DefineModule(EmitterState& state) {
 			case IR::StageInputKind::FragCoord:
 				ptr_type = TypePointer(state, StorageClassInput, TypeF32Vector(state, 4));
 				break;
+			case IR::StageInputKind::TessCoord:
 			case IR::StageInputKind::BaryCoordSmooth:
 			case IR::StageInputKind::BaryCoordNoPerspective:
 				ptr_type = TypePointer(state, StorageClassInput, TypeF32Vector(state, 3));
@@ -835,7 +846,7 @@ void DefineModule(EmitterState& state) {
 				ptr_type = TypePointer(state, StorageClassInput, TypeBool(state));
 				break;
 			case IR::StageInputKind::Parameter:
-				if (state.stage == ShaderType::Vertex) {
+				if (state.stage == ShaderType::Vertex || state.stage == ShaderType::Local) {
 					const auto kind       = VertexParameterScalarKind(state, input.location);
 					const auto components = VertexParameterComponentCount(input);
 					ptr_type = VertexParameterInputPointerType(state, kind, components);

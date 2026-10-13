@@ -106,14 +106,15 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
 	    kind == IR::StageInputKind::BaseInstance || kind == IR::StageInputKind::Layer ||
-	    kind == IR::StageInputKind::SampleId) {
+	    kind == IR::StageInputKind::SampleId || kind == IR::StageInputKind::InvocationId ||
+	    kind == IR::StageInputKind::PrimitiveId) {
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
 		state.builder.AddFunction({OpLoad, TypeI32(state), value, variable});
 		state.builder.AddFunction({OpBitcast, TypeU32(state), bits, value});
 		return bits;
 	}
-	if (kind == IR::StageInputKind::FragCoord) {
+	if (kind == IR::StageInputKind::FragCoord || kind == IR::StageInputKind::TessCoord) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
@@ -198,7 +199,7 @@ uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan) {
 	if (input == nullptr || input->variable_id == 0) {
 		return ConstantU32(state, 0);
 	}
-	if (state.stage == ShaderType::Vertex) {
+	if (state.stage == ShaderType::Vertex || state.stage == ShaderType::Local) {
 		return EmitVertexParameterComponentU32(state, *input, chan & 3u);
 	}
 	const auto load_per_vertex = [&](uint32_t vertex) {
@@ -566,6 +567,10 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::TtraceData:
 		case IR::ValueOpcode::InstPrefetch: return true;
 		case IR::ValueOpcode::Barrier: {
+			if (state.stage == ShaderType::TessellationControl) {
+				EmitTessellationBarrier(state);
+				return true;
+			}
 			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
 			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
 			                           ConstantU32(state, ScopeWorkgroup),
@@ -573,6 +578,12 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		case IR::ValueOpcode::MeshAllocate: EmitMeshAllocate(ctx, inst); return true;
+		case IR::ValueOpcode::GetTessellationAttribute:
+			ctx.Define(inst, EmitGetTessellationAttribute(ctx, inst));
+			return true;
+		case IR::ValueOpcode::SetTessellationAttribute: EmitSetTessellationAttribute(ctx, inst); return true;
+		case IR::ValueOpcode::TessellationBase:
+			ctx.Fail(inst, "a tessellation ring base outside a lowered tessellation access");
 		case IR::ValueOpcode::MeshDrawParameter: {
 			const auto index = inst.Arg(0).U32();
 			if (state.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
@@ -632,7 +643,8 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitWqmU64(ctx.state, ctx.Arg(inst, 0)));
 			return true;
 		case IR::ValueOpcode::LaneId:
-			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
+			ctx.Define(inst, state.stage == ShaderType::TessellationControl ? EmitTessellationLaneId(state)
+			                                                                : EmitSubgroupLocalInvocationId(state));
 			return true;
 		case IR::ValueOpcode::Ballot: ctx.Define(inst, ctx.Ballot(inst.Arg(0))); return true;
 		case IR::ValueOpcode::AnyLane: {

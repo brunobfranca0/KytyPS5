@@ -913,6 +913,9 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 	}
 	switch (options.stage) {
 		case ShaderType::Vertex:
+		case ShaderType::Local:
+		case ShaderType::TessellationControl:
+		case ShaderType::TessellationEvaluation:
 		case ShaderType::Mesh:
 			if (options.vertex == nullptr) {
 				EXIT("vertex shader translation has no vertex input metadata");
@@ -1183,6 +1186,42 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(options.vertex->start_instance_sgpr),
 				                      draw(2));
 			}
+		} else if (options.stage == ShaderType::Local) {
+			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
+			                      builtin(IR::StageInputKind::VertexIndex));
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), IR::U32(IR::Value(0u)));
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
+			                      builtin(IR::StageInputKind::InstanceIndex));
+		} else if (options.stage == ShaderType::TessellationControl) {
+			const auto& tess = options.vertex->tess;
+			entry_ir.SetScalarReg(
+			    static_cast<IR::ScalarReg>(2),
+			    IR::U32(entry_ir.Emit(IR::ValueOpcode::TessellationBase, {IR::Value(0u)})));
+			entry_ir.SetScalarReg(
+			    static_cast<IR::ScalarReg>(4),
+			    IR::U32(entry_ir.Emit(IR::ValueOpcode::TessellationBase, {IR::Value(1u)})));
+			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
+			                      IR::U32(IR::Value(0x81010000u | tess.input_control_points |
+			                                        (tess.output_control_points << 8u))));
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
+			                      builtin(IR::StageInputKind::PrimitiveId));
+			entry_ir.SetVectorReg(
+			    static_cast<IR::VectorReg>(1),
+			    entry_ir.ShiftLeftLogical(builtin(IR::StageInputKind::InvocationId),
+			                              IR::U32(IR::Value(8u))));
+		} else if (options.stage == ShaderType::TessellationEvaluation) {
+			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
+			entry_ir.SetScalarReg(
+			    static_cast<IR::ScalarReg>(4),
+			    IR::U32(entry_ir.Emit(IR::ValueOpcode::TessellationBase, {IR::Value(0u)})));
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
+			                      builtin(IR::StageInputKind::TessCoord, 0));
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6),
+			                      builtin(IR::StageInputKind::TessCoord, 1));
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(7), IR::U32(IR::Value(0u)));
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
+			                      builtin(IR::StageInputKind::PrimitiveId));
 		} else if (options.stage == ShaderType::Pixel) {
 			const auto* ps = options.pixel;
 			if (ps->ps_perspective_center_vgpr != UINT32_MAX) {
