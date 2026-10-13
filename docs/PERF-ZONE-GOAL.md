@@ -331,3 +331,9 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
 - 2026-10-13 (8): **KYTY_OVERLAP_WRITEBACK hizo el juego muy lento** (3a5b3ab: 45-57 ms/frame, el log llegó al tope de
   200 OVERLAP-WRITEBACK enseguida: se dispara con imágenes compute del juego en cada frame, no solo con el vídeo).
   Apagado en config\*.json y por defecto en el código (=1 lo activa). Hay que limitarlo a los planos del vídeo.
+- 2026-10-13 (9): 6a944f8 instalada: overlap write-back solo para planos de 1-2 bytes/píxel con el mismo tiling
+  (vídeo); activo por defecto, KYTY_OVERLAP_WRITEBACK=0 lo apaga. Sin probar: mirar en el log que no haya
+  OVERLAP-WRITEBACK fuera del menú de archipiedras y que los fps sean normales.
+- Wolverine dev (12 hilos), 13-10 06:04: 9-13 fps en juego tras la zona inicial (60 fps al principio); sin línea
+  base aún (el original no registra fps). Pendiente: misma zona con Play Wolverine.bat y con WORKERS=4. Prioridad
+  del usuario: precompilación de shaders tipo Demon's Souls + estructura de carpetas/launcher como DS.
