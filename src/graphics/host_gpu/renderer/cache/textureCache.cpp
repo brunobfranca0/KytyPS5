@@ -1337,10 +1337,13 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	// memory without them, garbled until the next key frame. Not for render targets (two targets the game renders into
 	// the same transient memory each frame would delete each other, see NumFramesBeforeRemoval).
 	const auto retire_written = [&]() {
-		static const bool enabled = [] {
+		// 1 (default): written back, then freed; 2: freed without writing back (the new image starts from what the
+		// game left in memory, e.g. a clear it made itself); 0: off.
+		static const int mode = [] {
 			const char* value = std::getenv("KYTY_OVERLAP_WRITEBACK");
-			return value == nullptr || value[0] != '0';
+			return value == nullptr ? 1 : std::atoi(value);
 		}();
+		const bool enabled = mode != 0;
 		// Only narrow planes (1-2 bytes a pixel: video Y/UV/alpha) of the same tiling: without this it fired on two
 		// RGBA16F compute images the game swaps in the same memory every frame (45-57 ms frames, 13-10).
 		if (cached.info.bytes_per_block > 2 || requested.bytes_per_block > 2 ||
@@ -1349,12 +1352,12 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (!enabled || safe_to_delete || !cached.IsGpuModified() || !cached.usage.storage ||
 		    cached.usage.render_target || cached.usage.depth_target || cached.binding.is_target || cached.depth_id)
 			return false;
-		if (!SafeToDownload(cached) || !TryDownloadImage(cached_id)) return false;
+		if (mode != 2 && (!SafeToDownload(cached) || !TryDownloadImage(cached_id))) return false;
 		cached.ClearGpuModified();
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1) < 200)
-			std::printf("OVERLAP-WRITEBACK cached=0x%llx+0x%llx requested=0x%llx+0x%llx\n",
-			            static_cast<unsigned long long>(cached.info.data.address),
+			std::printf("OVERLAP-WRITEBACK mode=%d cached=0x%llx+0x%llx requested=0x%llx+0x%llx\n",
+			            mode, static_cast<unsigned long long>(cached.info.data.address),
 			            static_cast<unsigned long long>(cached.info.data.size),
 			            static_cast<unsigned long long>(requested.data.address),
 			            static_cast<unsigned long long>(requested.data.size));
