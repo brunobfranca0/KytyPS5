@@ -294,3 +294,8 @@ escrito en la GPU momentos antes; 17 % (6,7 s) lo mismo vía `CopyBuffer`; 10 % 
   release 2026-10-03 (f53e5d2) + PR #937 + arreglos. Es OTRO árbol de código, no esta rama: los arreglos genéricos
   (ATRAC9 multicanal 0x30, FSR3 FG, wave OR en PS, skipcs) habría que portarlos a ese código; lo específico de
   Demon's Souls (seeds, hints, DemonsSouls::*) no aplica.
+- 2026-10-13 (3), **trama del agua ARREGLADA** (9ce1872, confirmado en juego): en shaders de gráficos wave64 sobre
+  subgrupos de 32, `v_readlane 31/63` de un OR por DPP row_shr + v_permlanex16 se emite como
+  OpGroupNonUniformBitwiseOr (spirvEmitterFlow.cpp, IsWaveOrScanRead; KYTY_PS_WAVE_OR=0 lo apaga). El primer intento
+  (aa159bb) no casaba: la escritura del permlane en su VGPR va envuelta en SelectU32(exec). En el Nexo lo aplica a 11
+  shaders (log `PS_WAVE_OR <hash>`), así que puede corregir más superficies con el mismo patrón.
