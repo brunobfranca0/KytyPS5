@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cstdlib>
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "slow-log.h"
 
@@ -1328,6 +1330,32 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const auto current_frame = m_frame.load(std::memory_order_relaxed);
 	const bool safe_to_delete =
 	    current_frame - std::min(current_frame, cached.frame_accessed_last) > NumFramesBeforeRemoval;
+	// KYTY_OVERLAP_WRITEBACK (on unless 0): a compute-written image partly under the requested one, used in the last
+	// frames, is written back to guest memory and freed now instead of living on beside it. The archstone menu's
+	// preview video is decoded on the GPU into Y/UV planes whose addresses shift by 0x200000 from one video to the
+	// next: the old planes stayed (gpu-modified, not in memory) and the new video's first reference frames came out of
+	// memory without them, garbled until the next key frame. Not for render targets (two targets the game renders into
+	// the same transient memory each frame would delete each other, see NumFramesBeforeRemoval).
+	const auto retire_written = [&]() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_OVERLAP_WRITEBACK");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (!enabled || safe_to_delete || !cached.IsGpuModified() || !cached.usage.storage ||
+		    cached.usage.render_target || cached.usage.depth_target || cached.binding.is_target || cached.depth_id)
+			return false;
+		if (!SafeToDownload(cached) || !TryDownloadImage(cached_id)) return false;
+		cached.ClearGpuModified();
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1) < 200)
+			std::printf("OVERLAP-WRITEBACK cached=0x%llx+0x%llx requested=0x%llx+0x%llx\n",
+			            static_cast<unsigned long long>(cached.info.data.address),
+			            static_cast<unsigned long long>(cached.info.data.size),
+			            static_cast<unsigned long long>(requested.data.address),
+			            static_cast<unsigned long long>(requested.data.size));
+		FreeImage(cached_id, "overlap-gpu-written");
+		return true;
+	};
 
 	if (requested.data.address == cached.info.data.address) {
 		const uint32_t requested_block = requested.bytes_per_block * requested.samples;
@@ -1407,6 +1435,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 				return {cached_id, mip, layer};
 			}
 		}
+		if (retire_written()) return {};
 		if (safe_to_delete) {
 			if (SlowLog::Threshold() > 0.0 && cached.info.data.size >= PartialDirtyMinSize) {
 				std::printf("[tsc %llu] OVERLAP-FREE requested=0x%llx+0x%llx fmt=%u %ux%u cached=0x%llx+0x%llx "
@@ -1428,6 +1457,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	}
 
 	const int32_t mip = cached.info.MipOf(requested);
+	if (mip < 0 || cached.info.SliceOf(requested, mip) < 0) {
+		// (The requested image starts before the cached one and does not hold it as a level or layer.)
+		if (retire_written()) return {merged_id};
+	}
 	if (mip >= 0) {
 		const int32_t layer = cached.info.SliceOf(requested, mip);
 		if (layer >= 0) {
