@@ -33,6 +33,7 @@ struct LocalDescriptorPlan;
 #endif
 class CommandBuffer;
 class PipelineBinaries;
+class PipelineCacheBlobs;
 
 namespace HW {
 class Context;
@@ -137,6 +138,13 @@ public:
 		uint32_t              shards  = 1;
 		uint32_t              threads = 1;
 		bool                  pipelines = true;
+		// No pipeline created: the timings list what would be (0 ms), each with its key (what makes two the same).
+		bool                  dry_run = false;
+		// The run's plan: each pipeline key of its seed files with the work item that makes it first. A dry run adds
+		// the seed file's keys to it; a shard creates only the pipelines whose first work item is its own.
+		std::filesystem::path plan;
+		// Native XPR variants of a seed file without recorded specializations too (its guesses; see WarmSeeds).
+		bool                  native_guesses = false;
 		// Compute seeds translated for this host subgroup size instead of the one they were listed or recorded with
 		// (0: as they were): kyty_shader_precompile passes the GPU's (GetComputeProgram's), --amd what a GPU running
 		// wave64 programs natively (AMD RDNA3) gets.
@@ -340,6 +348,7 @@ private:
 	vk::PipelineCache             m_static_cache = nullptr;
 	// Or its binaries (pipelineBinaries.h): GraphicContext::pipeline_binaries while open.
 	std::unique_ptr<PipelineBinaries> m_static_binaries;
+	std::unique_ptr<PipelineCacheBlobs> m_static_blobs;
 	std::filesystem::path         m_driver_cache_path;
 	std::string                   m_driver_cache_key;
 	// The size of the driver cache's data when it was loaded or last saved (Save skips an unchanged one).
@@ -410,7 +419,8 @@ private:
 	void              TablePipelineDone();
 	void              MainPipelineDone();
 	void InitializeStaticCache(bool create);
-	void WarmPipelines();
+	// The recorded pipelines; compute ones, newest first, while they took less than `compute_video` bytes of video memory.
+	void WarmPipelines(uint64_t compute_video = UINT64_MAX);
 #ifdef KYTY_STATIC_PRECOMPILE
 	bool SaveStaticCache(vk::PipelineCache cache, const std::filesystem::path& path);
 	static bool MergeBinaryShards(GraphicContext& graphics, bool prune);
@@ -440,7 +450,27 @@ void MaterializationReaders(ShaderRecompiler::IR::SrtRuntime& runtime);
 // KYTY_PIPELINE_KEY_LOG (diagnostic): a PIPEKEY line with the driver key of each pipeline the static store did not
 // hold (the precompile: of each it makes) and its modules' shader and SPIR-V hashes.
 bool PipelineKeyLog();
-void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash);
+void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash, size_t spirv_bytes = 0);
+// The descriptor set and pipeline layouts the pipelines share (one pair per binding set, shaders.cpp): destroyed after
+// every pipeline that uses them.
+void DestroySharedLayouts(vk::Device device);
+// KYTY_PIPELINE_SOURCE_LOG (diagnostic): a PIPESRC line for each pipeline made (its kind, identity, whether the static
+// cache gave it, its build and time; from a cache blob: the blob's size and the microseconds of its read, of the cache
+// made of it and of the driver's creation) and a PIPESPV line (its SPIR-V size and the microseconds before its
+// identity, of the identity and of the handle), a PROGSRC line per program permutation made (adopted from the
+// prefetch or translated, its time): which of the precompile's pipelines a game session meets, and what they cost.
+bool PipelineSourceLog();
+// Each shader module's SPIR-V hash is noted when made (NotePipelineKeyModule) from now on: pipeline identities need them
+// (pipeline cache blobs, the source and key logs).
+void RecordModuleSpirvHashes();
+bool ModuleSpirvHashesRecorded();
+// A pipeline's identity: its modules' SPIR-V, its fixed-function state (as a recipe holds it), its stages' static input
+// keys and native bindings; the same for the same pipeline (the precompile's plan keys it so, the source log too).
+uint64_t GraphicsPipelineIdentity(uint64_t vertex_spirv, uint64_t pixel_spirv, const PipelineRenderingState& rendering,
+                                  const PipelineVertexInputState& vertex_input, const PipelineStaticParameters& state,
+                                  const ShaderVertexInputInfo& vs_input_info, const ShaderPixelInputInfo* ps_input_info,
+                                  bool native_bindings);
+uint64_t ComputePipelineIdentity(uint64_t spirv, const ShaderComputeInputInfo& input_info, bool native_bindings);
 
 } // namespace Libs::Graphics
 

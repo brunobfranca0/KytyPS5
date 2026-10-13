@@ -9,38 +9,76 @@ $languages = 'Japanese', 'English (United States)', 'French (France)', 'Spanish 
 	'Portuguese (Portugal)', 'Russian', 'Korean', 'Chinese (Traditional)', 'Chinese (Simplified)', 'Finnish', 'Swedish',
 	'Danish', 'Norwegian', 'Polish', 'Portuguese (Brazil)', 'English (United Kingdom)', 'Turkish', 'Spanish (Latin America)',
 	'Arabic', 'French (Canada)', 'Czech', 'Hungarian', 'Greek', 'Romanian', 'Thai', 'Vietnamese', 'Indonesian'
-$resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160', '2560x1080', '3440x1440', '3840x1600', '5120x2160'
+$resolutions = '1280x720', '1920x1080', '2560x1440', '3840x2160'
+# The height Demon's Souls renders its 3D at (run-windows.ps1 -RenderHeight); its output and UI stay 3840x2160.
+$renderHeights = '1440 (PS5)', '1296', '1152', '1080', '900'
 
-$settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true; fsr3 = $false }
+$settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false; aspect = $true; language = 1; redzone = $true;
+	ecores = $false; fps120 = $false; render = 1440 }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
 }
 if (!$settings.game -and (Test-Path "$root\game-path.txt")) { $settings.game = (Get-Content "$root\game-path.txt" -TotalCount 1).Trim() }
 
-# The play / precompile command lines, run by PowerShell itself: no cmd.exe (an overlay or monitoring program that
-# injects a DLL into every process can keep cmd.exe from starting, error 0xc0000142, while PowerShell starts fine).
-function Get-PlayArguments {
-	$size = $settings.resolution -split 'x'
-	$script = @("'$root\run-windows.ps1'", '-Prompt', '-Follow', '-Width', $size[0], '-Height', $size[1], '-Language', $settings.language)
-	if ($settings.fullscreen) { $script += '-Fullscreen'; if ($settings.aspect) { $script += '-AspectFit' } }
-	if (!$settings.redzone) { $script += '-NoRedZone' }
-	if ($settings.fsr3) { $script += '-Fsr3FrameGen' }
-	if ($settings.game) { $script += "-Game '$($settings.game.Replace("'", "''"))'" }
-	# The console stays for the live log; after a crash it waits for a key.
-	$command = '& ' + ($script -join ' ') + '; if ($LASTEXITCODE -ne 0) { Read-Host ''Press Enter to close'' | Out-Null }'
-	return @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command)
+# The efficiency cores (the lowest efficiency class of a hybrid CPU) as an affinity mask, or 0.
+function Get-EfficiencyMask {
+	Add-Type -Namespace KytyLauncher -Name CpuSets -MemberDefinition @'
+[DllImport("kernel32.dll")]
+static extern bool GetSystemCpuSetInformation(IntPtr information, uint length, out uint returned, IntPtr process, uint flags);
+// Group 0's logical processors as (index, efficiency class) pairs.
+public static int[] Query() {
+	var result = new System.Collections.Generic.List<int>();
+	uint length;
+	GetSystemCpuSetInformation(IntPtr.Zero, 0, out length, IntPtr.Zero, 0);
+	if (length == 0) return result.ToArray();
+	IntPtr buffer = Marshal.AllocHGlobal((int)length);
+	try {
+		if (!GetSystemCpuSetInformation(buffer, length, out length, IntPtr.Zero, 0)) return result.ToArray();
+		for (int offset = 0; offset < length; offset += Marshal.ReadInt32(buffer, offset)) {
+			if (Marshal.ReadInt32(buffer, offset + 4) != 0 || Marshal.ReadInt16(buffer, offset + 12) != 0) continue;
+			result.Add(Marshal.ReadByte(buffer, offset + 14));
+			result.Add(Marshal.ReadByte(buffer, offset + 18));
+		}
+	} finally {
+		Marshal.FreeHGlobal(buffer);
+	}
+	return result.ToArray();
 }
-function Get-PrecompileArguments {
-	$script = @("'$root\precompile-windows.ps1'")
-	if ($settings.game) { $script += "-Game '$($settings.game.Replace("'", "''"))'" }
-	$command = '& ' + ($script -join ' ') + '; Read-Host ''Press Enter to close'' | Out-Null'
-	return @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command)
+'@
+	$values = [KytyLauncher.CpuSets]::Query()
+	$sets = for ($i = 0; $i + 1 -lt $values.Count; $i += 2) { [pscustomobject]@{ Cpu = $values[$i]; Class = $values[$i + 1] } }
+	if (@($sets | ForEach-Object Class | Sort-Object -Unique).Count -lt 2) { return [int64]0 }
+	$slowest = ($sets | Measure-Object Class -Minimum).Minimum
+	$mask = [int64]0
+	foreach ($set in $sets | Where-Object { $_.Class -eq $slowest -and $_.Cpu -lt 63 }) { $mask = $mask -bor ([int64]1 -shl $set.Cpu) }
+	return $mask
+}
+$efficiencyMask = Get-EfficiencyMask
+
+function Get-PlayCommand {
+	$size = $settings.resolution -split 'x'
+	$arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$root\run-windows.ps1`"", '-Prompt', '-Follow',
+		'-Width', $size[0], '-Height', $size[1], '-Language', $settings.language)
+	if ($settings.fullscreen) { $arguments += '-Fullscreen'; if ($settings.aspect) { $arguments += '-AspectFit' } }
+	if (!$settings.redzone) { $arguments += '-NoRedZone' }
+	if ($settings.fps120) { $arguments += '-Fps120' }
+	if ([int]$settings.render -gt 0 -and [int]$settings.render -ne 1440) { $arguments += @('-RenderHeight', [int]$settings.render) }
+	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
+	# The console stays for the live log; after a crash it waits for a key.
+	return 'powershell ' + ($arguments -join ' ') + ' & if !errorlevel! neq 0 pause'
+}
+function Get-PrecompileCommand {
+	$arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$root\precompile-windows.ps1`"")
+	if ($settings.ecores -and $efficiencyMask -ne 0) { $arguments += @('-Affinity', $efficiencyMask) }
+	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
+	return 'powershell ' + ($arguments -join ' ') + ' & pause'
 }
 function Save-Settings { $settings | ConvertTo-Json | Set-Content $settingsPath -Encoding UTF8 }
 if ($DryRun) {
-	"play:       powershell " + ((Get-PlayArguments) -join ' ')
-	"precompile: powershell " + ((Get-PrecompileArguments) -join ' ')
+	"play:       cmd /v:on /s /c `"$(Get-PlayCommand)`""
+	"precompile: cmd /s /c `"$(Get-PrecompileCommand)`""
+	"efficiency cores: 0x{0:X}" -f $efficiencyMask
 	return
 }
 
@@ -113,7 +151,7 @@ $resolution = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyl
 $resolution.Items.AddRange($resolutions)
 $resolution.SelectedItem = if ($resolutions -contains $settings.resolution) { $settings.resolution } else { '2560x1440' }
 Add-Row 'Resolution' @($resolution)
-$fullscreen = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Borderless fullscreen (unchecked: window)'; AutoSize = $true; Checked = [bool]$settings.fullscreen }
+$fullscreen = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Fullscreen'; AutoSize = $true; Checked = [bool]$settings.fullscreen }
 $aspect = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Keep 16:9 (black bars)'; AutoSize = $true; Checked = [bool]$settings.aspect }
 $aspect.Enabled = $fullscreen.Checked
 $fullscreen.Add_CheckedChanged({ $aspect.Enabled = $fullscreen.Checked })
@@ -124,8 +162,18 @@ $language.SelectedIndex = [Math]::Max(0, [Math]::Min($languages.Count - 1, [int]
 Add-Row 'Console language' @($language)
 $redzone = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Red-zone protection (recommended)'; AutoSize = $true; Checked = [bool]$settings.redzone }
 Add-Row '' @($redzone)
-$fsr3 = New-Object System.Windows.Forms.CheckBox -Property @{ Text = "Generaci$([char]0xF3)n de frames FSR 3 (x2)"; AutoSize = $true; Checked = [bool]$settings.fsr3 }
-Add-Row '' @($fsr3)
+$fps120 = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Up to 120 fps (the game''s own frames; movies play faster)'; AutoSize = $true; Checked = [bool]$settings.fps120 }
+Add-Row '' @($fps120)
+$render = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 120 }
+$render.Items.AddRange($renderHeights)
+$render.SelectedItem = ($renderHeights | Where-Object { ($_ -split ' ')[0] -eq [string][int]$settings.render } | Select-Object -First 1)
+if ($render.SelectedIndex -lt 0) { $render.SelectedIndex = 0 }
+$renderNote = New-Object System.Windows.Forms.Label -Property @{ Text = 'Demon''s Souls 3D; lower = faster, less sharp'; AutoSize = $true; ForeColor = 'Gray'; Margin = '6,6,0,0' }
+Add-Row 'Render height' @($render, $renderNote)
+$ecores = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Precompile on the efficiency cores only (slower, the PC stays responsive)'; AutoSize = $true
+	Checked = ([bool]$settings.ecores -and $efficiencyMask -ne 0); Enabled = ($efficiencyMask -ne 0) }
+Add-Row '' @($ecores)
+
 $buttons = New-Object System.Windows.Forms.FlowLayoutPanel -Property @{ AutoSize = $true; Margin = '0,10,0,0' }
 $play = New-Object System.Windows.Forms.Button -Property @{ Text = 'Play'; AutoSize = $true; Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold) }
 $precompile = New-Object System.Windows.Forms.Button -Property @{ Text = 'Precompile shaders'; AutoSize = $true }
@@ -147,17 +195,19 @@ function Read-Form {
 	$settings.aspect     = $aspect.Checked
 	$settings.language   = $language.SelectedIndex
 	$settings.redzone    = $redzone.Checked
-	$settings.fsr3       = $fsr3.Checked
+	$settings.fps120     = $fps120.Checked
+	$settings.render     = [int](([string]$render.SelectedItem -split ' ')[0])
+	$settings.ecores     = $ecores.Checked
 	Save-Settings
 }
 $play.Add_Click({
 	Read-Form
-	Start-Process powershell -ArgumentList (Get-PlayArguments) -WorkingDirectory $root
+	Start-Process cmd -ArgumentList "/v:on /s /c `"$(Get-PlayCommand)`"" -WorkingDirectory $root
 	$form.Close()
 })
 $precompile.Add_Click({
 	Read-Form
-	Start-Process powershell -ArgumentList (Get-PrecompileArguments) -WorkingDirectory $root
+	Start-Process cmd -ArgumentList "/s /c `"$(Get-PrecompileCommand)`"" -WorkingDirectory $root
 })
 $logs.Add_Click({
 	$folder = if (Test-Path "$root\_Build") { "$root\_Build\run-logs" } else { "$root\logs" }

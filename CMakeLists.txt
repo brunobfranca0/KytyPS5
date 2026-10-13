@@ -394,7 +394,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak libzstd_static)
 
 # Linux system libraries required by the static FFmpeg archive.
 if(LINUX)
@@ -444,6 +444,11 @@ function(add_kyty_full_emulator_test target source)
 	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
+	# These targets share the emulator's sources: give them its linker too, or ThinLTO objects
+	# fail to resolve on a stock toolchain (GNU ld has no ThinLTO without the LLVM plugin).
+	if(KYTY_LD_OPTIONS)
+		target_link_options(${target} PRIVATE ${KYTY_LD_OPTIONS})
+	endif()
 	if (WIN32)
 		target_link_libraries(${target} iphlpapi)
 	endif()
@@ -783,6 +788,25 @@ endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
+
+if(LINUX)
+	set_property(SOURCE
+		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/graphicsRun.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/speculation.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandScheduler.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/tiler.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/shader/shader.cpp"
+		"${KYTY_SOURCE_DIR}/loader/redZonePatcher.cpp"
+		"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
+		"${KYTY_SOURCE_DIR}/local/static-seeds.cpp"
+		"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
+		"${KYTY_SOURCE_DIR}/libs/libKernel.cpp"
+		"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
+		APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+endif()
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)

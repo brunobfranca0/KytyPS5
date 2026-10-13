@@ -133,6 +133,59 @@ static void PortableIndirectTables(const ShaderRecompiler::IR::Program&         
 	specialization.images = std::move(images);
 }
 
+// The run's plan (PrecompileOptions::plan): each pipeline key of its seed files with the work item that makes it first,
+// the seed file's name hash and the work item's index (a compute seed's, or the seeds' count + a graphics recipe's).
+// Dry runs fill it, seed file by seed file (a key an earlier seed file has stays that one's); a shard creates only the
+// pipelines whose first work item is one of its own, whatever the number of shards.
+struct PrecompilePlan {
+	struct Owner {
+		uint64_t file = 0;
+		uint32_t n    = 0;
+	};
+	std::unordered_map<uint64_t, Owner> owners;
+
+	static constexpr std::string_view Magic = "KytyPrecompilePlan1\n";
+	static constexpr size_t           Entry = 2 * sizeof(uint64_t) + sizeof(uint32_t);
+
+	// (A missing file is an empty plan.)
+	bool Load(const std::filesystem::path& path) {
+		std::ifstream file(path, std::ios::binary);
+		if (!file) return false;
+		std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+		if (!bytes.starts_with(Magic) || (bytes.size() - Magic.size()) % Entry != 0) return false;
+		owners.reserve((bytes.size() - Magic.size()) / Entry);
+		for (size_t at = Magic.size(); at < bytes.size(); at += Entry) {
+			uint64_t key = 0;
+			Owner    owner;
+			std::memcpy(&key, bytes.data() + at, sizeof(key));
+			std::memcpy(&owner.file, bytes.data() + at + 8, sizeof(owner.file));
+			std::memcpy(&owner.n, bytes.data() + at + 16, sizeof(owner.n));
+			owners[key] = owner;
+		}
+		return true;
+	}
+
+	bool Save(const std::filesystem::path& path) const {
+		std::string bytes(Magic);
+		bytes.reserve(Magic.size() + owners.size() * Entry);
+		for (const auto& [key, owner]: owners) {
+			bytes.append(reinterpret_cast<const char*>(&key), sizeof(key));
+			bytes.append(reinterpret_cast<const char*>(&owner.file), sizeof(owner.file));
+			bytes.append(reinterpret_cast<const char*>(&owner.n), sizeof(owner.n));
+		}
+		auto temporary = path;
+		temporary += ".tmp";
+		{
+			std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+			file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+			if (!file) return false;
+		}
+		std::error_code error;
+		std::filesystem::rename(temporary, path, error);
+		return !error;
+	}
+};
+
 // A seed file's compiler inputs (tools/local/static-precompile: derived from the game files, their
 // resource specialization left open), each translated and specialized (SeedSpecializations) with
 // portable formats, the module the game gets when it meets the program (ProgramCache::Get); a pixel
@@ -163,6 +216,15 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		return true;
 	};
 	const auto stage_of = [&](size_t index) { return ShaderType(seed_words[index][0]); };
+	// A seed file whose records carry no specialization (--make-seeds: the game files' shaders, their specializations
+	// guessed below), not a recording's or the hints' (each record the specialization the game used).
+	bool guesses = true;
+	for (size_t i = 0; i < seed_words.size() && guesses; i++) {
+		LocalShaderWarmup::Record record;
+		if (decode(static_cast<uint32_t>(i), record) &&
+		    (!record.specialization.buffers.empty() || !record.specialization.images.empty()))
+			guesses = false;
+	}
 	// Graphics recipes; every compute seed gets its pipelines anyway.
 	std::vector<LocalShaderWarmup::PipelineRecord> recipes;
 	for (const auto& words: recipe_words) {
@@ -502,23 +564,41 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	// are not kept. The static cache is looked up first (CreatePipelineInternal): a rerun compiles
 	// only what it misses. With pipeline binaries every pipeline's binaries go to a shard file
 	// (.shard<i>of<n>-<seeds>, merged by --merge --prune), copied from the store when it holds them, else captured
-	// (from the static cache, else compiled through a cache of the shard's own).
-	const bool                            binaries = create_pipelines && m_graphics.pipeline_binaries_enabled;
-	std::unique_ptr<PipelineBinaryWriter> writer;
+	// (from the static cache, else compiled through a cache of the shard's own). Without them, each pipeline's own
+	// pipeline cache data goes to the shard file (pipelineCacheBlobs.h), copied from the store's blobs or made.
+	const bool binaries = create_pipelines && m_graphics.pipeline_binaries_enabled;
+	const bool blobs    = create_pipelines && !binaries && StaticBlobsMode(m_graphics);
+	std::unique_ptr<PipelineBinaryWriter>    writer;
+	std::unique_ptr<PipelineCacheBlobWriter> blob_writer;
 	if (binaries) {
 		writer                            = std::make_unique<PipelineBinaryWriter>(m_graphics.device);
 		m_graphics.pipeline_binary_writer = writer.get();
 	}
-	vk::PipelineCache target = binaries ? nullptr : m_static_cache;
-	if (create_pipelines && (shards > 1 || binaries)) {
+	if (blobs) {
+		blob_writer                     = std::make_unique<PipelineCacheBlobWriter>();
+		m_graphics.pipeline_blob_writer = blob_writer.get();
+	}
+	vk::PipelineCache target = binaries || blobs ? nullptr : m_static_cache;
+	if (create_pipelines && !blobs && (shards > 1 || binaries)) {
 		vk::PipelineCacheCreateInfo info {};
 		if (m_graphics.device.createPipelineCache(&info, nullptr, &target) != vk::Result::eSuccess) target = nullptr;
 	}
-	auto target_file = binaries ? StaticBinariesPath() : StaticCachePath();
+	auto target_file = binaries ? StaticBinariesPath() : blobs ? StaticBlobsPath() : StaticCachePath();
 	// Named after the seed file too: a run shards several (precompile-windows.ps1: seeds and recorded).
-	if (shards > 1 || binaries)
+	if (shards > 1 || binaries || blobs)
 		target_file += fmt::format(".shard{}of{}-{}", shard, shards, Common::PathToString(args.seeds.stem()));
 	const auto save = [&] {
+		if (blobs) {
+			auto temporary = target_file;
+			temporary += ".tmp";
+			std::error_code error;
+			if (!blob_writer->Save(temporary, StaticBlobsSignature(m_graphics.GetPhysicalDeviceProperties()))) return false;
+			std::filesystem::rename(temporary, target_file, error);
+			PipelineCacheLog("Static pipeline blobs: saved {} pipelines ({} made, {} from the store, {} left out) to {}",
+			                 blob_writer->Pipelines(), blob_writer->Made(), blob_writer->Copied(), blob_writer->LeftOut(),
+			                 Common::PathToString(target_file));
+			return !error;
+		}
 		if (!binaries) return SaveStaticCache(target, target_file);
 		auto temporary = target_file;
 		temporary += ".tmp";
@@ -533,33 +613,61 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	};
 	const auto          driver_cache = target != nullptr ? target : m_driver_cache;
 	std::atomic<size_t> created {0};
-	// args.timings: a line per pipeline (compile ms, SPIR-V words, the seeds' hashes).
+	// args.timings: a line per pipeline (compile ms, SPIR-V words, the seeds' hashes, the kind of its modules, its key:
+	// the same for the same pipeline, and the work item n: a compute seed's index, or the seeds' count + a recipe's).
 	std::mutex               timings_mutex;
 	std::vector<std::string> timings;
 	const auto created_one = [&](std::chrono::steady_clock::time_point start, size_t words, uint64_t hash,
-	                             uint64_t pixel_hash) {
+	                             uint64_t pixel_hash, const char* kind, uint64_t key, size_t n) {
 		if (const auto done = created.fetch_add(1, std::memory_order_relaxed) + 1; done % 1000 == 0)
 			PipelineCacheLog("Shader seeds: created {} pipelines, {} ms", done, elapsed());
 		if (args.timings.empty()) return;
 		const auto      ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 		std::lock_guard lock(timings_mutex);
-		timings.push_back(fmt::format("{:.1f} {} {:016x} {:016x}", ms, words, hash, pixel_hash));
+		timings.push_back(fmt::format("{:.1f} {} {:016x} {:016x} {} {:016x} {}", ms, words, hash, pixel_hash, kind, key, n));
+	};
+	// The plan: a dry run adds this seed file's keys (each with its first work item), a shard creates a pipeline only at
+	// the work item the plan names (a key it does not have: wherever met), and each once.
+	PrecompilePlan     plan;
+	const bool         planned   = !args.plan.empty() && plan.Load(args.plan);
+	const auto         seed_name = Common::PathToString(args.seeds.filename());
+	const uint64_t     seed_file = XXH3_64bits(seed_name.data(), seed_name.size());
+	const size_t       planned_keys = plan.owners.size();
+	std::mutex         plan_mutex;
+	std::unordered_set<uint64_t> made_keys;
+	std::atomic<size_t>          left_to_others {0};
+	const auto make_here = [&](uint64_t key, size_t n) {
+		if (args.dry_run) {
+			if (args.plan.empty()) return false;
+			std::lock_guard lock(plan_mutex);
+			const auto [owner, added] = plan.owners.try_emplace(key, PrecompilePlan::Owner {seed_file, static_cast<uint32_t>(n)});
+			if (!added && owner->second.file == seed_file && n < owner->second.n) owner->second.n = static_cast<uint32_t>(n);
+			return false;
+		}
+		if (planned) {
+			const auto owner = plan.owners.find(key); // (not changed while shards run)
+			if (owner != plan.owners.end() && (owner->second.file != seed_file || owner->second.n != n)) {
+				left_to_others.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+		}
+		std::lock_guard lock(plan_mutex);
+		if (made_keys.insert(key).second) return true;
+		left_to_others.fetch_add(1, std::memory_order_relaxed);
+		return false;
 	};
 	const auto words_of = [&](const Permutation* permutation) {
 		return permutation != nullptr ? spirv_of.find(permutation)->second.words : size_t {0};
 	};
 	const auto spirv_hash = [&](const Permutation* permutation) { return spirv_of.find(permutation)->second.hash; };
-	const auto destroy = [&](Pipeline& pipeline) {
-		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
-		m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
-		m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
-	};
+	// (Its layouts are shared with other pipelines of the same bindings: the pipeline cache destroys them.)
+	const auto destroy = [&](Pipeline& pipeline) { m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr); };
 	// Saved every ten minutes too: an interrupted precompile loses at most that.
 	std::mutex              checkpoint_mutex;
 	std::condition_variable checkpoint_wake;
 	bool                    pipelines_done = false;
 	std::jthread            checkpoints;
-	if (create_pipelines && (target != nullptr || binaries)) {
+	if (create_pipelines && !args.dry_run && (target != nullptr || binaries || blobs)) {
 		checkpoints = std::jthread([&] {
 			std::unique_lock lock(checkpoint_mutex);
 			while (!checkpoint_wake.wait_for(lock, std::chrono::minutes(10), [&] { return pipelines_done; })) {
@@ -572,33 +680,41 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	}
 	if (create_pipelines) {
 		parallel(seed_words.size() + recipes.size(), [&](size_t n) {
-			// Once binaries are left out, the rest would be too: for a smaller shard.
-			if (!mine(n) || (writer != nullptr && writer->LeftOut() != 0)) return;
+			// Once binaries (or blobs) are left out, the rest would be too: for a smaller shard.
+			if (!mine(n) || (writer != nullptr && writer->LeftOut() != 0) ||
+			    (blob_writer != nullptr && blob_writer->LeftOut() != 0))
+				return;
 			if (n < seed_words.size()) {
 				if (stage_of(n) != ShaderType::Compute) return;
 				LocalShaderWarmup::Record input;
 				if (!decode(static_cast<uint32_t>(n), input)) return;
 				// (`native`: a table mode program's pipeline, TryCreateComputePipeline's.)
-				const auto create = [&](const Permutation& permutation, bool native) {
+				const auto create = [&](const Permutation& permutation, bool native, const char* kind) {
 					input.compute.stage.program = &permutation.program;
-					Pipeline   pipeline;
+					const auto key              = ComputePipelineIdentity(spirv_hash(&permutation), input.compute, native);
+					const bool here             = make_here(key, n);
+					if (!here && !args.dry_run) return;
 					const auto start = std::chrono::steady_clock::now();
-					CreatePipelineInternal(m_graphics, pipeline, input.compute, permutation.handle.module, driver_cache,
-					                       PipelineBuild::Full, native);
-					destroy(pipeline);
-					created_one(start, words_of(&permutation), input.hash, 0);
+					if (here) {
+						Pipeline pipeline;
+						CreatePipelineInternal(m_graphics, pipeline, input.compute, permutation.handle.module, driver_cache,
+						                       PipelineBuild::Full, native);
+						destroy(pipeline);
+					}
+					created_one(start, words_of(&permutation), input.hash, 0, kind, key, n);
 				};
-				for (const auto& permutation: first[n]) create(*permutation, false);
+				for (const auto& permutation: first[n]) create(*permutation, false, "cs-first");
 				if (exact[n] && std::ranges::none_of(first[n], [&](const auto& permutation) {
 					    return spirv_hash(permutation.get()) == spirv_hash(exact[n].get());
 				    }))
-					create(*exact[n], false);
+					create(*exact[n], false, "cs-exact");
 				if (table_first[n]) {
 					std::unordered_set<uint64_t> made {spirv_hash(table_first[n].get())};
-					create(*table_first[n], true);
+					create(*table_first[n], true, "cs-table");
 					for (auto found = table_more.lower_bound({static_cast<uint32_t>(n), 0});
 					     found != table_more.end() && found->first.first == n; ++found)
-						if (found->second && made.insert(spirv_hash(found->second.get())).second) create(*found->second, true);
+						if (found->second && made.insert(spirv_hash(found->second.get())).second)
+							create(*found->second, true, "cs-table-portable");
 				}
 				return;
 			}
@@ -619,25 +735,42 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 				       });
 			};
 			const bool unbuffered = recipe.vertex_input.binding_count == 0 && vs.stage == ShaderType::Vertex;
-			const auto create     = [&](const Permutation& vertex_permutation, const Permutation* pixel, bool native) {
+			const auto create     = [&](const Permutation& vertex_permutation, const Permutation* pixel, bool native,
+			                            const char* kind) {
 				vs.vertex.stage.program = &vertex_permutation.program;
 				if (pixel) ps.pixel.stage.program = &pixel->program;
-				Pipeline   pipeline;
+				const auto key  = GraphicsPipelineIdentity(spirv_hash(&vertex_permutation), pixel ? spirv_hash(pixel) : 0,
+				                                           recipe.rendering, recipe.vertex_input, recipe.state, vs.vertex,
+				                                           pixel ? &ps.pixel : nullptr, native);
+				const bool here = make_here(key, n);
+				if (!here && !args.dry_run) return;
 				const auto start = std::chrono::steady_clock::now();
-				CreatePipelineInternal(m_graphics, pipeline, recipe.rendering, recipe.vertex_input, vs.vertex,
-				                       vertex_permutation.handle, pixel ? &ps.pixel : nullptr,
-				                       pixel ? pixel->handle : ShaderProgram {}, recipe.state, driver_cache, native);
-				destroy(pipeline);
-				created_one(start, words_of(&vertex_permutation) + words_of(pixel), vs.hash, pixel != nullptr ? ps.hash : 0);
+				if (here) {
+					Pipeline pipeline;
+					CreatePipelineInternal(m_graphics, pipeline, recipe.rendering, recipe.vertex_input, vs.vertex,
+					                       vertex_permutation.handle, pixel ? &ps.pixel : nullptr,
+					                       pixel ? pixel->handle : ShaderProgram {}, recipe.state, driver_cache, native);
+					destroy(pipeline);
+				}
+				created_one(start, words_of(&vertex_permutation) + words_of(pixel), vs.hash, pixel != nullptr ? ps.hash : 0,
+				            kind, key, n);
 			};
-			const auto create_with_native = [&](const Permutation& vertex_permutation, const Permutation* pixel) {
-				create(vertex_permutation, pixel, false);
-				if (unbuffered && readonly(&vertex_permutation) && readonly(pixel)) create(vertex_permutation, pixel, true);
+			const auto create_with_native = [&](const Permutation& vertex_permutation, const Permutation* pixel,
+			                                    const char* kind, const char* native_kind, bool native) {
+				create(vertex_permutation, pixel, false, kind);
+				if (native && unbuffered && readonly(&vertex_permutation) && readonly(pixel))
+					create(vertex_permutation, pixel, true, native_kind);
 			};
+			// A native XPR record takes the modules its draw has (NativeXprStore): a guessed specialization's only where the
+			// guess was right (seldom: a 1-1 session met none of these variants, every native pipeline it made had a
+			// recorded specialization's modules). One the store lacks is built in the background, its draws taking the
+			// normal path meanwhile (TryCreateGraphicsPipeline), so a guess file leaves them out (a third of its time).
+			const bool native_first = !guesses || args.native_guesses;
 			for (const auto& [pixel, cursor]: pixel_variants(recipe)) {
 				const auto found = vertex.find({recipe.vertex, cursor});
 				if (found == vertex.end()) continue;
-				for (const auto& vertex_permutation: found->second) create_with_native(*vertex_permutation, pixel);
+				for (const auto& vertex_permutation: found->second)
+					create_with_native(*vertex_permutation, pixel, "gfx-first", "gfx-first-native", native_first);
 			}
 			// The recording's replay (ProgramCache::Warm, WarmPipelines): its exact modules, unless they are the
 			// portable ones.
@@ -654,7 +787,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 					for (const auto& vertex_permutation: found->second)
 						portable |= same_as(exact[recipe.vertex].get(), vertex_permutation.get());
 				}
-				if (!portable) create_with_native(*exact[recipe.vertex], pixel);
+				if (!portable) create_with_native(*exact[recipe.vertex], pixel, "gfx-exact", "gfx-exact-native", true);
 			}
 			// Table mode (TableStore): a draw without vertex buffers, its table programs with native bindings: those of each
 			// specialization of its two programs (the pairs of their SPIR-V once).
@@ -670,7 +803,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 							if (found == table_vertex.end() || !found->second ||
 							    !made.insert({spirv_hash(found->second.get()), pixel_hash}).second)
 								continue;
-							create(*found->second, pixel, true);
+							create(*found->second, pixel, true, "gfx-table");
 						}
 					}
 				}
@@ -685,9 +818,18 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	checkpoint_wake.notify_all();
 	if (checkpoints.joinable()) checkpoints.join();
 
-	const bool saved_pipelines = !create_pipelines || ((target != nullptr || binaries) && save());
-	left_out                          = writer != nullptr ? writer->LeftOut() : 0;
+	const bool saved_pipelines =
+	    !create_pipelines || args.dry_run || ((target != nullptr || binaries || blobs) && save());
+	if (args.dry_run && !args.plan.empty()) {
+		const bool written = plan.Save(args.plan);
+		PipelineCacheLog("Shader seeds: plan {} {} ({} pipelines, {} of them this seed file's)",
+		                 written ? "saved to" : "could not be saved to", Common::PathToString(args.plan), plan.owners.size(),
+		                 plan.owners.size() - planned_keys);
+		if (!written) return false;
+	}
+	left_out = (writer != nullptr ? writer->LeftOut() : 0) + (blob_writer != nullptr ? blob_writer->LeftOut() : 0);
 	m_graphics.pipeline_binary_writer = nullptr;
+	m_graphics.pipeline_blob_writer   = nullptr;
 	if (!args.timings.empty()) {
 		auto path = args.timings;
 		if (shards > 1) path += fmt::format(".shard{}", shard);
@@ -700,9 +842,10 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	size_t spirv_words = 0;
 	for (const auto& [permutation, spirv]: spirv_of) spirv_words += spirv.words;
 	PipelineCacheLog("Shader seeds: {} programs ({} with indirect image tables, {} MiB of SPIR-V) in {} ms; {} pipelines "
-	                 "in {} ms ({} threads)",
+	                 "in {} ms ({} threads; {} made by another work item{}{})",
 	                 compiled, indirect.load(), spirv_words >> 18u, programs_ms, created.load(), elapsed() - programs_ms,
-	                 threads);
+	                 threads, left_to_others.load(), planned ? ", planned" : "",
+	                 guesses && !args.native_guesses ? "; guessed specializations: no native variants" : "");
 	for (const auto& [message, count]: rejections) PipelineCacheLog("Shader seeds: rejected {}: {}", count, message);
 
 	// What was compiled, as a warmup file (compiler inputs with the specialization used), with the SPIR-V
@@ -828,16 +971,21 @@ bool PipelineCache::Precompile(GraphicContext& graphics, const PrecompileOptions
 
 // Both files are saved whole (a temporary file renamed), so their first line tells the GPU and driver.
 bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics, const std::filesystem::path& seeds) {
+	const bool blobs = StaticBlobsMode(graphics);
 	if (!seeds.empty()) {
 		std::error_code error;
 		const auto      written = std::filesystem::last_write_time(
-		    graphics.pipeline_binaries_enabled ? StaticBinariesPath() : StaticCachePath(), error);
+		    graphics.pipeline_binaries_enabled ? StaticBinariesPath() : blobs ? StaticBlobsPath() : StaticCachePath(), error);
 		if (error) return false;
 		const auto seeded = std::filesystem::last_write_time(seeds, error);
 		if (error || written < seeded) return false;
 	}
 	if (graphics.pipeline_binaries_enabled) {
 		return PipelineBinaries::Open(graphics.device, StaticBinariesPath(), StaticBinariesSignature(graphics)) != nullptr;
+	}
+	if (blobs) {
+		return PipelineCacheBlobs::Open(StaticBlobsPath(), StaticBlobsSignature(graphics.GetPhysicalDeviceProperties())) !=
+		       nullptr;
 	}
 	const auto    signature = StaticCacheSignature(graphics.GetPhysicalDeviceProperties());
 	std::ifstream file(StaticCachePath(), std::ios::binary);
@@ -898,9 +1046,52 @@ bool PipelineCache::MergeBinaryShards(GraphicContext& graphics, bool prune) {
 	return merged;
 }
 
+// The blobs and their shards' files (or only the shards': prune) into new blobs; the shard files are removed once
+// merged. Their data is copied from the files when the new one is written.
+static bool MergeBlobShards(GraphicContext& graphics, bool prune) {
+	const auto                                       path      = StaticBlobsPath();
+	const auto                                       signature = StaticBlobsSignature(graphics.GetPhysicalDeviceProperties());
+	PipelineCacheBlobWriter                          writer;
+	std::vector<std::unique_ptr<PipelineCacheBlobs>> sources;
+	std::vector<std::filesystem::path>               files;
+	if (!prune) {
+		if (auto store = PipelineCacheBlobs::Open(path, signature)) {
+			writer.CopyAll(*store);
+			sources.push_back(std::move(store));
+		}
+	}
+	std::error_code error;
+	for (const auto& entry: std::filesystem::directory_iterator(path.parent_path(), error)) {
+		const auto name = entry.path().filename().string();
+		if (!name.starts_with(path.filename().string() + ".shard") || name.ends_with(".tmp")) continue;
+		if (auto shard = PipelineCacheBlobs::Open(entry.path(), signature)) {
+			writer.CopyAll(*shard);
+			sources.push_back(std::move(shard));
+			files.push_back(entry.path());
+		}
+	}
+	if (files.empty()) {
+		PipelineCacheLog("Static pipeline blobs: no shards to merge");
+		return true;
+	}
+	auto temporary = path;
+	temporary += ".tmp";
+	const bool saved = writer.Save(temporary, signature);
+	sources.clear(); // closes the files: the blobs may be replaced
+	if (saved) std::filesystem::rename(temporary, path, error);
+	const bool merged = saved && !error;
+	if (merged) {
+		for (const auto& file: files) std::filesystem::remove(file, error);
+	}
+	PipelineCacheLog("Static pipeline blobs: merged {} shards{}, {} pipelines{}", files.size(), prune ? " (pruned)" : "",
+	                 writer.Pipelines(), merged ? "" : ": FAILED");
+	return merged;
+}
+
 // The shard files are removed once merged.
 bool PipelineCache::MergePrecompileShards(GraphicContext& graphics, bool prune) {
 	if (graphics.pipeline_binaries_enabled) return MergeBinaryShards(graphics, prune);
+	if (StaticBlobsMode(graphics)) return MergeBlobShards(graphics, prune);
 	PipelineCache cache(graphics);
 	if (cache.m_static_cache == nullptr) cache.InitializeStaticCache(true);
 	if (cache.m_static_cache == nullptr) return false;

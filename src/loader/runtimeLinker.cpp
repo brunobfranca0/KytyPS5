@@ -19,6 +19,7 @@
 #include "loader/demonsSoulsIdle.h"
 #include "loader/demonsSoulsCopy.h"
 #include "loader/demonsSoulsGpuPages.h"
+#include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsSceneGuard.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
@@ -825,9 +826,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	}
 
 	// The game's debug break after a failed assertion (an audio plugin's assert(0) ended 4 of ~420 runs):
-	// no debugger, so the guest goes on.
+	// no debugger, so the guest goes on.  TrySkipDebugBreak gates on the instruction bytes themselves
+	// (guest "cd 41"), so no vaddr signature can let a real null access through here.
+	//   * Windows/macOS raised the assert with the wildcard address SIZE_MAX.
+	//   * On x86-64 Linux a ring-3 "int 0x41" is a #GP with no faulting address: the kernel reports
+	//     si_addr == 0 (and the #GP error code's IDT bit reads back as "write"), which otherwise
+	//     shows up in the report as a fake "write to address 0".
 	if (info->type == Common::HostException::ExceptionType::AccessViolation &&
-	    info->access_violation_vaddr == UINT64_MAX && g_faulting_linker != nullptr &&
+	    (info->access_violation_vaddr == UINT64_MAX || info->access_violation_vaddr == 0) &&
+	    g_faulting_linker != nullptr &&
 	    g_faulting_linker->FindProgramByAddr(info->exception_address) != nullptr &&
 	    Loader::X64InstructionEmulator::TrySkipDebugBreak(info->native_context)) {
 		static std::atomic<uint32_t> reported {0};
@@ -1612,6 +1619,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
 	for (auto* program : m_programs) DemonsSoulsCopy::Install(program);
 	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsRenderSize::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsSceneGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	StartAllModules();
 

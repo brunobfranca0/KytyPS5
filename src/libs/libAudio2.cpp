@@ -11,11 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cstdio>
 #include <cstring>
-#include <cstdlib>
-#include <map>
-#include <string>
 #include <vector>
 
 namespace Libs::Audio {
@@ -195,9 +191,6 @@ struct AudioOut2PortStateEntry {
 	const void*            pcm_data      = nullptr;
 	float                  gain          = 1.0f; // a mono (object) port's gain attribute
 	uint32_t               ambisonics    = 0;    // an object port's attribute 8: 0x40 | ACN when it carries one
-	// KYTY_AUDIO_STATS: the pushes that carried this port's PCM in the period, and its peak.
-	uint32_t               stat_pushes   = 0;
-	float                  stat_peak     = 0.0f;
 };
 
 struct AudioOut2SpeakerArrayState {
@@ -305,15 +298,7 @@ static int audioout2_port_type_to_audio_out_type(uint16_t port_type) {
 		case 3: return AUDIO_OUT_PORT_TYPE_PADSPK;
 		case 4: return AUDIO_OUT_PORT_TYPE_PERSONAL;
 		case 5: return AUDIO_OUT_PORT_TYPE_AUX;
-		case 6: {
-			// KYTY_AUDIO2_PORT6_MAIN=1 (experiment): type 6 plays on the speakers instead of the vibration device (it
-			// carried the loud signal while the Maiden in Black spoke and the rest was silent, log 20261012-213558).
-			static const bool to_main = [] {
-				const char* value = std::getenv("KYTY_AUDIO2_PORT6_MAIN");
-				return value != nullptr && *value == '1';
-			}();
-			return to_main ? AUDIO_OUT_PORT_TYPE_MAIN : AUDIO_OUT_PORT_TYPE_VIBRATION;
-		}
+		case 6: return AUDIO_OUT_PORT_TYPE_VIBRATION;
 		default: return AUDIO_OUT_PORT_TYPE_MAIN;
 	}
 }
@@ -372,143 +357,22 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 	return false;
 }
 
-// KYTY_AUDIO_STATS: what the game hands AudioOut2, every 5 s per context: its pushes, each speaker port (type,
-// format, peak) and its object ports grouped by what the mix below does with them (mixed, or dropped and why), with
-// the ambisonics attribute values of the sounding ones; the port attributes set and the speaker-array queries.
-struct AudioOut2ContextStats {
-	AudioOut2ContextHandle ctx        = 0;
-	uint32_t               pushes     = 0;
-	bool                   float_main = false;
-};
-static std::array<AudioOut2ContextStats, 16>       g_audioout2_ctx_stats;  // (g_audioout2_port_mutex)
-static std::array<std::atomic<uint32_t>, 33>       g_audioout2_attr_counts; // attribute id (32: larger ids)
-static std::atomic<uint32_t>                       g_audioout2_speaker_coeff_calls {0};
-static std::atomic<uint32_t>                       g_audioout2_ambi_coeff_calls {0};
-static std::atomic<uint32_t>                       g_audioout2_speaker_info_calls {0};
-
-static AudioOut2ContextStats* audioout2_ctx_stats_locked(AudioOut2ContextHandle ctx) {
-	AudioOut2ContextStats* free_entry = nullptr;
-	for (auto& entry: g_audioout2_ctx_stats) {
-		if (entry.ctx == ctx) return &entry;
-		if (entry.ctx == 0 && free_entry == nullptr) free_entry = &entry;
-	}
-	if (free_entry != nullptr) free_entry->ctx = ctx;
-	return free_entry;
-}
-
-static float audioout2_port_peak(const AudioOut2PortStateEntry& port) {
-	const auto channels = audioout2_data_format_channels(port.data_format);
-	const auto count    = static_cast<size_t>(port.samples_num) * channels;
-	switch (port.audio_format) {
-		case AudioInternal::Format::FloatMono:
-		case AudioInternal::Format::FloatStereo:
-		case AudioInternal::Format::Float8Ch:
-		case AudioInternal::Format::Float8ChStd:
-		case AudioInternal::Format::Float12Ch: return AudioInternal::PcmPeak(port.pcm_data, count, 2, 3);
-		case AudioInternal::Format::Unknown: return 0.0f;
-		default: return AudioInternal::PcmPeak(port.pcm_data, count, 0, 3);
-	}
-}
-
-static std::string audioout2_ranges(const std::vector<uint32_t>& values) {
-	std::string out;
-	for (size_t i = 0; i < values.size();) {
-		size_t j = i;
-		while (j + 1 < values.size() && values[j + 1] == values[j] + 1) j++;
-		char part[40];
-		if (j == i) std::snprintf(part, sizeof(part), "%s0x%x", out.empty() ? "" : ",", values[i]);
-		else std::snprintf(part, sizeof(part), "%s0x%x-0x%x", out.empty() ? "" : ",", values[i], values[j]);
-		out += part;
-		i = j + 1;
-	}
-	return out.empty() ? "-" : out;
-}
-
-// (g_audioout2_port_mutex held.)
-static void audioout2_report_locked() {
-	static double last = 0.0;
-	const double  now  = AudioInternal::StatsSeconds();
-	if (last == 0.0) last = now;
-	if (now - last < 5.0) return;
-	last = now;
-	for (auto& ctx: g_audioout2_ctx_stats) {
-		if (ctx.ctx == 0 || ctx.pushes == 0) continue;
-		std::printf("[audio2] ctx %llu: %u pushes, %s\n", static_cast<unsigned long long>(ctx.ctx), ctx.pushes,
-		            ctx.float_main ? "objects mixed into its first float main port" : "no float main port: its objects are not heard");
-		struct Group {
-			uint32_t              ports = 0, with_pcm = 0, sounding = 0;
-			float                 peak  = 0.0f;
-			std::vector<uint32_t> values; // the sounding ones' ambisonics attribute
-		};
-		std::map<std::string, Group> groups;
-		for (auto& port: g_audioout2_ports) {
-			if (!port.used || port.context != ctx.ctx) continue;
-			const bool sounding = port.stat_pushes != 0 && port.stat_peak > 0.001f;
-			if (!audioout2_port_type_is_object(port.port_type)) {
-				std::printf("[audio2]  speaker port %llu: type 0x%x, format 0x%x (%u ch), %s, %u pushes, peak %.3f\n",
-				            static_cast<unsigned long long>(port.handle), port.port_type, port.data_format,
-				            audioout2_data_format_channels(port.data_format), port.audio_handle > 0 ? "device" : "no device",
-				            port.stat_pushes, static_cast<double>(port.stat_peak));
-			} else {
-				const char* fate = nullptr;
-				if (!ctx.float_main) fate = "dropped: no float main port";
-				else if (port.audio_format != AudioInternal::Format::FloatMono) fate = "dropped: not float mono";
-				else if ((port.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0 &&
-				         (port.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL) > 1 && std::getenv("KYTY_AUDIO2_HOA") != nullptr &&
-				         *std::getenv("KYTY_AUDIO2_HOA") == '0')
-					fate = "dropped: ambisonics above first order";
-				else fate = "mixed";
-				char key[160];
-				std::snprintf(key, sizeof(key), "type 0x%x format 0x%x %s, %s", port.port_type, port.data_format,
-				              (port.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0 ? "ambisonics" : "point", fate);
-				auto& group = groups[key];
-				group.ports++;
-				if (port.stat_pushes != 0) group.with_pcm++;
-				if (sounding) {
-					group.sounding++;
-					group.values.push_back(port.ambisonics);
-				}
-				group.peak = std::max(group.peak, port.stat_peak);
-			}
-			port.stat_pushes = 0;
-			port.stat_peak   = 0.0f;
-		}
-		for (auto& [key, group]: groups) {
-			std::sort(group.values.begin(), group.values.end());
-			group.values.erase(std::unique(group.values.begin(), group.values.end()), group.values.end());
-			std::printf("[audio2]  objects %s: %u ports, %u with PCM, %u sounding, peak %.3f, attribute 8 of the sounding: %s\n",
-			            key.c_str(), group.ports, group.with_pcm, group.sounding, static_cast<double>(group.peak),
-			            audioout2_ranges(group.values).c_str());
-		}
-		ctx.pushes = 0;
-	}
-	std::string attrs;
-	for (uint32_t id = 0; id < g_audioout2_attr_counts.size(); id++) {
-		const auto n = g_audioout2_attr_counts[id].exchange(0, std::memory_order_relaxed);
-		if (n == 0) continue;
-		char part[32];
-		std::snprintf(part, sizeof(part), " %s%u:%u", id == 32 ? ">" : "", id == 32 ? 31 : id, n);
-		attrs += part;
-	}
-	std::printf("[audio2] port attributes set (id:count)%s; speaker-array queries: coefficients %u, ambisonics %u, speaker info %u\n",
-	            attrs.empty() ? " none" : attrs.c_str(), g_audioout2_speaker_coeff_calls.exchange(0),
-	            g_audioout2_ambi_coeff_calls.exchange(0), g_audioout2_speaker_info_calls.exchange(0));
-}
-
 // The object ports (mono float) are for the system's 3D audio to render. Demon's Souls puts its whole
 // game mix there as ambisonics: two fifth-order scenes, one channel per port (attribute 8 = 0x40 | ACN,
-// SN3D, its beds silent). Decoded here for stereo with two virtual cardioids facing left and right
-// (W and Y, left positive), which only the first order feeds; an object that is no ambisonics channel
-// plays in the centre. Each port's gain applies, and the result goes to the front left and right of
-// the context's first float main port. Adding the 36 channels up instead cancelled most directions.
+// SN3D, its beds silent). Decoded here for stereo from the first order (W, Y left positive, X front
+// positive) by two virtual microphones facing about 74 degrees left and right: a sound straight ahead
+// plays at full level on both sides, as a binaural render plays it, one behind at -3 dB (the level of
+// a surround downmix), and one at the side with the power it has ahead. Cardioids facing 90 degrees
+// (W and Y alone) played what is ahead, where people talk, 3 dB below what is at the sides. An object
+// that is no ambisonics channel plays in the centre. Each port's gain applies, and the result goes to
+// the front left and right of the context's first float main port. Adding the 36 channels up instead
+// cancelled most directions.
 static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, const AudioOut2PortStateEntry& target) {
-	constexpr float                 HALF_POWER = 0.70710677f;
-	static constexpr float HoaLeft[36]  = {0.265712f, 0.123879f, 0.000000f, 0.214565f, 0.160253f, 0.000000f, -0.106836f, 0.000000f, 0.092522f, 0.131933f, 0.000000f, -0.051098f, 0.000000f, -0.088504f, 0.000000f, 0.000000f, 0.071768f, 0.000000f, -0.054251f, 0.000000f, 0.042023f, 0.000000f, -0.031322f, 0.000000f, -0.041435f, 0.019143f, 0.000000f, -0.028537f, 0.000000f, 0.013210f, 0.000000f, 0.022881f, 0.000000f, 0.000000f, 0.000000f, -0.033157f};
-	static constexpr float HoaRight[36] = {0.265712f, -0.123879f, 0.000000f, 0.214565f, -0.160253f, 0.000000f, -0.106836f, 0.000000f, 0.092522f, -0.131933f, 0.000000f, 0.051098f, 0.000000f, -0.088504f, 0.000000f, 0.000000f, -0.071768f, 0.000000f, 0.054251f, 0.000000f, 0.042023f, 0.000000f, -0.031322f, 0.000000f, -0.041435f, -0.019143f, 0.000000f, 0.028537f, 0.000000f, -0.013210f, 0.000000f, 0.022881f, 0.000000f, 0.000000f, 0.000000f, -0.033157f};
-	static const bool hoa = [] {
-		const char* value = std::getenv("KYTY_AUDIO2_HOA");
-		return value == nullptr || *value != '0';
-	}();
+	constexpr float HALF_POWER = 0.70710677f;
+	// Ahead W + X = 1, behind W - X = 1/sqrt(2), at the side (W + Y)^2 + (W - Y)^2 = 2.
+	constexpr float W_GAIN = 0.85355339f;
+	constexpr float X_GAIN = 0.14644661f;
+	constexpr float Y_GAIN = 0.52100538f;
 	thread_local std::vector<float> mix;
 	const auto channels = audioout2_data_format_channels(target.data_format);
 	const auto frames   = target.samples_num;
@@ -522,24 +386,14 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 		float left = HALF_POWER, right = HALF_POWER;
 		if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
 			const auto acn = object.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL;
-			if (hoa) {
-				// KYTY_AUDIO2_HOA (default on): the whole fifth-order scene decoded for two speakers at +-30 degrees
-				// (SN3D real harmonics, max-rE weights), scaled so that a source at a speaker's direction plays as loud
-				// as the first-order decode did. The voices (the Maiden in Black's, 12-10) came only in the orders above
-				// the first, which that decode dropped.
-				if (acn >= 36) continue;
-				// KYTY_AUDIO2_HOA_GAIN: the orders above the first scaled (an experiment: the voices' level there).
-				static const float high_gain = [] {
-					const char* value = std::getenv("KYTY_AUDIO2_HOA_GAIN");
-					return value != nullptr ? static_cast<float>(std::atof(value)) : 1.0f;
-				}();
-				const float scale = acn >= 4 ? high_gain : 1.0f;
-				left  = HoaLeft[acn] * scale;
-				right = HoaRight[acn] * scale;
-				if (left == 0.0f && right == 0.0f) continue;
+			if (acn == 0) {
+				left = right = W_GAIN;
 			} else if (acn == 1) {
-				right = -HALF_POWER;
-			} else if (acn != 0) {
+				left  = Y_GAIN;
+				right = -Y_GAIN;
+			} else if (acn == 3) {
+				left = right = X_GAIN;
+			} else {
 				continue;
 			}
 		}
@@ -564,20 +418,6 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
 
 	g_audioout2_port_mutex.Lock();
-	if (AudioInternal::StatsWanted()) {
-		auto* ctx_stats = audioout2_ctx_stats_locked(ctx);
-		if (ctx_stats != nullptr) ctx_stats->pushes++;
-		for (auto& state: g_audioout2_ports) {
-			if (!state.used || state.context != ctx || state.pcm_data == nullptr) continue;
-			state.stat_pushes++;
-			state.stat_peak = std::max(state.stat_peak, audioout2_port_peak(state));
-			if (ctx_stats != nullptr && state.audio_handle > 0 && (state.port_type & 0xffu) == 0 &&
-			    (state.audio_format == AudioInternal::Format::FloatStereo || state.audio_format == AudioInternal::Format::Float8Ch ||
-			     state.audio_format == AudioInternal::Format::Float8ChStd))
-				ctx_stats->float_main = true;
-		}
-		audioout2_report_locked();
-	}
 	bool objects_mixed = false;
 	for (const auto& state: g_audioout2_ports) {
 		if (state.used && state.context == ctx && state.audio_handle > 0 &&
@@ -674,10 +514,6 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 	state->num_grains  = (params->num_grains == 0 ? 512u : params->num_grains);
 	state->last_update = LibKernel::KernelGetProcessTime();
 	g_audioout2_context_mutex.Unlock();
-
-	std::printf("AudioOut2 context %llu: max ports %u, max object ports %u, queue depth %u, grain %u samples, flags 0x%x\n",
-	            static_cast<unsigned long long>(*ctx), params->max_ports, params->max_object_ports, params->queue_depth,
-	            params->num_grains, params->flags);
 
 	LOGF("\t buffer      = 0x%016" PRIx64 "\n"
 	     "\t buffer_size = 0x%016" PRIx64 "\n"
@@ -864,16 +700,6 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 
 	*port = next_port;
 
-	{
-		// (In the run log: every speaker port, and the first object ports.)
-		static std::atomic<uint32_t> objects_logged {0};
-		const bool object = audioout2_port_type_is_object(params->port_type);
-		if (!object || objects_logged.fetch_add(1, std::memory_order_relaxed) < 8)
-			std::printf("AudioOut2 port %llu: ctx %llu, type 0x%x (%s), format 0x%x, %u Hz%s\n", static_cast<unsigned long long>(next_port),
-			            static_cast<unsigned long long>(ctx), params->port_type, object ? "object" : "speakers", params->data_format,
-			            params->sampling_freq, audio_format == AudioInternal::Format::Unknown ? ", unknown format" : "");
-	}
-
 	if (next_port <= 16 || (next_port % 600) == 0) {
 		PRINT_NAME();
 		LOGF("\t ctx           = 0x%016" PRIx64 "\n"
@@ -915,25 +741,6 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 	uint32_t    ambisonics     = 0;
 	bool        has_ambisonics = false;
 	for (uint32_t i = 0; i < num; i++) {
-		if (AudioInternal::StatsWanted()) {
-			const auto id = std::min<uint32_t>(attributes[i].attribute_id, 32);
-			g_audioout2_attr_counts[id].fetch_add(1, std::memory_order_relaxed);
-			// (In the run log: the first values of the attributes the mix does not read.)
-			static std::array<std::atomic<uint32_t>, 33> logged {};
-			if (id != AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM && logged[id].fetch_add(1, std::memory_order_relaxed) < 12 &&
-			    attributes[i].value != nullptr) {
-				char bytes[100] {};
-				size_t at = 0;
-				const auto* raw = static_cast<const uint8_t*>(attributes[i].value);
-				for (size_t b = 0; b < std::min<size_t>(attributes[i].value_size, 24); b++)
-					at += static_cast<size_t>(std::snprintf(bytes + at, sizeof(bytes) - at, "%02x", raw[b]));
-				float f[3] {};
-				std::memcpy(f, raw, std::min<size_t>(attributes[i].value_size, sizeof(f)));
-				std::printf("AudioOut2 port %llu attribute %u (%zu bytes): %s (as floats %g %g %g)\n", static_cast<unsigned long long>(port),
-				            attributes[i].attribute_id, attributes[i].value_size, bytes, static_cast<double>(f[0]),
-				            static_cast<double>(f[1]), static_cast<double>(f[2]));
-			}
-		}
 		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
 		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
 			AudioOut2Pcm pcm {};
@@ -1079,7 +886,6 @@ int KYTY_SYSV_ABI AudioOut2SpeakerArrayDestroy(AudioOut2SpeakerArrayHandle handl
 int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayCoefficients(
     AudioOut2SpeakerArrayHandle handle, AudioOut2Position pos, float spread, float* coefficients,
     uint32_t num_coefficients, uint8_t height_aware, float downmix_spread_radius) {
-	g_audioout2_speaker_coeff_calls.fetch_add(1, std::memory_order_relaxed);
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(coefficients == nullptr && num_coefficients != 0);
 
@@ -1106,7 +912,6 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2Speake
                                                                  uint32_t ambisonics_channel,
                                                                  float*   coefficients,
                                                                  uint32_t num_coefficients) {
-	g_audioout2_ambi_coeff_calls.fetch_add(1, std::memory_order_relaxed);
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(coefficients == nullptr && num_coefficients != 0);
 
@@ -1125,7 +930,6 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2Speake
 }
 
 int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t flags) {
-	g_audioout2_speaker_info_calls.fetch_add(1, std::memory_order_relaxed);
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 	std::memset(info, 0, sizeof(AudioOut2SpeakerInfo));
 	info->type             = 0;

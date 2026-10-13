@@ -24,7 +24,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -72,6 +74,10 @@ constexpr uint64_t PartialDirtyCandidateSize = 2 * PartialDirtyGranule;
 constexpr uint64_t PartialUploadMaxShare = 2;
 // Staged runs of picked subresources closer than this are staged as one run.
 constexpr uint64_t PartialStageGap = uint64_t {64} << 10;
+// UploadImageChunked: images from this size whose bytes no cached buffer holds whole, uploaded this much of guest
+// memory at a time.
+constexpr uint64_t ChunkedUploadMin   = uint64_t {256} << 20;
+constexpr uint64_t ChunkedUploadPiece = uint64_t {64} << 20;
 
 [[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, vk::Format format,
                                   uint32_t fill, vk::ClearColorValue& clear) {
@@ -258,6 +264,51 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	// Collection starts where the video memory use reaches the budget less its headroom (GetTotalMemoryBudget):
 	// below it a kept image costs nothing, a deleted one an upload when the game uses it again.
 	m_trigger_gc_memory = m_graphics.GetTotalMemoryBudget();
+}
+
+void KytyTextureGcThresholds(uint64_t total_budget, uint64_t& trigger, uint64_t& pressure, uint64_t& critical) {
+	constexpr int64_t GiB       = 1024ll * 1024 * 1024;
+	const auto        budget    = static_cast<int64_t>(std::min<uint64_t>(total_budget, INT64_MAX));
+	const auto        threshold = std::min<int64_t>(budget, 8 * GiB);
+	pressure =
+	    static_cast<uint64_t>(std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+	critical =
+	    static_cast<uint64_t>(std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+	trigger = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+}
+
+bool KytyGcLiveBudget() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_GC_LIVE_BUDGET");
+		return env != nullptr && std::atoi(env) != 0;
+	}();
+	return enabled;
+}
+
+uint64_t KytyGcLiveBudgetValue(const GraphicContext& graphics) {
+	static const uint64_t cap = [] {
+		const char* env = std::getenv("KYTY_GC_BUDGET_CAP_MB");
+		return env != nullptr ? std::strtoull(env, nullptr, 10) << 20 : 0ull;
+	}();
+	const uint64_t budget     = graphics.GetTotalMemoryBudget();
+	const uint64_t now_budget = cap != 0 ? std::min(budget, cap) : budget;
+	static std::mutex                        mutex;
+	static std::array<uint64_t, 15>          samples {};
+	static size_t                            next = 0;
+	static std::chrono::steady_clock::time_point last {};
+	std::scoped_lock                        lock {mutex};
+	const auto                              now = std::chrono::steady_clock::now();
+	if (samples[0] == 0) {
+		samples.fill(now_budget);
+		last = now;
+	} else if (now - last >= std::chrono::seconds(2)) {
+		next          = (next + 1) % samples.size();
+		samples[next] = now_budget;
+		last          = now;
+	} else {
+		samples[next] = std::min(samples[next], now_budget);
+	}
+	return *std::min_element(samples.begin(), samples.end());
 }
 
 TextureCache::~TextureCache() {
@@ -1379,6 +1430,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
+		if (const auto texel_id = ResolveBlockTexelOverlap(requested, cached_id)) {
+			return {texel_id};
+		}
 		if (requested.IsBlock() && !cached.info.IsBlock()) {
 			return {ExpandImage(requested, cached_id)};
 		}
@@ -1492,9 +1546,58 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	return {merged_id};
 }
 
+// The blocks of a block-compressed image as an uncompressed image of them: the same tiling, element grid (BlockExtent,
+// bytes per block: ResolveOverlap's checks before) and placement of the levels both hold. The game's GPU block
+// compressors write BC textures so (Demon's Souls' character creation: each head preset's face, composited and then
+// compressed to BC3 / BC7 2048x2048 by CS 55d35da67c9a387a / b59223a986bb112e through R32G32B32A32_UINT 512x512 storage
+// views of the textures' bytes). Vulkan views of one image cannot be that over more than a level, so the requested form
+// is an image of its own made from the other's contents, and the other is parked (ExpandImage takes it back the other
+// way, with the texels' contents). Before, the storage view was an image of its own made from the guest's bytes and the
+// compressed texture kept its old contents: faces showed the previous preset's makeup, tattoos or stale bytes.
+ImageId TextureCache::ResolveBlockTexelOverlap(const ImageInfo& requested, ImageId cached_id) {
+	const auto& cached = m_slot_images[cached_id].info;
+	if (requested.IsBlock() || !cached.IsBlock() || requested.IsDepth() || cached.IsDepth() || requested.samples != 1 ||
+	    cached.samples != 1 || requested.tile_mode != cached.tile_mode || requested.type != cached.type ||
+	    requested.IsVolume() || requested.resources.layers != cached.resources.layers || requested.HasMetadata() ||
+	    cached.HasMetadata() || requested.HasStencil() || cached.HasStencil() ||
+	    requested.resources.levels > cached.resources.levels || requested.resources.levels > requested.mip_layout.size())
+		return {};
+	for (uint32_t level = 0; level < requested.resources.levels; ++level) {
+		if (requested.mip_layout[level].offset != cached.mip_layout[level].offset ||
+		    requested.mip_layout[level].size != cached.mip_layout[level].size)
+			return {};
+	}
+	RefreshCopySource(cached_id);
+	auto texel_id = TakeParkedImage(requested);
+	if (!texel_id) texel_id = InsertImage(requested);
+	auto& texels = m_slot_images[texel_id];
+	auto& blocks = m_slot_images[cached_id];
+	texels.usage = blocks.usage;
+	if (blocks.binding.is_bound || blocks.binding.is_target) {
+		blocks.binding.needs_rebind = true;
+	}
+	InitializeImage(texel_id);
+	CopyImage(texel_id, cached_id);
+	ParkImage(cached_id);
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+		std::printf("TextureCache: 0x%llx+0x%llx as the texels of its blocks (fmt %u %ux%u levels %u from fmt %u %ux%u "
+		            "levels %u)\n",
+		            static_cast<unsigned long long>(requested.data.address),
+		            static_cast<unsigned long long>(requested.data.size), static_cast<uint32_t>(requested.guest_format),
+		            requested.extent.width, requested.extent.height, requested.resources.levels,
+		            static_cast<uint32_t>(m_slot_images[cached_id].info.guest_format),
+		            m_slot_images[cached_id].info.extent.width, m_slot_images[cached_id].info.extent.height,
+		            m_slot_images[cached_id].info.resources.levels);
+	}
+	return texel_id;
+}
+
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	RefreshCopySource(source_id);
-	const auto expanded_id = InsertImage(info);
+	// (The blocks' image parked for these texels: ResolveBlockTexelOverlap.)
+	auto expanded_id = TakeParkedImage(info);
+	if (!expanded_id) expanded_id = InsertImage(info);
 	auto&      expanded    = m_slot_images[expanded_id];
 	auto&      source      = m_slot_images[source_id];
 	expanded.usage         = source.usage;
@@ -1647,7 +1750,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (!plan.tiles.empty()) {
 			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
-			                        plan.LinearSize(), plan.tiles);
+			                        plan.LinearSize(), plan.tiles, source.Usage() == MemoryUsage::Upload);
 		}
 		if (plan.swap_bgra16) {
 			linear = m_tiler.SwapBgra16(linear);
@@ -1668,7 +1771,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	if (info.IsTiled()) {
 		const auto tiles = BuildDepthTiles(info);
 		linear =
-		    m_tiler.Detile(source.Handle(), source_offset, info.data.size, info.data.size, tiles);
+		    m_tiler.Detile(source.Handle(), source_offset, info.data.size, info.data.size, tiles,
+		                   source.Usage() == MemoryUsage::Upload);
 	}
 	const auto transfer_bytes = DepthAspectTransferBytes(info.pixel_format);
 	if (transfer_bytes != info.bytes_per_block) {
@@ -1742,7 +1846,8 @@ void TextureCache::UploadStencil(Image& image, Buffer& source, uint64_t source_o
 		tiles.back().surface_z = layer;
 	}
 	const auto linear =
-	    m_tiler.Detile(source.Handle(), source_offset, info.stencil.size, info.stencil.size, tiles);
+	    m_tiler.Detile(source.Handle(), source_offset, info.stencil.size, info.stencil.size, tiles,
+	                   source.Usage() == MemoryUsage::Upload);
 	for (auto& copy: copies) {
 		copy.bufferOffset += linear.offset;
 	}
@@ -1848,6 +1953,14 @@ void TextureCache::InitializeImage(ImageId id) {
 				LiveCounters::Add(LiveCounters::PartialFallbacks);
 			} else {
 				image.staged_ring = nullptr;
+			}
+		}
+		if (!uploaded && UploadImageChunked(image)) {
+			uploaded            = true;
+			image.staged_ring   = nullptr;
+			if (kyty_local_partial_image_dirty_mode.load(std::memory_order_relaxed) == 2 &&
+			    PartialDirtyCandidate(image)) {
+				UpdatePartialHashes(image, true);
 			}
 		}
 		if (!uploaded) {
@@ -2060,9 +2173,12 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 		}
 		total = pieces.back().offset + pieces.back().size;
 	}
-	const auto [source, source_offset] = m_buffer_cache.StageImagePieces(pieces, total);
+	const char* refused = nullptr;
+	const auto [source, source_offset] = m_buffer_cache.StageImagePieces(pieces, total, &refused);
 	if (source == nullptr) {
-		return PartialFail("depth_stage");
+		return PartialFail(refused == nullptr        ? "depth_stage"
+		                   : refused[0] == 'g' ? "depth_stage:gpu"
+		                                       : "depth_stage:map");
 	}
 	// The picked layers, packed: as the whole path's copies and tiles, at their own layer.
 	std::vector<vk::BufferImageCopy> copies(picked.size());
@@ -2085,7 +2201,8 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 			                 info.extent.width, info.extent.height, 1, info.pitch});
 			tiles.back().surface_z = picked[i];
 		}
-		linear = m_tiler.Detile(source->Handle(), source_offset, total, slice * picked.size(), tiles);
+		linear = m_tiler.Detile(source->Handle(), source_offset, total, slice * picked.size(), tiles,
+		                        source->Usage() == MemoryUsage::Upload);
 	}
 	for (auto& copy: copies) {
 		copy.bufferOffset += linear.offset;
@@ -2094,6 +2211,106 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 	LiveCounters::Add(LiveCounters::PartialUploads);
 	LiveCounters::Add(LiveCounters::PartialUploadBytes, total);
 	LogPartialUpload(image, pieces.size(), total);
+	return true;
+}
+
+// A whole upload of a large image no cached buffer holds whole, a piece of guest memory at a time, each piece from the
+// source ObtainBufferForImage picks for it: staged guest bytes, the buffer holding it, or (a subresource with
+// GPU-written bytes, a piece of its own) a buffer over that subresource. The whole range at once took a buffer over
+// all of it: a texture-pool view at Shrine of Storms 4-2 (1568 1 MiB layers) joined the 103 small buffers inside it
+// into one 1.57 GB buffer (3.2 s), and with the image and its detiling scratch (2 GiB) an 8 GB laptop paged for seconds;
+// its shadow-map pool, inside that buffer, then took whole 320 MiB uploads at every layer the game streamed. The
+// pieces detile into one reused scratch buffer: one each lived until the submission completed, as much again.
+bool TextureCache::UploadImageChunked(Image& image) {
+	const auto& info    = image.info;
+	const auto  binding = UploadBinding(image);
+	const auto  base    = info.data.address;
+	if (binding == BindingType::DepthTarget || info.data.size < ChunkedUploadMin || info.IsVolume() || base % 256 != 0 ||
+	    m_buffer_cache.BufferHoldsRange(base, info.data.size)) {
+		return false;
+	}
+	auto& cached = m_partial_plans[image.serial];
+	if (cached.plan == nullptr || cached.binding != binding) {
+		cached.plan    = std::make_shared<TextureTransferPlan>(
+            BuildTextureTransfer(image, binding, TransferDirection::Upload));
+		cached.binding = binding;
+	}
+	const auto& plan = *cached.plan;
+	if (!plan.valid || plan.swap_bgra16 || plan.tiles.empty() || plan.tiles.size() != plan.regions.size()) {
+		return false;
+	}
+	std::vector<size_t> order(plan.tiles.size());
+	for (size_t index = 0; index < order.size(); index++) {
+		if (plan.regions[index].bufferOffset < plan.tiles[index].linear_offset) {
+			return false;
+		}
+		order[index] = index;
+	}
+	std::sort(order.begin(), order.end(),
+	          [&](size_t left, size_t right) { return plan.tiles[left].tiled_offset < plan.tiles[right].tiled_offset; });
+	const auto                       start = std::chrono::steady_clock::now();
+	std::vector<GpuTileInfo>         tiles;
+	std::vector<vk::BufferImageCopy> regions;
+	uint64_t                         pieces     = 0;
+	uint64_t                         gpu_pieces = 0;
+	for (size_t at = 0; at < order.size();) {
+		const auto& first   = plan.tiles[order[at]];
+		uint64_t    begin   = base + first.tiled_offset;
+		uint64_t    end     = begin + first.tiled_size;
+		size_t      next    = at + 1;
+		const bool  written = m_buffer_cache.IsRegionGpuModified(begin, end - begin);
+		while (!written && next < order.size()) {
+			const auto&    tile       = plan.tiles[order[next]];
+			const uint64_t tile_begin = base + tile.tiled_offset;
+			const uint64_t tile_end   = tile_begin + tile.tiled_size;
+			if (std::max(end, tile_end) - begin > ChunkedUploadPiece ||
+			    m_buffer_cache.IsRegionGpuModified(tile_begin, tile.tiled_size)) {
+				break;
+			}
+			end = std::max(end, tile_end);
+			next++;
+		}
+		begin                              = begin & ~uint64_t {255};
+		end                                = std::min(info.data.End(), (end + 255) & ~uint64_t {255});
+		const auto [source, source_offset] = m_buffer_cache.ObtainBufferForImage(begin, end - begin);
+		if (source == nullptr) {
+			EXIT("TextureCache: failed to obtain image upload source\n");
+		}
+		tiles.clear();
+		regions.clear();
+		uint64_t linear_total = 0;
+		for (size_t k = at; k < next; k++) {
+			auto       tile          = plan.tiles[order[k]];
+			auto       region        = plan.regions[order[k]];
+			const auto linear_offset = (linear_total + 255) & ~uint64_t {255};
+			region.bufferOffset      = linear_offset + (region.bufferOffset - tile.linear_offset);
+			tile.linear_offset       = linear_offset;
+			tile.tiled_offset        = base + tile.tiled_offset - begin;
+			linear_total             = linear_offset + tile.linear_size;
+			tiles.push_back(tile);
+			regions.push_back(region);
+		}
+		const auto linear = m_tiler.Detile(source->Handle(), source_offset, end - begin, linear_total, tiles,
+		                                   source->Usage() == MemoryUsage::Upload, true);
+		for (auto& region: regions) {
+			region.bufferOffset += linear.offset;
+		}
+		image.Upload(regions, linear.buffer, linear.offset, linear.size);
+		pieces++;
+		gpu_pieces += written ? 1 : 0;
+		at = next;
+	}
+	LiveCounters::Add(LiveCounters::FullUploads);
+	LiveCounters::Add(LiveCounters::FullUploadBytes, info.data.size);
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 64) {
+		std::printf("TextureCache: chunked upload addr=0x%llx size=0x%llx layers=%u levels=%u: %llu pieces (%llu with "
+		            "GPU-written bytes) in %.1f ms\n",
+		            static_cast<unsigned long long>(base), static_cast<unsigned long long>(info.data.size),
+		            info.resources.layers, info.resources.levels, static_cast<unsigned long long>(pieces),
+		            static_cast<unsigned long long>(gpu_pieces),
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+	}
 	return true;
 }
 
@@ -2241,7 +2458,8 @@ bool TextureCache::UploadImagePartial(Image& image, uint64_t window_begin, uint6
 	if (source == nullptr) {
 		return PartialFail("stage");
 	}
-	const auto linear = m_tiler.Detile(source->Handle(), source_offset, total, linear_total, tiles);
+	const auto linear = m_tiler.Detile(source->Handle(), source_offset, total, linear_total, tiles,
+	                                   source->Usage() == MemoryUsage::Upload);
 	for (auto& region: regions) {
 		region.bufferOffset += linear.offset;
 	}
@@ -2521,6 +2739,21 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	    m_stencil_associations.end()) {
 		m_stencil_associations.push_back(association);
 	}
+}
+
+bool TextureCache::HoldsImage(const ImageInfo& info) {
+	if (info.data.Empty()) return false;
+	std::scoped_lock          lock {m_lock};
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(info.data.address, info.data.size, pages)) return false;
+	const auto* owners = m_image_page_table.Find(pages.first);
+	if (owners == nullptr) return false;
+	bool held = false;
+	owners->ForEach([&](ImageId id) {
+		const auto* image = m_slot_images.try_get(id);
+		held              = held || (image != nullptr && image->registered && SameBacking(image->info, info, false));
+	});
+	return held;
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
@@ -3821,6 +4054,27 @@ void TextureCache::RunGarbageCollector() {
 		std::printf("Buffer cache: %llu MiB registered\n", static_cast<unsigned long long>(m_buffer_cache.CacheBytes() >> 20u));
 		m_graphics.LogVideoMemory("30 s");
 		std::fflush(stdout);
+	}
+	if (KytyGcLiveBudget() && m_graphics.CanReportMemoryUsage()) {
+		static auto   kyty_budget_window = std::chrono::steady_clock::time_point {};
+		const auto    now                = std::chrono::steady_clock::now();
+		const uint64_t budget            = KytyGcLiveBudgetValue(m_graphics);
+		if (now - kyty_budget_window >= std::chrono::seconds(2)) {
+			kyty_budget_window = now;
+			uint64_t trigger = 0, pressure = 0, critical = 0;
+			KytyTextureGcThresholds(budget, trigger, pressure, critical);
+			const auto moved = [](uint64_t a, uint64_t b) { return (a > b ? a - b : b - a) >= (uint64_t {64} << 20u); };
+			if (moved(trigger, m_trigger_gc_memory)) {
+				std::printf("KYTYGCBUDGET texture budget=%lluMB trigger=%lluMB pressure=%lluMB critical=%lluMB "
+				            "used=%lluMB\n",
+				            static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(trigger >> 20),
+				            static_cast<unsigned long long>(pressure >> 20),
+				            static_cast<unsigned long long>(critical >> 20),
+				            static_cast<unsigned long long>(m_total_used_memory >> 20));
+				std::fflush(stdout);
+			}
+			m_trigger_gc_memory = trigger;
+		}
 	}
 	// A GPU short of video memory: a log line on where it goes when its use moved by 256 MiB (checked every 60 flips).
 	if (uint64_t video = 0, budget = 0; m_graphics.small_video_memory && tick % 60 == 0 &&

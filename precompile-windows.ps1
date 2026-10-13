@@ -4,7 +4,9 @@
 #                                         looks up before compiling (hours the first time: run it overnight); with
 #                                         a driver that has VK_KHR_pipeline_binary (NVIDIA 5xx) the pipelines'
 #                                         binaries instead, <title>_<version>.binaries, read only when a pipeline is
-#                                         needed (the driver copies a whole .bin into memory: GBs)
+#                                         needed (the driver copies a whole .bin into memory: GBs); without them,
+#                                         each pipeline's own pipeline cache data, <title>_<version>.blobs, read
+#                                         alike (a .bin made before them stays in use, and a run adds to it)
 #   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 3 threads each on the allowed CPUs)
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
@@ -206,6 +208,16 @@ if ($InputsOnly) {
 }
 # The shards an interrupted run finished first: what they hold is not compiled again.
 Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
+# The plan: every pipeline of the run with the work item that makes it first (a dry run of each seed file on all CPUs,
+# a minute or two). The shards then compile each pipeline once, whichever of them or of the seed files makes it: two
+# fifths of their pipelines were made by another work item too (the same modules and state: a recipe's table and
+# native variants, a recorded specialization the seeds guessed), each compiled again in every shard that had one.
+$plan = "$logs\plan.bin"
+Wait-Precompile (Start-Precompile 'plan-seeds' @('--seeds', "`"$Seeds`"", '--dry-run', '--plan', "`"$plan`"", '--threads', "$cpus")) 'plan'
+if ($Recorded -and (Test-Path $Recorded)) {
+	Wait-Precompile (Start-Precompile 'plan-recorded' @('--seeds', "`"$Recorded`"", '--dry-run', '--plan', "`"$plan`"",
+		'--threads', "$cpus")) 'plan'
+}
 $pending = [System.Collections.Generic.Queue[object]]::new()
 for ($i = 0; $i -lt $Shards; $i++) { $pending.Enqueue(@($Seeds, "$i/$Shards")) }
 if ($Recorded -and (Test-Path $Recorded)) {
@@ -224,7 +236,8 @@ while ($pending.Count -or $running.Count) {
 	while ($pending.Count -and $running.Count -lt $Jobs) {
 		$seedFile, $shard = $pending.Dequeue()
 		$name = 'shard' + ($shard -replace '/', 'of') + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
-		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard, '--threads', "$Threads")))
+		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard,
+			'--threads', "$Threads", '--plan', "`"$plan`"")))
 	}
 	Start-Sleep -Milliseconds 250
 	foreach ($name in @($running.Keys)) {
@@ -253,7 +266,8 @@ while ($pending.Count -or $running.Count) {
 $env:KYTY_PRECOMPILE_CLAIMS = $null
 Wait-Precompile (Start-Precompile 'merge' @('--merge', '--prune')) 'merge'
 Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
-$cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSScriptRoot\_PipelineCache\static\$gameId.binaries" -ErrorAction SilentlyContinue |
+$cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSScriptRoot\_PipelineCache\static\$gameId.binaries",
+	"$PSScriptRoot\_PipelineCache\static\$gameId.blobs" -ErrorAction SilentlyContinue |
 	Sort-Object LastWriteTime | Select-Object -Last 1
 Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB; {3} shards split)" -f ((Get-Date) - $begin), $cache.FullName, ($cache.Length / 1MB), $split)
 } finally {

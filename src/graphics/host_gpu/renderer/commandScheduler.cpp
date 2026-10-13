@@ -598,6 +598,12 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 	info.pCommandBuffers      = submit.commands;
 	info.signalSemaphoreCount = submit.signals;
 	info.pSignalSemaphores    = submit.signal_semaphores;
+	for (uint32_t i = 0; i < submit.signals; ++i) {
+		if (submit.signal_ticks[i] != submit.tick) continue;
+		DeviceFault::NoteSubmit((uint64_t)(submit.signal_semaphores[i]), submit.tick, submit.commands, submit.count, // NOLINT
+		                        submit.wait_semaphores, submit.wait_ticks, submit.waits);
+		break;
+	}
 	VkResult result;
 	{
 		Common::LockGuard lock(*submit.queue_mutex);
@@ -614,6 +620,7 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 void ReplayDiscard(std::span<const LocalVulkanRecording::Segment> segments,
                    const vk::detail::DispatchLoaderDynamic& dispatch) {
 	const auto command = *static_cast<const VkCommandBuffer*>(segments[0].data);
+	DeviceFault::NoteDiscard(command);
 	if (dispatch.vkResetCommandBuffer(command, 0) != VK_SUCCESS) {
 		EXIT("deferred vkResetCommandBuffer failed\n");
 	}
@@ -670,7 +677,36 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	return tick;
 }
 
+void CommandScheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, uint64_t value) {
+	// (One semaphore at a time: a later value of the same one replaces the earlier; another one is waited for now.)
+	if (m_next_wait_semaphore == semaphore) {
+		m_next_wait_value = std::max(m_next_wait_value, value);
+		return;
+	}
+	if (m_next_wait_semaphore != nullptr) {
+		vk::SemaphoreWaitInfo wait {};
+		wait.semaphoreCount = 1;
+		wait.pSemaphores    = &m_next_wait_semaphore;
+		wait.pValues        = &m_next_wait_value;
+		EXIT_NOT_IMPLEMENTED(m_graphics.device.waitSemaphores(&wait, UINT64_MAX) != vk::Result::eSuccess);
+	}
+	m_next_wait_semaphore = semaphore;
+	m_next_wait_value     = value;
+}
+
 uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit) {
+	if (m_next_wait_semaphore != nullptr) {
+		if (submit.num_wait_semaphores < SubmitInfo::MaxSemaphores) {
+			submit.AddWait(m_next_wait_semaphore, m_next_wait_value);
+		} else {
+			vk::SemaphoreWaitInfo wait {};
+			wait.semaphoreCount = 1;
+			wait.pSemaphores    = &m_next_wait_semaphore;
+			wait.pValues        = &m_next_wait_value;
+			EXIT_NOT_IMPLEMENTED(m_graphics.device.waitSemaphores(&wait, UINT64_MAX) != vk::Result::eSuccess);
+		}
+		m_next_wait_semaphore = nullptr;
+	}
 	// The work may run once submitted: the pages it writes are read-protected first.
 	PageManager::FlushDeferredProtection();
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
@@ -751,6 +787,14 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		submit_info.pCommandBuffers      = buffers.data();
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		static_assert(sizeof(vk::CommandBuffer) == sizeof(VkCommandBuffer));
+		DeviceFault::NoteSubmit((uint64_t)(static_cast<VkSemaphore>(m_master.Handle())), tick, // NOLINT
+		                        reinterpret_cast<const VkCommandBuffer*>(buffers.data()),
+		                        static_cast<uint32_t>(entries.size()),
+		                        reinterpret_cast<const VkSemaphore*>(submit.wait_semaphores.data()), submit.wait_ticks.data(),
+		                        submit.num_wait_semaphores);
+#endif
 
 		result = (m_lane == 1 ? graphics.compute_queue : graphics.queue).submit(1, &submit_info, nullptr);
 		m_driver_tick.store(tick, std::memory_order_release);

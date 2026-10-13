@@ -865,6 +865,24 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.multiDrawIndirect                    = VK_TRUE; // (indirect draws of several argument sets)
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
+	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue (the BDA page table).
+	{
+		vk::PhysicalDeviceProperties properties {};
+		physical_device.getProperties(&properties);
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		graphics.sparse_residency_buffers =
+		    supported_features2.features.sparseBinding == VK_TRUE &&
+		    supported_features2.features.sparseResidencyBuffer == VK_TRUE &&
+		    properties.sparseProperties.residencyNonResidentStrict == VK_TRUE && queue_family < family_count &&
+		    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding);
+		if (graphics.sparse_residency_buffers) {
+			device_features.sparseBinding         = VK_TRUE;
+			device_features.sparseResidencyBuffer = VK_TRUE;
+		}
+	}
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
@@ -1363,6 +1381,7 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.supports_block_texel_view = block_texel_view_props.result == vk::Result::eSuccess;
 	LOGF("Block Texel View support: %s\n", graphic_ctx.supports_block_texel_view ? "Yes" : "No");
 
+	bool checkpoints = false;
 	{
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
 		    "vkEnumerateDeviceExtensionProperties",
@@ -1390,6 +1409,12 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		// KYTY_GPU_CHECKPOINTS (diagnostic): the pipelines a GPU hang or fault ran (device-fault.h).
+		if (DeviceFault::CheckpointsRequested() &&
+		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+			checkpoints = true;
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
@@ -1430,9 +1455,21 @@ void WindowContext::CreateVulkan() {
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::Install();
 #endif
+	// Every pipeline bind is noted for a device loss's report (device-fault.h).
+	if (checkpoints) DeviceFault::EnableCheckpoints(graphic_ctx.device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	{
+		auto bind = LocalVulkanRecording::DirectDispatch().vkCmdBindPipeline;
+		DeviceFault::InstallBindHook(&bind);
+		(void)LocalVulkanRecording::ReplaceBindPipeline(reinterpret_cast<void*>(bind));
+	}
+#else
+	DeviceFault::InstallBindHook(&VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBindPipeline);
+#endif
 	graphic_ctx.queue_family = queue_family;
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	DeviceFault::NoteQueue(graphic_ctx.queue, "graphics");
 	if (graphic_ctx.present_queue_created) {
 		graphic_ctx.device.getQueue(queue_family, 1, &graphic_ctx.present_queue);
 		LOGF("\tpresent queue: family %u index 1\n", queue_family);
@@ -1444,6 +1481,7 @@ void WindowContext::CreateVulkan() {
 	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
 		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
 		EXIT_IF(graphic_ctx.readback_queue == nullptr);
+		DeviceFault::NoteQueue(graphic_ctx.readback_queue, "readback");
 	}
 	Libs::Graphics::Fsr3::OnDevice(graphic_ctx, g_fsr3_plan);
 	Libs::Graphics::FrameGen::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);

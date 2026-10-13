@@ -31,6 +31,11 @@ class CommandScheduler;
 class RenderExecutor;
 struct TextureCacheTestAccess;
 
+void                   KytyTextureGcThresholds(uint64_t total_budget, uint64_t& trigger, uint64_t& pressure,
+                                               uint64_t& critical);
+[[nodiscard]] bool     KytyGcLiveBudget();
+[[nodiscard]] uint64_t KytyGcLiveBudgetValue(const GraphicContext& graphics);
+
 class TextureCache {
 public:
 	// Every image as a tab-separated row (live "images <path>").
@@ -50,6 +55,8 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// An image of exactly this guest texture is registered (what FindImage takes first; no lookup side effects).
+	[[nodiscard]] bool          HoldsImage(const ImageInfo& info);
 	// Addresses that gained their first registered image, in registration
 	// order: a caller that proved "no image starts here" at StartEpoch() E only
 	// needs the addresses logged after E.
@@ -238,6 +245,8 @@ private:
 	void               FinishRefresh(Image& image);
 	// The dirty subresources over [window_begin, window_end) only (a whole one where it crosses an end).
 	[[nodiscard]] bool UploadImagePartial(Image& image, uint64_t window_begin = 0, uint64_t window_end = UINT64_MAX);
+	// A whole upload of a large image a piece of guest memory at a time; false: not such an image (ObtainBufferForImage's).
+	[[nodiscard]] bool UploadImageChunked(Image& image);
 	// The dirty layers in [first_layer, last_layer) only.
 	[[nodiscard]] bool UploadDepthPartial(Image& image, uint32_t first_layer = 0,
 	                                      uint32_t last_layer = UINT32_MAX);
@@ -269,6 +278,7 @@ private:
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
+	[[nodiscard]] ImageId       ResolveBlockTexelOverlap(const ImageInfo& requested, ImageId cached_id);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
 	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);

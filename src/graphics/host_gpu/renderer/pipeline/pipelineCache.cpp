@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCacheBlobs.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -58,6 +59,7 @@
 #include <utility>
 #include <vector>
 #include <xxhash.h>
+#include <zstd.h>
 
 extern "C" {
 // 1: find graphics pipelines through a block-hashed index of the full key.
@@ -364,12 +366,14 @@ struct PipelineCache::ProgramCache {
 		bool                                         table_mode = false; // an empty handle: refused
 	};
 
-	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file.
+	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file: zstd-compressed (spirv_bytes,
+	// a fifth of it), or as it is (spirv_bytes 0).
 	struct PrefetchedModule {
 		ShaderRecompiler::IR::ResourceSpecialization specialization; // compiled with
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		uint64_t                                     spirv_offset = 0;
 		size_t                                       spirv_words  = 0;
+		size_t                                       spirv_bytes  = 0;
 	};
 
 	// A table mode permutation a compile worker translates (Get): the next Get of its specialization and push data
@@ -461,6 +465,7 @@ struct PipelineCache::ProgramCache {
 		std::atomic<bool>                                      ready {false}, stop {false};
 		std::atomic<size_t>                                    next {0}, finished {0};
 		std::atomic<uint64_t>                                  spill_end {0};
+		std::atomic<uint64_t>                                  spirv_bytes {0}; // before compression
 		uint64_t                                               spill = 0;
 		std::thread                                            loader;
 		std::vector<std::thread>                               threads;
@@ -512,7 +517,12 @@ struct PipelineCache::ProgramCache {
 				PipelineCacheLog("Shader prefetch: no temporary file for the SPIR-V");
 				return;
 			}
-			uint32_t threads = std::max(2u, std::thread::hardware_concurrency() / 2u);
+			// The CPUs the game leaves: its loading keeps about 12 threads busy (guest job threads, the GPU and recording
+			// threads), and prefetch threads beside them (on the other half of a core) slow them however low their
+			// priority. An 8-core laptop (16 CPUs) with 8 prefetch threads took 120+ s instead of 20 s to load 1-1
+			// (start-up to the game 264-300 s; with 4: 107 s); half the CPUs at most (a 32-CPU desktop keeps 16).
+			const uint32_t cpus    = std::max(1u, std::thread::hardware_concurrency());
+			uint32_t       threads = std::clamp(cpus > 12u ? cpus - 12u : 2u, 2u, std::max(2u, cpus / 2u));
 			if (const char* value = std::getenv("KYTY_SHADER_PREFETCH_THREADS"); value != nullptr && *value != '\0')
 				threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
 			PipelineCacheLog("Shader prefetch: {} programs ({} inputs) to translate on {} threads, loaded in {} ms",
@@ -537,7 +547,8 @@ struct PipelineCache::ProgramCache {
 				group.state.notify_all();
 			}
 			if (p.finished.fetch_add(1, std::memory_order_relaxed) + 1 == p.groups.size()) {
-				PipelineCacheLog("Shader prefetch: all {} programs translated, {} MiB of SPIR-V", p.groups.size(),
+				PipelineCacheLog("Shader prefetch: all {} programs translated, {} MiB of SPIR-V ({} MiB compressed)",
+				                 p.groups.size(), p.spirv_bytes.load(std::memory_order_relaxed) >> 20u,
 				                 p.spill_end.load(std::memory_order_relaxed) >> 20u);
 				std::vector<std::vector<uint32_t>>().swap(p.inputs.records); // no longer read
 			}
@@ -561,11 +572,19 @@ struct PipelineCache::ProgramCache {
 				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, record.specialization);
 				auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, record.specialization,
 				                                               record.push_cursor);
-				const auto bytes  = result.spirv.size() * sizeof(uint32_t);
-				const auto offset = p.spill_end.fetch_add(bytes, std::memory_order_relaxed);
-				if (!LocalPlatform::WriteScratchFile(p.spill, offset, result.spirv.data(), bytes)) continue;
+				// Compressed (a fifth of the bytes): the file of a whole game's SPIR-V (4.5 GB) is kept in memory by the
+				// system as a temporary file, which an 8 GB-GPU laptop with 32 GB of RAM did not have to spare.
+				const auto  bytes  = result.spirv.size() * sizeof(uint32_t);
+				std::vector<char> packed(ZSTD_compressBound(bytes));
+				const auto  packed_size = ZSTD_compress(packed.data(), packed.size(), result.spirv.data(), bytes, 1);
+				const bool  compressed  = !ZSTD_isError(packed_size) && packed_size < bytes;
+				const void* data        = compressed ? static_cast<const void*>(packed.data()) : result.spirv.data();
+				const auto  stored      = compressed ? packed_size : bytes;
+				const auto  offset      = p.spill_end.fetch_add(stored, std::memory_order_relaxed);
+				p.spirv_bytes.fetch_add(bytes, std::memory_order_relaxed);
+				if (!LocalPlatform::WriteScratchFile(p.spill, offset, data, stored)) continue;
 				group.modules.push_back({std::move(record.specialization), std::move(result.program).TakeCompiledInfo(),
-				                         offset, result.spirv.size()});
+				                         offset, result.spirv.size(), compressed ? stored : 0});
 			} catch (const Common::RecoverableExit&) {
 			}
 		}
@@ -609,9 +628,15 @@ struct PipelineCache::ProgramCache {
 		});
 		if (module == source.prefetched.end()) return nullptr;
 		std::vector<uint32_t> spirv(module->spirv_words);
-		if (!LocalPlatform::ReadScratchFile(prefetch->spill, module->spirv_offset, spirv.data(),
-		                                    spirv.size() * sizeof(uint32_t)))
+		const auto            bytes = spirv.size() * sizeof(uint32_t);
+		if (module->spirv_bytes != 0) {
+			std::vector<char> packed(module->spirv_bytes);
+			if (!LocalPlatform::ReadScratchFile(prefetch->spill, module->spirv_offset, packed.data(), packed.size()) ||
+			    ZSTD_decompress(spirv.data(), bytes, packed.data(), packed.size()) != bytes)
+				return nullptr;
+		} else if (!LocalPlatform::ReadScratchFile(prefetch->spill, module->spirv_offset, spirv.data(), bytes)) {
 			return nullptr;
+		}
 		source.permutations.push_back(
 		    ModulePermutation(options, spirv, std::move(module->program), std::move(specialization)));
 		source.prefetched.erase(module);
@@ -704,9 +729,9 @@ struct PipelineCache::ProgramCache {
 		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 		                     "create recompiled shader module");
 		EXIT_IF(module == nullptr);
-		if (PipelineKeyLog()) {
-			NotePipelineKeyModule(module, options.shader_hash,
-			                      XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t)));
+		if (ModuleSpirvHashesRecorded()) {
+			NotePipelineKeyModule(module, options.shader_hash, XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t)),
+			                      spirv.size() * sizeof(uint32_t));
 		}
 		SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
 		                     options.shader_hash);
@@ -979,8 +1004,14 @@ struct PipelineCache::ProgramCache {
 				group->plan.reset();
 			}
 		}
+		// (KYTY_PIPELINE_SOURCE_LOG: a PROGSRC line per permutation made here - adopted from the prefetch or translated -
+		// with its time.)
+		const auto source_begin = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		bool       translated_here = false;
+		double     translate_ms    = 0.0;
 		if (entry == programs.end() ||
 		    AdoptPrefetchedModule(entry->second, options, specialization, push_data_cursor) == nullptr) {
+			translated_here = true;
 			// With the slow-call log: the translation's specialization-independent part (front) and
 			// whether the program had other permutations already.
 			const bool known_program = entry != programs.end();
@@ -1000,6 +1031,7 @@ struct PipelineCache::ProgramCache {
 			}
 			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
+			translate_ms = front_ms;
 			if (entry == programs.end()) {
 				auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 				if (!ReportMaterialization(label, stage, params.hash, report,
@@ -1024,6 +1056,10 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		const auto& permutation = entry->second.permutations.back();
+		if (PipelineSourceLog())
+			std::printf("PROGSRC %s hash=%016llx translated=%d translate_ms=%.1f ms=%.1f\n", label,
+			            static_cast<unsigned long long>(params.hash), translated_here ? 1 : 0, translate_ms,
+			            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - source_begin).count());
 		if (warmup.Enabled()) {
 			LocalShaderWarmup::Record record;
 			record.stage = stage;
@@ -1516,9 +1552,12 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			}
 		}
 		// The recorded pipelines (15K, most of other areas) cost ~1 GiB of video memory and ~3 GiB of RAM (5 GiB
-		// committed): a GPU that cannot also hold the game's working set (small_video_memory), or a PC with less RAM
-		// than the ~20 GB the game takes while it loads, makes them when they are first used (~0.75 ms each from the
-		// static precompile's binaries). Such a PC records the shaders but translates none at start-up either: their
+		// committed): a GPU that cannot also hold the game's working set (small_video_memory) makes the graphics ones
+		// (almost no video memory) and the compute ones it met most recently up to 1/16 of its video memory (a laptop's
+		// 8 GB RTX 3080: making them when first used, 2-3.6 ms each, held up walks for 150-900 ms at a new view), the
+		// rest when they are first used (WarmPipelines). A PC with less RAM than the ~20 GB the game takes while it
+		// loads makes none at start-up (~0.75 ms each from the static precompile's binaries when first used). Such a
+		// PC records the shaders but translates none at start-up either: their
 		// SPIR-V and modules took 3.1 GiB of RAM, and the shader prefetch translates every shader of the game in the
 		// background anyway (16 GB reported at 1-1: +76 MiB instead of +3181, the HUD 10 s sooner, the same 59-60 fps
 		// and one slow shader translation).
@@ -1533,19 +1572,22 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		const auto video_before = m_graphics.GetDeviceMemoryUsage();
 		m_program_cache->Warm(path, title + device, compile_shaders, adopt_from);
 		const auto memory_shaders = LocalPlatform::ProcessMemory();
-		// KYTY_PIPELINE_WARMUP=0 skips them (made at first use from the static precompile's binaries).
-		static const bool warmup_off = [] {
-			const char* value = std::getenv("KYTY_PIPELINE_WARMUP");
-			return value != nullptr && std::string_view(value) == "0";
-		}();
-		// (Skipping them under the 8 GiB cap saved no video memory at Boletaria and made a 228 ms first use.)
-		const bool warm_pipelines = !m_graphics.small_video_memory && !low_ram && !warmup_off;
+		// KYTY_PIPELINE_WARMUP: 1 makes them all whatever the memory, 0 none; KYTY_PIPELINE_WARMUP_VIDEO_MIB: the compute
+		// pipelines' video memory cap instead of 1/16 of a small one's.
+		const char*            forced = std::getenv("KYTY_PIPELINE_WARMUP");
+		const std::string_view force  = forced != nullptr ? forced : "";
+		const bool             warm_pipelines = force == "1" || (force != "0" && !low_ram);
+		const char*            cap            = std::getenv("KYTY_PIPELINE_WARMUP_VIDEO_MIB");
+		const uint64_t         compute_video  = cap != nullptr && *cap != 0 ? std::strtoull(cap, nullptr, 10) << 20u
+		                                        : force != "1" && m_graphics.small_video_memory
+		                                            ? m_graphics.GetTotalMemoryBudget() / 16u
+		                                            : UINT64_MAX;
 		if (!warm_pipelines && std::string_view(warmup) == "1")
 			PipelineCacheLog("Pipeline warmup: skipped (video memory budget {} MiB, RAM {} MiB)",
 			                 m_graphics.GetTotalMemoryBudget() >> 20u, ram >> 20u);
 		if (std::string_view(warmup) == "1" && warm_pipelines) {
 			const auto begin = std::chrono::steady_clock::now();
-			WarmPipelines();
+			WarmPipelines(compute_video);
 			// What the driver had to compile is kept at once: the cache is otherwise written only
 			// at a normal exit, so after a crash the next launch compiled it all again (2+ minutes).
 			if (std::chrono::steady_clock::now() - begin > std::chrono::seconds(5)) (void)Save();
@@ -1595,7 +1637,7 @@ PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
 	return {std::min(prefetch->finished.load(std::memory_order_relaxed), total), total};
 }
 
-void PipelineCache::WarmPipelines() {
+void PipelineCache::WarmPipelines(uint64_t compute_video) {
 	auto& programs = *m_program_cache;
 	const auto begin = std::chrono::steady_clock::now();
 	const auto get = [&](uint32_t index) -> ProgramCache::Permutation* {
@@ -1618,7 +1660,10 @@ void PipelineCache::WarmPipelines() {
 	std::vector<Job> jobs;
 	jobs.reserve(programs.warmup.pipelines.size());
 	std::atomic<size_t> skipped {0};
-	for (const auto& words: programs.warmup.pipelines) {
+	// The most recently recorded first (the area played last, likely the one the save is in): what a video memory cap
+	// for compute pipelines leaves out are the oldest.
+	for (auto recorded = programs.warmup.pipelines.rbegin(); recorded != programs.warmup.pipelines.rend(); ++recorded) {
+		const auto& words = *recorded;
 		Job job;
 		LocalShaderWarmup::Reader reader {words};
 		if (!LocalShaderWarmup::VisitPipeline(reader, job.recipe)) { ++skipped; continue; }
@@ -1643,16 +1688,26 @@ void PipelineCache::WarmPipelines() {
 		jobs.push_back(std::move(job));
 	}
 
-	std::atomic<size_t> next {0}, compiled {0};
+	std::atomic<size_t> next {0}, compiled {0}, computes {0}, left {0};
+	// Compute pipelines while the warmup's video memory stays under `compute_video` (checked every 32 of them).
+	m_graphics.RefreshMemoryBudget();
+	const uint64_t    video_start = m_graphics.GetDeviceMemoryUsage();
+	std::atomic<bool> compute_full {false};
 	const auto work = [&] {
 		for (size_t n; (n = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();) {
 			if (std::chrono::steady_clock::now() >= programs.warm_deadline) return;
 			auto& job = jobs[n];
 			if (job.compute) {
+				if (compute_full.load(std::memory_order_relaxed)) { ++left; continue; }
 				LocalShaderWarmup::Record input;
 				if (!decode(job.recipe.compute, input)) { ++skipped; continue; }
 				input.compute.stage.program = &job.compute->program;
 				CreatePipelineInternal(m_graphics, *job.pipeline, input.compute, job.compute->handle.module, m_driver_cache);
+				if (compute_video != UINT64_MAX && (computes.fetch_add(1, std::memory_order_relaxed) + 1) % 32 == 0) {
+					m_graphics.RefreshMemoryBudget();
+					const auto video = m_graphics.GetDeviceMemoryUsage();
+					if (video > video_start && video - video_start >= compute_video) compute_full.store(true);
+				}
 			} else {
 				LocalShaderWarmup::Record vs, ps;
 				if (!decode(job.recipe.vertex, vs) || (job.pixel && !decode(job.recipe.pixel, ps))) { ++skipped; continue; }
@@ -1674,7 +1729,7 @@ void PipelineCache::WarmPipelines() {
 		for (uint32_t t = 1; t < threads; ++t) pool.emplace_back(work);
 		work();
 	}
-	// Past the deadline, or with an undecodable input, an entry stays empty.
+	// Past the deadline, past the compute cap, or with an undecodable input, an entry stays empty.
 	std::erase_if(m_compute_pipelines, [](const auto& entry) { return entry.second->pipeline == nullptr; });
 	std::erase_if(m_graphics_pipelines, [](const auto& entry) { return entry.second->pipeline == nullptr; });
 	programs.warm_permutations.clear();
@@ -1682,6 +1737,9 @@ void PipelineCache::WarmPipelines() {
 		compiled.load(), programs.warmup.pipelines.size(), skipped.load(),
 		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(),
 		threads);
+	if (compute_video != UINT64_MAX)
+		PipelineCacheLog("Pipeline warmup: compute pipelines up to {} MiB of video memory, {} older ones made when first used",
+		                 compute_video >> 20u, left.load());
 }
 
 PipelineCache::~PipelineCache() {
@@ -1694,13 +1752,14 @@ PipelineCache::~PipelineCache() {
 				m_graphics.device.destroyPipeline(pipeline->optimized->pipeline, nullptr);
 			}
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
-			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
-			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
 		}
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	// (The pipelines' layouts are shared: once all of them are gone.)
+	DestroySharedLayouts(m_graphics.device);
 	m_graphics.pipeline_binaries = nullptr;
+	m_graphics.pipeline_blobs    = nullptr;
 	for (const auto pipeline: m_replaced_pipelines) {
 		m_graphics.device.destroyPipeline(pipeline, nullptr);
 	}
@@ -1736,6 +1795,56 @@ static std::string StaticBinariesSignature(GraphicContext& graphics) {
 	return PipelineBinaries::Signature(graphics.device, ShaderInputDeviceSignature(graphics.GetPhysicalDeviceProperties()));
 }
 
+// Without pipeline binaries: each pipeline's own pipeline cache data (pipelineCacheBlobs.h), read when it is needed,
+// in place of the static pipeline cache, which the driver copies into memory whole. KYTY_STATIC_BLOBS=0: the cache.
+static bool StaticBlobsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STATIC_BLOBS");
+		return !(value != nullptr && std::string_view(value) == "0");
+	}();
+	return enabled;
+}
+
+static std::filesystem::path StaticBlobsPath() {
+	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".blobs");
+}
+
+static std::string StaticBlobsSignature(const vk::PhysicalDeviceProperties& properties) {
+	return "KytyPCBlobs1" + ShaderInputDeviceSignature(properties);
+}
+
+// KYTY_STATIC_BLOBS_FROM_CACHE=1 (the precompile): blobs made of the static pipeline cache's pipelines (loaded as a
+// source), compiled only where the driver cannot give them otherwise.
+static bool StaticBlobsFromCache() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_STATIC_BLOBS_FROM_CACHE");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return on;
+}
+
+// A static pipeline cache of this GPU and driver exists (its file begins with their signature).
+static bool StaticCacheFileMatches(const vk::PhysicalDeviceProperties& properties) {
+	const auto    signature = StaticCacheSignature(properties);
+	std::ifstream file(StaticCachePath(), std::ios::binary);
+	std::string   saved(signature.size(), '\0');
+	return file.read(saved.data(), static_cast<std::streamsize>(saved.size())) && saved == signature;
+}
+
+// Whether this PC's static precompile is pipeline cache blobs: without pipeline binaries, unless a static pipeline cache
+// of this GPU and driver was made before them (no blobs beside it). That one stays in use, and a precompile adds to it as
+// it did: a cache made once is never made again for the blobs, which come with the next cache made from nothing (a new
+// install, a driver update). Decided once per process.
+static bool StaticBlobsMode(GraphicContext& graphics) {
+	if (graphics.pipeline_binaries_enabled || !StaticBlobsEnabled()) return false;
+	static const bool mode = [&] {
+		std::error_code error;
+		return std::filesystem::exists(StaticBlobsPath(), error) || StaticBlobsFromCache() ||
+		       !StaticCacheFileMatches(graphics.GetPhysicalDeviceProperties());
+	}();
+	return mode;
+}
+
 // A pipeline cache file (signature, XXH3 of the payload, payload): the payload, or nothing when the
 // file is missing, damaged or from another GPU or driver.
 static std::vector<uint8_t> ReadPipelineCacheFile(const std::filesystem::path& path, const std::string& signature) {
@@ -1761,7 +1870,33 @@ void PipelineCache::InitializeStaticCache(bool create) {
 	    std::string_view(value) == "0")
 		return;
 	const auto begin = std::chrono::steady_clock::now();
-	if (m_static_binaries != nullptr) return;
+	if (m_static_binaries != nullptr || m_static_blobs != nullptr) return;
+	if (StaticBlobsMode(m_graphics)) {
+		RecordModuleSpirvHashes();
+		m_static_blobs = PipelineCacheBlobs::Open(StaticBlobsPath(), StaticBlobsSignature(m_graphics.GetPhysicalDeviceProperties()));
+		if (m_static_blobs != nullptr) {
+			m_graphics.pipeline_blobs = m_static_blobs.get();
+			PipelineCacheLog("Static pipeline blobs: {} pipelines, {} MiB in {} ({} ms)", m_static_blobs->Pipelines(),
+			                 m_static_blobs->DataBytes() >> 20u, Common::PathToString(StaticBlobsPath()),
+			                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
+			                     .count());
+#ifdef KYTY_STATIC_PRECOMPILE
+			// A conversion (StaticBlobsFromCache) takes what the blobs lack from the static pipeline cache too.
+			if (!StaticBlobsFromCache()) return;
+			create = false;
+#else
+			return;
+#endif
+		}
+		// None yet: the precompile makes them (and loads no static cache: every shard process would hold one whole,
+		// unless it converts one: StaticBlobsFromCache); the emulator takes a static cache from before them.
+#ifdef KYTY_STATIC_PRECOMPILE
+		if (!StaticBlobsFromCache()) return;
+		create = false;
+#else
+		if (create) return;
+#endif
+	}
 	if (m_graphics.pipeline_binaries_enabled) {
 		m_static_binaries = PipelineBinaries::Open(m_graphics.device, StaticBinariesPath(), StaticBinariesSignature(m_graphics));
 		if (m_static_binaries != nullptr) {

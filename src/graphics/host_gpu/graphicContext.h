@@ -17,6 +17,8 @@ namespace Libs::Graphics {
 struct VulkanImage;
 class PipelineBinaries;
 class PipelineBinaryWriter;
+class PipelineCacheBlobs;
+class PipelineCacheBlobWriter;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
@@ -55,6 +57,10 @@ struct GraphicContext {
 	bool                               pipeline_binary_internal_cache        = true;
 	const PipelineBinaries*            pipeline_binaries                     = nullptr;
 	PipelineBinaryWriter*              pipeline_binary_writer                = nullptr;
+	// Without pipeline binaries: the static precompile's pipelines as each one's own pipeline cache data, keyed by
+	// its identity (pipelineCacheBlobs.h); in the precompile, its output.
+	const PipelineCacheBlobs*          pipeline_blobs                        = nullptr;
+	PipelineCacheBlobWriter*           pipeline_blob_writer                  = nullptr;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
@@ -155,6 +161,9 @@ struct GraphicContext {
 	// A budget under 12 GiB (CreateAllocator): less than the game's working set (Boletaria ~11 GB). Textures yield video
 	// memory to render targets and buffers (CreateImage); the pipeline warmup leaves its pipelines to first use.
 	bool                          small_video_memory = false;
+	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue
+	// (MemoryUsage::SparseDeviceLocal).
+	bool                          sparse_residency_buffers = false;
 	// An image only sampled and copied (CreateImage places these apart on such a GPU).
 	[[nodiscard]] static bool     IsTextureUsage(vk::ImageUsageFlags usage) {
 		return !(usage & (vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eDepthStencilAttachment |
