@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 
 #include "common/abi.h"
+#include <source_location>
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
@@ -133,7 +134,7 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
-	void                      FreeImage(ImageId id);
+	void                      FreeImage(ImageId id, std::source_location where = std::source_location::current());
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);

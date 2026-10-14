@@ -402,9 +402,54 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 }
 
-void TextureCache::FreeImage(ImageId id) {
+// KYTY_IMAGE_STATS also prints the source lines that free images ("Image frees (5 s)"), with how
+// many still held GPU-written contents the free discarded.
+static void NoteImageFree(const std::source_location& where, bool gpu_modified) {
+	static auto& stats = Common::LiveSwitches::Get("KYTY_IMAGE_STATS", 0);
+	if (stats.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	static std::mutex                                               mutex;
+	static std::map<uint32_t, std::pair<uint64_t, uint64_t>>        sites;
+	static auto report = std::chrono::steady_clock::now();
+	std::lock_guard lock(mutex);
+	auto& e = sites[where.line()];
+	e.first++;
+	e.second += gpu_modified ? 1 : 0;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - report >= std::chrono::seconds(5)) {
+		report = now;
+		::printf("Image frees (5 s) by textureCache.cpp line:");
+		for (const auto& [line, v]: sites) {
+			::printf(" %u:%llu(gpu %llu)", line, static_cast<unsigned long long>(v.first),
+			         static_cast<unsigned long long>(v.second));
+		}
+		::printf("\n");
+		std::fflush(stdout);
+		sites.clear();
+	}
+}
+
+// Research: KYTY_FREE_WRITEBACK (live, default 0). Freeing an image the GPU wrote dropped its
+// contents: guest memory kept the bytes from before, and the next image created over the range
+// (another format/size the game aliases there) read those. On the console the memory holds what
+// the GPU wrote. 1 writes the contents back to guest memory first (asynchronous download);
+// 2 also waits for that download, so an image created next uploads the final bytes.
+void TextureCache::FreeImage(ImageId id, std::source_location where) {
 	auto& image = m_slot_images[id];
-	if (image.IsGpuModified()) {
+	const bool gpu_modified = image.IsGpuModified();
+	NoteImageFree(where, gpu_modified);
+	if (gpu_modified) {
+		static auto& writeback = Common::LiveSwitches::Get("KYTY_FREE_WRITEBACK", 0);
+		const auto   mode      = writeback.load(std::memory_order_relaxed);
+		if (mode != 0 && m_scheduler.Active() && DownloadImageMemory(id)) {
+			if (mode >= 2) {
+				const auto tick = m_scheduler.CurrentTick();
+				m_scheduler.Flush();
+				m_scheduler.Wait(tick);
+				m_scheduler.WaitPriorityOperations(tick);
+			}
+		}
 		image.ClearGpuModified();
 	}
 	DeleteImage(id);
