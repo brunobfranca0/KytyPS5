@@ -1,3 +1,4 @@
+#include "graphics/drawDiff.h"
 #include "graphics/frameCosts.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 
@@ -1899,6 +1900,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 // GPU thread once per guest flip. If fps falls by about N us per frame this thread is on the
 // critical path and cutting its work raises fps; if fps barely moves, it is not the bottleneck.
 static void ProbeFlipDelay() {
+	DrawDiff::EndFrame();
 	static auto& probe_us = Common::LiveSwitches::Get("KYTY_PROBE_FLIP_US", 0);
 	const auto   us       = probe_us.load(std::memory_order_relaxed);
 	if (us <= 0) {

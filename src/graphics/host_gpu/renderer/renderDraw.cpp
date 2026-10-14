@@ -1,3 +1,4 @@
+#include "graphics/drawDiff.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -1355,6 +1356,17 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 			}
 		}
 		vk_buffer.shaderTimeBegin(time_hash, false);
+	}
+	if (DrawDiff::Enabled()) {
+		uint64_t vs_hash = 0;
+		for (const auto* stage: stages) {
+			if (stage->runtime != nullptr && *stage->runtime &&
+			    stage->runtime->program->stage != ShaderType::Pixel && vs_hash == 0) {
+				vs_hash = stage->runtime->program->shader_hash;
+			}
+		}
+		DrawDiff::Note(vs_hash, ps_hash, draw.index_count, draw.instance_count,
+		               indirect_buffer != nullptr ? 1u : 0u);
 	}
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);

@@ -1,3 +1,4 @@
+#include "graphics/drawDiff.h"
 #include "graphics/frameCosts.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
@@ -885,6 +886,7 @@ struct PipelineCache::ProgramCache {
 				if (!ShaderFailureNonFatal()) {
 					EXIT("shader resource materialization failed\n");
 				}
+				DrawDiff::NoteSkip(params.hash, "resource materialization failed");
 				static std::atomic<uint32_t> reported = 0;
 				if (reported.fetch_add(1) < 16) {
 					LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
@@ -999,6 +1001,7 @@ struct PipelineCache::ProgramCache {
 				if (!ShaderFailureNonFatal()) {
 					EXIT("shader resource materialization failed\n");
 				}
+				DrawDiff::NoteSkip(params.hash, "resource materialization failed");
 				static std::atomic<uint32_t> reported = 0;
 				if (reported.fetch_add(1) < 16) {
 					LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64

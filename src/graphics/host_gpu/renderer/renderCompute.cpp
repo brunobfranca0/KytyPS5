@@ -1,3 +1,4 @@
+#include "graphics/drawDiff.h"
 #include "common/liveSwitches.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -584,6 +585,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (shader_time) {
 			vk_buffer.shaderTimeBegin(program.shader_hash, true);
 		}
+		DrawDiff::Note(program.shader_hash, 0, thread_group_x * thread_group_y * thread_group_z, 0, 2);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		if (shader_time) {
 			vk_buffer.shaderTimeEnd();
@@ -691,6 +693,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (shader_time) {
 			vk_buffer.shaderTimeBegin(program.shader_hash, true);
 		}
+		DrawDiff::Note(program.shader_hash, 0, 0, 0, 3);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 		if (shader_time) {
 			vk_buffer.shaderTimeEnd();
