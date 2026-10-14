@@ -16,6 +16,7 @@ void RegisterCurrentThread(const char* /*name*/) {}
 #define NOMINMAX
 #endif
 #include <windows.h> // IWYU pragma: keep
+#include <tlhelp32.h>
 
 #include "common/liveSwitches.h"
 
@@ -316,6 +317,89 @@ void SamplerThread() {
 	}
 }
 
+// KYTY_CPU_LOAD=1 (live, default 0): every 5 s prints the CPU use of the busiest threads of the
+// process (user+kernel time from GetThreadTimes over wall time; 100% = one full core) with their
+// names. A thread near 100% is a serial bottleneck; if none is, the frame waits on the GPU or on
+// synchronization. Costs nothing while off (one relaxed load every 200 ms).
+void CpuLoadThread() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_CPU_LOAD", 0);
+	std::unordered_map<DWORD, uint64_t> last; // thread id -> 100 ns CPU time
+	auto                               last_time = std::chrono::steady_clock::now();
+	bool                               primed    = false;
+	const DWORD                        pid       = GetCurrentProcessId();
+	for (;;) {
+		if (on.load(std::memory_order_relaxed) == 0) {
+			primed = false;
+			last.clear();
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+			continue;
+		}
+		const auto now  = std::chrono::steady_clock::now();
+		const double wall_100ns = std::chrono::duration<double>(now - last_time).count() * 1e7;
+		last_time = now;
+		std::vector<std::pair<double, std::string>> rows;
+		std::unordered_map<DWORD, uint64_t>         cur;
+		double                                      total = 0.0;
+		HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+		if (snap != INVALID_HANDLE_VALUE) {
+			THREADENTRY32 te {};
+			te.dwSize = sizeof(te);
+			for (BOOL ok = Thread32First(snap, &te); ok != 0; ok = Thread32Next(snap, &te)) {
+				if (te.th32OwnerProcessID != pid) {
+					continue;
+				}
+				HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+				if (h == nullptr) {
+					continue;
+				}
+				FILETIME c {}, e {}, k {}, u {};
+				if (GetThreadTimes(h, &c, &e, &k, &u) != 0) {
+					const uint64_t t = (static_cast<uint64_t>(k.dwHighDateTime) << 32u | k.dwLowDateTime) +
+					                   (static_cast<uint64_t>(u.dwHighDateTime) << 32u | u.dwLowDateTime);
+					cur[te.th32ThreadID] = t;
+					auto it = last.find(te.th32ThreadID);
+					if (primed && it != last.end() && wall_100ns > 0.0) {
+						const double pct = 100.0 * static_cast<double>(t - it->second) / wall_100ns;
+						total += pct;
+						if (pct >= 3.0) {
+							std::string name = "tid " + std::to_string(te.th32ThreadID);
+							PWSTR desc = nullptr;
+							if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc != nullptr) {
+								if (desc[0] != 0) {
+									char buf[128] {};
+									WideCharToMultiByte(CP_UTF8, 0, desc, -1, buf, sizeof(buf) - 1, nullptr, nullptr);
+									name = buf;
+								}
+								LocalFree(desc);
+							}
+							std::lock_guard lock(g_mutex);
+							for (const auto& tg: g_targets) {
+								if (tg.id == te.th32ThreadID) {
+									name = tg.name;
+								}
+							}
+							rows.emplace_back(pct, name);
+						}
+					}
+				}
+				CloseHandle(h);
+			}
+			CloseHandle(snap);
+		}
+		if (primed) {
+			std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+			::printf("CPU load (5 s): process %.0f%% of one core; busiest threads:\n", total);
+			for (size_t i = 0; i < rows.size() && i < 12; i++) {
+				::printf("  %5.1f%%  %s\n", rows[i].first, rows[i].second.c_str());
+			}
+			::fflush(stdout);
+		}
+		last   = std::move(cur);
+		primed = true;
+		std::this_thread::sleep_for(std::chrono::seconds(5));
+	}
+}
+
 void Start() {
 	auto* base   = reinterpret_cast<const uint8_t*>(GetModuleHandleA(nullptr));
 	g_image_base = reinterpret_cast<uintptr_t>(base);
@@ -324,6 +408,7 @@ void Start() {
 	g_image_end     = g_image_base + nt->OptionalHeader.SizeOfImage;
 	g_stack = static_cast<uint8_t*>(VirtualAlloc(nullptr, kStackCopyMax + kStackSlack, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
 	std::thread(SamplerThread).detach();
+	std::thread(CpuLoadThread).detach();
 }
 
 } // namespace

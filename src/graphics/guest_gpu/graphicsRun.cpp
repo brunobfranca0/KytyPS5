@@ -1895,7 +1895,22 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	}
 }
 
+// Causality probe (method step 3): KYTY_PROBE_FLIP_US=N (live, default 0) busy-spins N us on the
+// GPU thread once per guest flip. If fps falls by about N us per frame this thread is on the
+// critical path and cutting its work raises fps; if fps barely moves, it is not the bottleneck.
+static void ProbeFlipDelay() {
+	static auto& probe_us = Common::LiveSwitches::Get("KYTY_PROBE_FLIP_US", 0);
+	const auto   us       = probe_us.load(std::memory_order_relaxed);
+	if (us <= 0) {
+		return;
+	}
+	const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+	while (std::chrono::steady_clock::now() < end) {
+	}
+}
+
 void CommandProcessor::Flip() {
+	ProbeFlipDelay();
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
@@ -1909,6 +1924,7 @@ void CommandProcessor::Flip() {
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
+	ProbeFlipDelay();
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
@@ -1933,6 +1949,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 
 void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action,
                                          void* dst_gpu_addr, uint32_t value) {
+	ProbeFlipDelay();
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
@@ -1961,6 +1978,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
+	ProbeFlipDelay();
 	auto& command = CurrentBuffer();
 	if (g_current_processor != nullptr) {
 		EXIT("invalid graphics-thread CPU flip preparation\n");

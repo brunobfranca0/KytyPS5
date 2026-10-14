@@ -3208,6 +3208,14 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	{
+		// Named host threads let KYTY_CPU_LOAD (and debuggers) show which guest thread is busy.
+		wchar_t wide[64] {};
+		MultiByteToWideChar(CP_UTF8, 0, thread->name.c_str(), -1, wide, 63);
+		SetThreadDescription(GetCurrentThread(), wide);
+	}
+#endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
