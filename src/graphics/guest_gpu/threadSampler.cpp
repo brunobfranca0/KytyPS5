@@ -45,6 +45,7 @@ struct Target {
 	std::unordered_map<uint64_t, uint64_t>       rips;    // exe offset -> count
 	std::unordered_map<std::string, uint64_t>    outside; // module name -> count
 	std::unordered_map<uint64_t, uint64_t>       callers; // CallerKey(first exe caller, module id) -> count
+	std::unordered_map<std::string, uint64_t>    chains;  // "module|exe+a<exe+b<..." (up to 4 exe frames) -> count
 };
 
 std::mutex          g_mutex; // NOLINT
@@ -109,7 +110,8 @@ DWORD64* IntReg(CONTEXT& c, unsigned reg) {
 
 // Walks the copied stack from ctx (registers of the sampled thread at the sample) and returns the
 // exe offset of the first frame inside the exe image, or kNoCaller.
-uint64_t FirstExeCaller(const CONTEXT& sampled, uintptr_t orig_rsp, size_t copied) {
+uint64_t FirstExeCaller(const CONTEXT& sampled, uintptr_t orig_rsp, size_t copied, uint64_t* chain = nullptr,
+                        int* chain_len = nullptr, int chain_max = 0) {
 	const auto buf     = reinterpret_cast<uintptr_t>(g_stack);
 	const auto buf_end = buf + copied;
 	// Rebase every stack-pointing qword (saved Rbp chains etc.) and register into the copy.
@@ -163,8 +165,17 @@ uint64_t FirstExeCaller(const CONTEXT& sampled, uintptr_t orig_rsp, size_t copie
 		}
 		const auto rip = static_cast<uintptr_t>(ctx.Rip);
 		if (rip >= g_image_base && rip < g_image_end) {
-			return rip - g_image_base;
+			if (chain == nullptr) {
+				return rip - g_image_base;
+			}
+			chain[(*chain_len)++] = rip - g_image_base;
+			if (*chain_len >= chain_max) {
+				break;
+			}
 		}
+	}
+	if (chain != nullptr && *chain_len > 0) {
+		return chain[0];
 	}
 	return kNoCaller;
 }
@@ -239,11 +250,17 @@ void Print(Target& t) {
 				::printf("  %5.2f%%  exe+0x%" PRIx64 "  [%s]\n", pct, off, mod);
 			}
 		}
+		auto chains = Sorted(t.chains);
+		::printf("  by call chain (sample frame < its callers):\n");
+		for (size_t i = 0; i < chains.size() && i < 30; i++) {
+			::printf("  %5.2f%%  %s\n", 100.0 * static_cast<double>(chains[i].second) / total, chains[i].first.c_str());
+		}
 	}
 	t.samples = 0;
 	t.rips.clear();
 	t.outside.clear();
 	t.callers.clear();
+	t.chains.clear();
 }
 
 void SamplerThread() {
@@ -277,7 +294,7 @@ void SamplerThread() {
 				const auto   rip    = static_cast<uintptr_t>(ctx.Rip);
 				const bool   in_exe = rip >= g_image_base && rip < g_image_end;
 				// While suspended: only syscalls and memcpy, no heap or loader locks.
-				const size_t copied = (ok != 0 && !in_exe) ? CopyStack(static_cast<uintptr_t>(ctx.Rsp)) : 0;
+				const size_t copied = ok != 0 ? CopyStack(static_cast<uintptr_t>(ctx.Rsp)) : 0;
 				ResumeThread(t.handle);
 				if (ok == 0) {
 					continue;
@@ -304,6 +321,24 @@ void SamplerThread() {
 					}
 				}
 				t.callers[CallerKey(caller, module_id)]++;
+				{
+					// Call chain: the sample's exe frame (if any) plus the exe frames above it.
+					uint64_t chain[4] {};
+					int      len = 0;
+					if (in_exe) {
+						chain[len++] = rip - g_image_base;
+					}
+					if (copied != 0) {
+						FirstExeCaller(ctx, static_cast<uintptr_t>(ctx.Rsp), copied, chain, &len, 4);
+					}
+					std::string key = g_module_names[module_id] + "|";
+					char        buf[24];
+					for (int i = 0; i < len; i++) {
+						std::snprintf(buf, sizeof(buf), "%sexe+0x%" PRIx64, i == 0 ? "" : "<", chain[i]);
+						key += buf;
+					}
+					t.chains[key]++;
+				}
 			}
 			if (now - report_time >= std::chrono::seconds(5)) {
 				report_time = now;
