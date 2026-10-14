@@ -1523,22 +1523,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				// the GPU wrote since is newer (the overlapping images are not GPU-modified): those
 				// bytes, not guest memory, are current. Wolverine re-creates its R8 416x234 image
 				// over an RGBA8 832x468 one up to 3 times a frame; 200 of 309 read stale memory.
-				for (const auto candidate: candidates) {
-					const auto* owner = m_slot_images.try_get(candidate);
-					if (owner == nullptr) {
-						continue;
-					}
-					const auto it = m_written_back.find(owner->info.data.address);
-					if (it != m_written_back.end() && DrawDiff::Frame() - it->second <= 2) {
-						inserted.MarkBufferModified();
-						break;
-					}
-				}
-				if (!inserted.IsBufferModified()) {
-					const auto it = m_written_back.find(inserted.info.data.address);
-					if (it != m_written_back.end() && DrawDiff::Frame() - it->second <= 2) {
-						inserted.MarkBufferModified();
-					}
+				// Only an image at the very address written back, of a real color format: forcing
+				// an upload for any overlapping image hit formats the upload path refuses (build
+				// 4f7b4bf: fmt=0 1024x1024 linear, fatal).
+				const auto it = m_written_back.find(inserted.info.data.address);
+				if (it != m_written_back.end() && DrawDiff::Frame() - it->second <= 2 &&
+				    inserted.info.pixel_format != vk::Format::eUndefined && !inserted.info.IsDepth() &&
+				    inserted.info.IsTiled()) {
+					inserted.MarkBufferModified();
 				}
 			}
 		}
