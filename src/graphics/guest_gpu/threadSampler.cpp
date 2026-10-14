@@ -43,6 +43,7 @@ struct Target {
 	uint64_t                                     samples = 0;
 	std::unordered_map<uint64_t, uint64_t>       rips;    // exe offset -> count
 	std::unordered_map<std::string, uint64_t>    outside; // module name -> count
+	std::unordered_map<uint64_t, uint64_t>       callers; // CallerKey(first exe caller, module id) -> count
 };
 
 std::mutex          g_mutex; // NOLINT
@@ -53,6 +54,119 @@ uintptr_t g_image_base = 0;
 uintptr_t g_image_end  = 0;
 
 std::unordered_map<uintptr_t, std::string> g_page_modules; // NOLINT, sampler thread only
+
+// Module ids for the "by first exe caller" table (sampler thread only). Id 0 is "exe".
+std::vector<std::string>                     g_module_names {"exe"}; // NOLINT
+std::unordered_map<std::string, uint32_t>    g_module_ids {{"exe", 0}}; // NOLINT
+
+constexpr uint64_t kNoCaller = (uint64_t(1) << 48u) - 1; // no exe frame found within the walk limit
+constexpr int      kMaxFrames = 32;
+
+uint64_t CallerKey(uint64_t exe_offset, uint32_t module_id) {
+	return (exe_offset << 16u) | module_id;
+}
+
+// Stack copy for unwinding. The stack is copied while the target is suspended (no user-mode
+// locks: VirtualQuery/ReadProcessMemory are plain syscalls), then the thread is resumed and the
+// copy is walked. Walking the live stack of a running thread races with it, and walking while it
+// is suspended can deadlock inside RtlLookupFunctionEntry if the target holds the function table
+// lock. g_stack has kStackSlack bytes after the copied part so an unwinder read slightly past the
+// copy (large frame allocation in a bogus frame) still hits mapped memory.
+constexpr size_t kStackCopyMax = size_t(512) * 1024;
+constexpr size_t kStackSlack   = size_t(1024) * 1024;
+uint8_t*         g_stack       = nullptr; // NOLINT
+
+// Copies [rsp, end of rsp's committed region) (capped) into g_stack. Returns copied size or 0.
+size_t CopyStack(uintptr_t rsp) {
+	if (g_stack == nullptr || rsp == 0) {
+		return 0;
+	}
+	MEMORY_BASIC_INFORMATION mbi {};
+	if (VirtualQuery(reinterpret_cast<LPCVOID>(rsp), &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+	    (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
+	    (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+	                    PAGE_EXECUTE_WRITECOPY)) == 0) {
+		return 0;
+	}
+	const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+	size_t          size       = std::min(static_cast<size_t>(region_end - rsp), kStackCopyMax);
+	size &= ~static_cast<size_t>(7);
+	SIZE_T read = 0;
+	if (size == 0 ||
+	    ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(rsp), g_stack, size, &read) == 0 ||
+	    read != size) {
+		return 0;
+	}
+	return size;
+}
+
+DWORD64* IntReg(CONTEXT& c, unsigned reg) {
+	DWORD64* const regs[16] = {&c.Rax, &c.Rcx, &c.Rdx, &c.Rbx, &c.Rsp, &c.Rbp, &c.Rsi, &c.Rdi,
+	                           &c.R8,  &c.R9,  &c.R10, &c.R11, &c.R12, &c.R13, &c.R14, &c.R15};
+	return regs[reg & 15u];
+}
+
+// Walks the copied stack from ctx (registers of the sampled thread at the sample) and returns the
+// exe offset of the first frame inside the exe image, or kNoCaller.
+uint64_t FirstExeCaller(const CONTEXT& sampled, uintptr_t orig_rsp, size_t copied) {
+	const auto buf     = reinterpret_cast<uintptr_t>(g_stack);
+	const auto buf_end = buf + copied;
+	// Rebase every stack-pointing qword (saved Rbp chains etc.) and register into the copy.
+	auto rebase = [&](DWORD64 v) -> DWORD64 {
+		return (v >= orig_rsp && v < orig_rsp + copied) ? v - orig_rsp + buf : v;
+	};
+	for (size_t i = 0; i < copied; i += 8) {
+		DWORD64 v = 0;
+		std::memcpy(&v, g_stack + i, 8);
+		const DWORD64 r = rebase(v);
+		if (r != v) {
+			std::memcpy(g_stack + i, &r, 8);
+		}
+	}
+	CONTEXT ctx = sampled;
+	for (unsigned reg = 0; reg < 16; reg++) {
+		DWORD64* p = IntReg(ctx, reg);
+		*p         = rebase(*p);
+	}
+	auto in_buf = [&](DWORD64 v, size_t bytes) { return v >= buf && v + bytes <= buf_end; };
+
+	for (int frame = 0; frame < kMaxFrames; frame++) {
+		const DWORD64 rsp = ctx.Rsp;
+		if (!in_buf(rsp, 8)) {
+			break;
+		}
+		DWORD64 image_base = 0;
+		auto*   fn         = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+		if (fn == nullptr) {
+			// Leaf (or code without unwind info): return address is at [Rsp].
+			std::memcpy(&ctx.Rip, reinterpret_cast<const void*>(rsp), 8);
+			ctx.Rsp = rsp + 8;
+		} else {
+			// If the function uses a frame register, the unwinder reads memory relative to it:
+			// only proceed when it points into the copy.
+			const RUNTIME_FUNCTION* primary = fn;
+			if ((primary->UnwindData & 1u) != 0) {
+				primary = reinterpret_cast<const RUNTIME_FUNCTION*>(image_base + (primary->UnwindData & ~DWORD(1)));
+			}
+			const auto* unwind_info = reinterpret_cast<const uint8_t*>(image_base + primary->UnwindData);
+			const unsigned frame_reg = unwind_info[3] & 0x0fu;
+			if (frame_reg != 0 && !in_buf(*IntReg(ctx, frame_reg), 8)) {
+				break;
+			}
+			PVOID   handler_data = nullptr;
+			DWORD64 establisher  = 0;
+			RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
+		}
+		if (ctx.Rip == 0 || ctx.Rsp <= rsp) {
+			break;
+		}
+		const auto rip = static_cast<uintptr_t>(ctx.Rip);
+		if (rip >= g_image_base && rip < g_image_end) {
+			return rip - g_image_base;
+		}
+	}
+	return kNoCaller;
+}
 
 const std::string& ModuleName(uintptr_t rip) {
 	const uintptr_t page = rip & ~static_cast<uintptr_t>(0xfff);
@@ -111,10 +225,24 @@ void Print(Target& t) {
 		for (const auto& [mod, n]: outside) {
 			::printf("  %5.2f%%  %s\n", 100.0 * static_cast<double>(n) / total, mod.c_str());
 		}
+		auto callers = Sorted(t.callers);
+		::printf("  by first exe caller:\n");
+		for (size_t i = 0; i < callers.size() && i < 30; i++) {
+			const uint64_t off    = callers[i].first >> 16u;
+			const auto     mod_id = static_cast<uint32_t>(callers[i].first & 0xffffu);
+			const char*    mod    = mod_id < g_module_names.size() ? g_module_names[mod_id].c_str() : "?";
+			const double   pct    = 100.0 * static_cast<double>(callers[i].second) / total;
+			if (off == kNoCaller) {
+				::printf("  %5.2f%%  <no exe caller>  [%s]\n", pct, mod);
+			} else {
+				::printf("  %5.2f%%  exe+0x%" PRIx64 "  [%s]\n", pct, off, mod);
+			}
+		}
 	}
 	t.samples = 0;
 	t.rips.clear();
 	t.outside.clear();
+	t.callers.clear();
 }
 
 void SamplerThread() {
@@ -143,20 +271,38 @@ void SamplerThread() {
 					continue;
 				}
 				CONTEXT ctx {};
-				ctx.ContextFlags = CONTEXT_CONTROL;
-				const BOOL ok    = GetThreadContext(t.handle, &ctx);
+				ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+				const BOOL   ok     = GetThreadContext(t.handle, &ctx);
+				const auto   rip    = static_cast<uintptr_t>(ctx.Rip);
+				const bool   in_exe = rip >= g_image_base && rip < g_image_end;
+				// While suspended: only syscalls and memcpy, no heap or loader locks.
+				const size_t copied = (ok != 0 && !in_exe) ? CopyStack(static_cast<uintptr_t>(ctx.Rsp)) : 0;
 				ResumeThread(t.handle);
 				if (ok == 0) {
 					continue;
 				}
 				// Nothing below may take a lock the target could hold: it is already resumed.
-				const auto rip = static_cast<uintptr_t>(ctx.Rip);
 				t.samples++;
-				if (rip >= g_image_base && rip < g_image_end) {
-					t.rips[rip - g_image_base]++;
+				uint64_t caller    = kNoCaller;
+				uint32_t module_id = 0;
+				if (in_exe) {
+					caller = rip - g_image_base;
+					t.rips[caller]++;
 				} else {
-					t.outside[ModuleName(rip)]++;
+					const std::string& mod = ModuleName(rip);
+					t.outside[mod]++;
+					const std::string short_name = mod.compare(0, 8, "outside:") == 0 ? mod.substr(8) : mod;
+					auto              it         = g_module_ids.find(short_name);
+					if (it == g_module_ids.end()) {
+						it = g_module_ids.emplace(short_name, static_cast<uint32_t>(g_module_names.size())).first;
+						g_module_names.push_back(short_name);
+					}
+					module_id = it->second;
+					if (copied != 0) {
+						caller = FirstExeCaller(ctx, static_cast<uintptr_t>(ctx.Rsp), copied);
+					}
 				}
+				t.callers[CallerKey(caller, module_id)]++;
 			}
 			if (now - report_time >= std::chrono::seconds(5)) {
 				report_time = now;
@@ -176,6 +322,7 @@ void Start() {
 	const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
 	const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
 	g_image_end     = g_image_base + nt->OptionalHeader.SizeOfImage;
+	g_stack = static_cast<uint8_t*>(VirtualAlloc(nullptr, kStackCopyMax + kStackSlack, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
 	std::thread(SamplerThread).detach();
 }
 
