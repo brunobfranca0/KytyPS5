@@ -13,6 +13,21 @@ No environment variables are needed: `KYTY_LABELS_AFTER_GPU` is on by default, a
 written-overlap check only warns (`KYTY_IGNORE_WRITTEN_OVERLAP` is gone). The release package
 (`Play Wolverine.bat`, launcher preset) sets all of this.
 
+## Branch `wolverine-dev-glyph-fix`
+
+Based on `wolverine-dev` 2e8e159. Tested with PPSA03671 v01.001.005 on Windows 11, Ryzen 5 5600,
+RTX 5060 Ti (16 GB), 16 GB RAM, clang-cl Release build; reached gameplay.
+
+- **UI glyphs no longer go missing under memory pressure**: the image collector keeps render
+  targets of at most 1024x1024 (glyph atlases, cached UI layers). Before, the screen reader prompt
+  read "TU   OFF" / "K  P  BL" instead of "TURN OFF" / "KEEP ENABLED".
+- **Evicted GPU-written images are freed after their write-back lands**: the image stays
+  registered until the asynchronous download has reached guest memory, and stays if it is used
+  again meanwhile. A write-back is dropped when the guest rewrote the range before it landed
+  (`KYTY_EVICT_WRITEBACK_GUARD=0` turns that check off). Images that are not safe to download are
+  kept instead of freed without a write-back.
+- The log names each gamepad when it connects (`Controller: gamepad <id> connected: <name>`).
+
 ## Results
 
 | Scene | `wolverine-perf` (before the merge) | `wolverine-v1` |

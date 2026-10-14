@@ -34,12 +34,37 @@
 #include <span>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+[[nodiscard]] bool EvictWriteBackGuard() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_EVICT_WRITEBACK_GUARD");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+[[nodiscard]] bool HashGuestBacking(uint64_t address, uint64_t size, uint64_t& hash) {
+	constexpr uint64_t   Chunk = 64 * 1024;
+	std::vector<uint8_t> bytes(static_cast<size_t>(std::min(size, Chunk)));
+	uint64_t             seed = 0;
+	for (uint64_t done = 0; done < size;) {
+		const auto part = std::min(size - done, Chunk);
+		if (!LibKernel::Memory::TryReadBacking(address + done, bytes.data(), part)) {
+			return false;
+		}
+		seed = XXH3_64bits_withSeed(bytes.data(), static_cast<size_t>(part), seed);
+		done += part;
+	}
+	hash = seed;
+	return true;
+}
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -2027,7 +2052,8 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id) {
+bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
+                                       std::shared_ptr<std::atomic<bool>>* landed) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -2061,6 +2087,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
+	const bool guard      = evicting && EvictWriteBackGuard();
+	uint64_t   guest_hash = 0;
+	if (guard && !HashGuestBacking(range.address, range.size, guest_hash)) {
+		return false;
+	}
 	download->Flush(offset, range.size);
 
 	DownloadImage(image, *download, offset, range.size, std::move(transfer));
@@ -2077,8 +2108,32 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
 	                                                 nullptr, 1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset] {
+	std::shared_ptr<std::atomic<bool>> landed_flag;
+	if (landed != nullptr) {
+		landed_flag = std::make_shared<std::atomic<bool>>(false);
+		*landed     = landed_flag;
+	}
+	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset, guard,
+	                                    guest_hash, landed_flag] {
+		struct Landed {
+			const std::shared_ptr<std::atomic<bool>>& flag;
+			~Landed() {
+				if (flag != nullptr) {
+					flag->store(true, std::memory_order_release);
+				}
+			}
+		} landed_scope {landed_flag};
 		download->Invalidate(offset, range.size);
+		uint64_t current = 0;
+		if (guard && (!HashGuestBacking(range.address, range.size, current) || current != guest_hash)) {
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("TextureCache: evicted image write-back dropped, guest=0x%016" PRIx64
+				     " size=0x%016" PRIx64 ": guest bytes changed before write-back landed\n",
+				     range.address, range.size);
+			}
+			return;
+		}
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
 	return true;
@@ -2267,6 +2322,25 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	m_gc_tick++;
 	const uint64_t clock    = LruClock();
+	// Keep an evicted image registered until the GPU write-back has reached guest memory. If it
+	// was sampled again meanwhile, retain the newer image instead of recreating it from stale RAM.
+	std::erase_if(m_pending_evictions, [&](const PendingEviction& pending) {
+		if (!pending.landed->load(std::memory_order_acquire)) {
+			return false;
+		}
+		m_evicting.erase(pending.id);
+		auto* image = m_slot_images.try_get(pending.id);
+		if (image == nullptr || !image->registered || image->info.data.address != pending.address) {
+			return true;
+		}
+		if (m_lru_cache.TickOf(image->lru_id) != pending.tick) {
+			return true;
+		}
+		m_gc_stats.freed++;
+		m_gc_stats.freed_bytes += image->AccountedSize();
+		FreeImage(pending.id);
+		return true;
+	});
 	static auto&   combined = Common::LiveSwitches::Get("KYTY_GC_COMBINED", 1);
 	m_other_cache_memory =
 	    combined.load(std::memory_order_relaxed) != 0 ? m_buffer_cache.UsedMemory() : 0;
@@ -2350,6 +2424,17 @@ void TextureCache::RunGarbageCollector() {
 				m_gc_stats.gone_or_depth++;
 				continue;
 			}
+			if (m_evicting.contains(id)) {
+				m_gc_stats.gpu_kept++;
+				m_gc_stats.gpu_kept_bytes += owner->AccountedSize();
+				continue;
+			}
+			// Small targets frequently contain glyph atlases or cached UI layers. Evicting one
+			// under pressure loses characters; preserve these until normal replacement or unmapping.
+			if (owner->usage.render_target && owner->info.extent.width <= 1024 &&
+			    owner->info.extent.height <= 1024) {
+				continue;
+			}
 			// KYTY_BINDLESS_EVICT=1 (live, default 0): unpin bindless images the shaders have not
 			// sampled for KYTY_BINDLESS_EVICT_AGE frames (live, default 60; TouchImages keeps their
 			// age), or KYTY_BINDLESS_EVICT_TIGHT_AGE (live, default 15) near the driver budget. The
@@ -2405,13 +2490,27 @@ void TextureCache::RunGarbageCollector() {
 					m_gc_stats.gpu_kept_bytes += owner->AccountedSize();
 					continue;
 				}
-				if (safe && !DownloadImageMemory(id)) {
+				std::shared_ptr<std::atomic<bool>> landed;
+				if (!safe || !DownloadImageMemory(id, true, &landed)) {
 					m_gc_stats.download_failed++;
 					continue;
 				}
-				if (safe && owner->info.IsTiled()) {
+				if (owner->info.IsTiled()) {
 					m_gc_written_back_bytes_frame += owner->info.data.size;
 				}
+				m_pending_evictions.push_back(
+				    {id, owner->info.data.address, m_lru_cache.TickOf(owner->lru_id),
+				     std::move(landed)});
+				m_evicting.insert(id);
+				if (pressured || aggressive) {
+					--deletions;
+					m_gc_freed_images_frame++;
+					m_gc_freed_bytes_frame += owner->AccountedSize();
+					if (m_gc_freed_bytes_frame >= byte_budget) {
+						break;
+					}
+				}
+				continue;
 			}
 			const auto freed = owner->AccountedSize();
 			FreeImage(id);

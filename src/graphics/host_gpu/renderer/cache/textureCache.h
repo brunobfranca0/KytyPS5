@@ -14,7 +14,9 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <functional>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <span>
 #include <type_traits>
 #include <unordered_map>
@@ -181,7 +183,9 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// For cache eviction, signal `landed` only after the GPU write-back reaches guest memory.
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool evicting = false,
+	                                       std::shared_ptr<std::atomic<bool>>* landed = nullptr);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -205,6 +209,15 @@ private:
 	uint64_t         m_gc_freed_bytes_frame   = 0;
 	size_t           m_gc_freed_images_frame  = 0;
 	uint64_t         m_gc_written_back_bytes_frame = 0;
+	// A GPU-written image remains registered until its asynchronous write-back has landed.
+	struct PendingEviction {
+		ImageId                            id;
+		uint64_t                           address = 0;
+		uint64_t                           tick    = 0;
+		std::shared_ptr<std::atomic<bool>> landed;
+	};
+	std::vector<PendingEviction> m_pending_evictions;
+	std::unordered_set<ImageId>  m_evicting;
 	// KYTY_IMAGE_GC_STATS: what the collector visited and why it kept each candidate.
 	struct GcStats {
 		uint64_t runs          = 0;

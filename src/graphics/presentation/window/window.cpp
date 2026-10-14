@@ -316,6 +316,8 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 			return;
 		}
 		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
+		const char* name = SDL_GetGamepadName(pad);
+		LOGF("Controller: gamepad %d connected: %s\n", id, name != nullptr ? name : "(unnamed)");
 		Controller::Connect(id);
 	}
 
