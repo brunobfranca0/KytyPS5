@@ -47,7 +47,7 @@ public:
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
-	void                      Wait(uint64_t tick);
+	void                      Wait(uint64_t tick, std::source_location where = std::source_location::current());
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);

@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
+#include <source_location>
 
 namespace Libs::Graphics {
 
@@ -33,7 +34,8 @@ public:
 	// default 0 = always) it asks the driver at most once every N microseconds and otherwise
 	// keeps the last known tick (still correct, only possibly older). Wait() is unaffected.
 	void Poll();
-	void Wait(uint64_t tick);
+	// Blocking waits are timed per call site and printed every 5 s ("GPU waits (5 s)").
+	void Wait(uint64_t tick, std::source_location where = std::source_location::current());
 
 private:
 	GraphicContext&       m_graphics;

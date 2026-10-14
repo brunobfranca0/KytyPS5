@@ -460,7 +460,7 @@ void CommandScheduler::FlushAndWait(std::source_location where) {
 	NoteSubmitSite("flush+wait", where);
 	KYTY_PROFILER_FUNCTION();
 	const auto tick = Submit();
-	m_master.Wait(tick);
+	m_master.Wait(tick, where);
 	BeginNext();
 }
 
@@ -471,12 +471,12 @@ void CommandScheduler::Finish(std::source_location where) {
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	m_master.Wait(CurrentTick() - 1, where);
 	BeginNext();
 	PopPendingOperations();
 }
 
-void CommandScheduler::Wait(uint64_t tick) {
+void CommandScheduler::Wait(uint64_t tick, std::source_location where) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
@@ -486,10 +486,10 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
+		m_master.Wait(tick, where);
 		BeginNext();
 	} else {
-		m_master.Wait(tick);
+		m_master.Wait(tick, where);
 	}
 }
 

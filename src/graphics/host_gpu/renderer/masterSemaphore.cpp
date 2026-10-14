@@ -7,9 +7,25 @@
 #include "common/liveSwitches.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include "common/common.h"
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IWYU pragma: keep
+#endif
 
 namespace Libs::Graphics {
 
@@ -70,6 +86,46 @@ void NoteTickStats(bool refreshed) {
 	}
 }
 
+// Every blocking wait for the GPU (the tick had not completed), timed and keyed by the source line
+// that asked for it, with the waiting thread: "GPU waits (5 s)". Costs nothing on the non-blocking
+// path; a blocking wait already costs a kernel wait.
+void NoteWaitSite(const std::source_location& where, int64_t us) {
+	struct Entry {
+		uint64_t count = 0;
+		int64_t  us    = 0;
+	};
+	static std::mutex                             mutex;
+	static std::unordered_map<std::string, Entry> sites;
+	static int64_t                                report_us = 0;
+	char                                          thread_name[32] = "?";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::snprintf(thread_name, sizeof(thread_name), "tid %lu", static_cast<unsigned long>(GetCurrentThreadId()));
+#endif
+	const char* file = where.file_name();
+	if (const char* slash = std::strrchr(file, '/')) file = slash + 1;
+	if (const char* slash = std::strrchr(file, '\\')) file = slash + 1;
+	std::lock_guard lock(mutex);
+	auto& e = sites[std::string(file) + ":" + std::to_string(where.line()) + " [" + thread_name + "]"];
+	e.count++;
+	e.us += us;
+	const auto now = NowUs();
+	if (report_us == 0) {
+		report_us = now;
+	}
+	if (now - report_us >= 5'000'000) {
+		std::vector<std::pair<std::string, Entry>> sorted(sites.begin(), sites.end());
+		std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+		::printf("GPU waits (5 s), blocking only, by site:\n");
+		for (size_t i = 0; i < sorted.size() && i < 12; i++) {
+			::printf("  %8.1f ms %6llu waits  %s\n", static_cast<double>(sorted[i].second.us) / 1000.0,
+			         static_cast<unsigned long long>(sorted[i].second.count), sorted[i].first.c_str());
+		}
+		std::fflush(stdout);
+		sites.clear();
+		report_us = now;
+	}
+}
+
 } // namespace
 
 void MasterSemaphore::Poll() {
@@ -100,7 +156,7 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
-void MasterSemaphore::Wait(uint64_t tick) {
+void MasterSemaphore::Wait(uint64_t tick, std::source_location where) {
 	if (IsFree(tick)) {
 		return;
 	}
@@ -117,7 +173,9 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	vk::Result result;
 	{
 		FrameCosts::Timer cost_timer {FrameCosts::g_gpu_wait_us, FrameCosts::g_gpu_waits};
+		const auto        begin = NowUs();
 		result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+		NoteWaitSite(where, NowUs() - begin);
 	}
 	if (result != vk::Result::eSuccess) {
 		if (result == vk::Result::eErrorDeviceLost) {
