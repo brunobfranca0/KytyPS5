@@ -195,10 +195,10 @@ config_compiler_and_linker()
 
 if(KYTY_CLANG_CL)
 	# Same release optimization as the Demon's Souls branch (chenxiao07/KytyPS5): the GPU thread is
-	# CPU-bound, so -O3 and a modern -march convert straight into fps there. Default: Zen 4
-	# instruction set (AVX-512), which the Ryzen 9 9950X3D this build is played on supports.
+	# CPU-bound, so -O3 and a modern -march convert straight into fps there. x86-64-v3 (AVX2, FMA,
+	# BMI2) as there: znver4 (AVX-512) crashed the unit tests on the CI runners, which lack it.
 	option(KYTY_NATIVE_OPT "Release: -O3 -march=KYTY_MARCH" ON)
-	set(KYTY_MARCH "znver4" CACHE STRING "Release: the -march of KYTY_NATIVE_OPT (x86-64-v3 for other PCs)")
+	set(KYTY_MARCH "x86-64-v3" CACHE STRING "Release: the -march of KYTY_NATIVE_OPT (x86-64-v3 for other PCs)")
 	if(KYTY_NATIVE_OPT)
 		add_compile_options("$<$<CONFIG:Release>:/clang:-O3>" "$<$<CONFIG:Release>:/clang:-march=${KYTY_MARCH}>")
 	endif()
