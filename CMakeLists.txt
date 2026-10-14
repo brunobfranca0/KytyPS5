@@ -864,4 +864,6 @@ if(KYTY_BUILD_LAUNCHER)
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
+	# Linker map for symbolizing KYTY_PROF exe+0x<offset> samples.
+	install(FILES "${KYTY_EMULATOR_MAP_LINK_PATH}" DESTINATION . RENAME kyty_emulator.map OPTIONAL)
 endif()
