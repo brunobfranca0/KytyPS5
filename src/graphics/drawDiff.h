@@ -52,6 +52,8 @@ struct State {
 	std::map<std::pair<uint64_t, std::string>, uint64_t> skips;
 	std::map<uint64_t, uint64_t>                         gpu_freed; // address -> frame freed with GPU contents
 	std::map<std::string, uint64_t>                      fresh;     // fresh-read description -> count
+	std::map<uint64_t, std::string>                      insert_note; // address -> what overlapped it at creation
+	std::map<std::string, uint64_t>                      writeback;   // writeback result -> count
 };
 
 inline State& Get() {
@@ -104,11 +106,32 @@ inline void NoteGpuFree(uint64_t address) {
 	s.gpu_freed[address] = Frame();
 }
 
+// What FindImage found over a range when it created a new image there (last creation per address).
+inline void NoteInsert(uint64_t address, std::string note) {
+	if (!Enabled()) {
+		return;
+	}
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	s.insert_note[address] = std::move(note);
+}
+
+inline void NoteWriteback(uint64_t address, const char* result) {
+	if (!Enabled()) {
+		return;
+	}
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	char            buf[96];
+	std::snprintf(buf, sizeof(buf), "0x%010llx %s", static_cast<unsigned long long>(address), result);
+	s.writeback[buf]++;
+}
+
 // A sampled read of an image created this frame that the GPU has not written yet: whatever it
 // holds came from guest memory (or nothing). If the game expects last frame's contents there
 // (a temporal history), this is the flicker.
 inline void NoteFreshRead(uint64_t address, const char* format, uint32_t width, uint32_t height,
-                          bool buffer_modified) {
+                          bool buffer_modified, uint32_t created_line = 0) {
 	if (!Enabled()) {
 		return;
 	}
@@ -116,11 +139,13 @@ inline void NoteFreshRead(uint64_t address, const char* format, uint32_t width, 
 	std::lock_guard lock(s.mutex);
 	const auto      freed  = s.gpu_freed.find(address);
 	const bool      lost   = freed != s.gpu_freed.end() && Frame() - freed->second <= 2;
-	char            buf[256];
-	std::snprintf(buf, sizeof(buf), "shader %016llx reads 0x%010llx %ux%u %s%s%s",
+	const auto      note   = s.insert_note.find(address);
+	char            buf[768];
+	std::snprintf(buf, sizeof(buf), "shader %016llx reads 0x%010llx %ux%u %s%s%s [created at line %u; overlapped: %s]",
 	              static_cast<unsigned long long>(t_shader), static_cast<unsigned long long>(address),
 	              width, height, format, buffer_modified ? " (from GPU buffer copy)" : "",
-	              lost ? " <- GPU contents dropped here 0-2 frames ago" : "");
+	              lost ? " <- GPU contents dropped here 0-2 frames ago" : "", created_line,
+	              note != s.insert_note.end() ? note->second.c_str() : "?");
 	s.fresh[buf]++;
 }
 
@@ -183,6 +208,16 @@ inline void EndFrame() {
 			::printf("  %6" PRIu64 "  %s\n", rows[i].first, rows[i].second.c_str());
 		}
 		s.fresh.clear();
+	}
+	if (!s.writeback.empty()) {
+		::printf("Image writebacks to the buffer cache (since last report):\n");
+		for (const auto& [k, n]: s.writeback) {
+			::printf("  %6" PRIu64 "  %s\n", n, k.c_str());
+		}
+		s.writeback.clear();
+	}
+	if (s.insert_note.size() > 4096) {
+		s.insert_note.clear();
 	}
 	if (s.gpu_freed.size() > 4096) {
 		s.gpu_freed.clear();

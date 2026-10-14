@@ -300,10 +300,11 @@ ImageChurnStats g_image_churn_stats;
 
 } // namespace
 
-ImageId TextureCache::InsertImage(const ImageInfo& info) {
+ImageId TextureCache::InsertImage(const ImageInfo& info, std::source_location where) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	g_image_churn_stats.Note(info, true);
 	m_slot_images[id].created_frame = DrawDiff::Frame();
+	m_slot_images[id].created_line  = where.line();
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -1483,6 +1484,26 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			// KYTY_FREE_WRITEBACK=3: an image that stays alive but overlaps the new one with
 			// another layout (Wolverine: RGBA8 832x468 and R8 416x234 at one address) also hands
 			// its GPU-written bytes to the buffer cache, so the new image uploads them.
+			if (DrawDiff::Enabled()) {
+				std::string note;
+				for (const auto candidate: candidates) {
+					if (const auto* owner = m_slot_images.try_get(candidate); owner != nullptr) {
+						char buf[160];
+						std::snprintf(buf, sizeof(buf), "%s0x%010llx %ux%u %s tile=%u gpu=%d",
+						              note.empty() ? "" : "; ",
+						              static_cast<unsigned long long>(owner->info.data.address),
+						              owner->info.extent.width, owner->info.extent.height,
+						              vk::to_string(owner->info.pixel_format).c_str(),
+						              static_cast<unsigned>(owner->info.tile_mode),
+						              owner->IsGpuModified() ? 1 : 0);
+						note += buf;
+					}
+				}
+				char buf[96];
+				std::snprintf(buf, sizeof(buf), " | new tile=%u", static_cast<unsigned>(desc.info.tile_mode));
+				note += buf;
+				DrawDiff::NoteInsert(desc.info.data.address, note.empty() ? "none" : note);
+			}
 			static auto& writeback = Common::LiveSwitches::Get("KYTY_FREE_WRITEBACK", 0);
 			if (writeback.load(std::memory_order_relaxed) == 3) {
 				for (const auto candidate: candidates) {
@@ -1513,7 +1534,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			DrawDiff::NoteFreshRead(image.info.data.address,
 			                        vk::to_string(image.info.pixel_format).c_str(),
 			                        image.info.extent.width, image.info.extent.height,
-			                        image.IsBufferModified());
+			                        image.IsBufferModified(), image.created_line);
 		}
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
@@ -2067,6 +2088,10 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 bool TextureCache::WritebackToBufferCache(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (!m_scheduler.Active() || !image.SafeToDownload() || image.info.data.Empty()) {
+		DrawDiff::NoteWriteback(image.info.data.address,
+		                        !m_scheduler.Active() ? "skipped: no active command buffer"
+		                        : !image.SafeToDownload() ? "skipped: not safe to download"
+		                                                  : "skipped: empty range");
 		return false;
 	}
 	// Only plain committed guest memory: marking other ranges GPU-written made a later readback
@@ -2077,17 +2102,22 @@ bool TextureCache::WritebackToBufferCache(ImageId id) {
 	const uint64_t     window_end =
 	    (image.info.data.address + image.info.data.size + Window - 1) & ~(Window - 1);
 	if (!LibKernel::Memory::IsCommittedRange(window_begin, window_end - window_begin)) {
+		DrawDiff::NoteWriteback(image.info.data.address, "skipped: 2 MiB window not committed");
 		return false;
 	}
 	auto transfer = BuildDownload(image);
 	if (!transfer.valid || transfer.depth_target) {
+		DrawDiff::NoteWriteback(image.info.data.address,
+		                        transfer.depth_target ? "skipped: depth" : "skipped: no download transfer");
 		return false;
 	}
 	const auto [buffer, offset] = m_buffer_cache.ObtainBuffer(
 	    image.info.data.address, image.info.data.size, true, false, BufferId {}, false);
 	if (buffer == nullptr) {
+		DrawDiff::NoteWriteback(image.info.data.address, "skipped: no buffer");
 		return false;
 	}
+	DrawDiff::NoteWriteback(image.info.data.address, "written back");
 	DownloadImage(image, *buffer, offset, image.info.data.size, std::move(transfer));
 	buffer->last_gpu_write_tick = m_scheduler.CurrentTick();
 	vk::MemoryBarrier after {};
