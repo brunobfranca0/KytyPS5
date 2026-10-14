@@ -97,7 +97,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 			// (A diagnostic's state too: what the GPU was in when it was reset, if it still reads.)
 			if (const auto dump = DeviceFault::g_stall_dump.load(std::memory_order_acquire); dump != nullptr) {
 				uint64_t now = 0;
-				(void)m_graphics.device.getSemaphoreCounterValue(m_semaphore, &now);
+				(void)m_graphics.device.getSemaphoreCounterValue(semaphore, &now);
 				dump(now);
 			}
 			DeviceFault::Report();
