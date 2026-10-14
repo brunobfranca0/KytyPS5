@@ -1,3 +1,4 @@
+#include "common/liveSwitches.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -549,7 +550,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
-	RebindImages(bindings);
+	// KYTY_SINGLE_REBIND=1 (live, A/B): the loop below resolves the images again before recording, so
+	// this first pass (the recovery transaction only needs the buffers) only repeats view lookups.
+	static auto& single_rebind = Common::LiveSwitches::Get("KYTY_SINGLE_REBIND", 0);
+	if (single_rebind.load(std::memory_order_relaxed) == 0) {
+		RebindImages(bindings);
+	}
 	RebindBuffers(bindings);
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
@@ -628,7 +634,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
-	RebindImages(bindings);
+	// KYTY_SINGLE_REBIND=1 (live, A/B): the loop below resolves the images again before recording, so
+	// this first pass (the recovery transaction only needs the buffers) only repeats view lookups.
+	static auto& single_rebind = Common::LiveSwitches::Get("KYTY_SINGLE_REBIND", 0);
+	if (single_rebind.load(std::memory_order_relaxed) == 0) {
+		RebindImages(bindings);
+	}
 	RebindBuffers(bindings);
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
