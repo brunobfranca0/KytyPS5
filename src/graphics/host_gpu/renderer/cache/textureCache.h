@@ -164,6 +164,8 @@ private:
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
 	bool WritebackToBufferCache(ImageId id);
+	// KYTY_FREE_WRITEBACK=3: address -> DrawDiff::Frame() of its last writeback to the buffer cache.
+	std::unordered_map<uint64_t, uint64_t> m_written_back;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, ImageDownload transfer);

@@ -1518,6 +1518,28 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
+			} else if (writeback.load(std::memory_order_relaxed) == 3) {
+				// The buffer cache got GPU contents for this range in the last 2 frames and nothing
+				// the GPU wrote since is newer (the overlapping images are not GPU-modified): those
+				// bytes, not guest memory, are current. Wolverine re-creates its R8 416x234 image
+				// over an RGBA8 832x468 one up to 3 times a frame; 200 of 309 read stale memory.
+				for (const auto candidate: candidates) {
+					const auto* owner = m_slot_images.try_get(candidate);
+					if (owner == nullptr) {
+						continue;
+					}
+					const auto it = m_written_back.find(owner->info.data.address);
+					if (it != m_written_back.end() && DrawDiff::Frame() - it->second <= 2) {
+						inserted.MarkBufferModified();
+						break;
+					}
+				}
+				if (!inserted.IsBufferModified()) {
+					const auto it = m_written_back.find(inserted.info.data.address);
+					if (it != m_written_back.end() && DrawDiff::Frame() - it->second <= 2) {
+						inserted.MarkBufferModified();
+					}
+				}
 			}
 		}
 		auto& image = m_slot_images[result];
@@ -2118,6 +2140,10 @@ bool TextureCache::WritebackToBufferCache(ImageId id) {
 		return false;
 	}
 	DrawDiff::NoteWriteback(image.info.data.address, "written back");
+	m_written_back[image.info.data.address] = DrawDiff::Frame();
+	if (m_written_back.size() > 4096) {
+		std::erase_if(m_written_back, [](const auto& e) { return DrawDiff::Frame() - e.second > 2; });
+	}
 	DownloadImage(image, *buffer, offset, image.info.data.size, std::move(transfer));
 	buffer->last_gpu_write_tick = m_scheduler.CurrentTick();
 	vk::MemoryBarrier after {};
