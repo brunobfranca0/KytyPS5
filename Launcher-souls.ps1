@@ -25,9 +25,22 @@ function Get-FgIndex {
 	}
 	return 1
 }
-function Set-FgIndex([int]$i) {
-	[IO.File]::WriteAllText($iniFile, "fgmode=$i`r`n", (New-Object System.Text.UTF8Encoding $false))
+function Get-IniValue([string]$key, [string]$default) {
+	if (Test-Path -LiteralPath $iniFile) {
+		$text = Get-Content -LiteralPath $iniFile -Raw
+		if ($text -match "(?m)^$key=(.*)$") { return $Matches[1].Trim() }
+	}
+	return $default
 }
+function Set-IniValue([string]$key, [string]$value) {
+	$lines = @()
+	if (Test-Path -LiteralPath $iniFile) {
+		$lines = @(Get-Content -LiteralPath $iniFile | Where-Object { $_ -and ($_ -notmatch "^$key=") -and ($_ -notmatch '^framegen=') })
+	}
+	$lines += "$key=$value"
+	[IO.File]::WriteAllText($iniFile, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+}
+function Set-FgIndex([int]$i) { Set-IniValue 'fgmode' "$i" }
 
 function Get-GamePath {
 	if (Test-Path -LiteralPath $pathFile) { return ((Get-Content -LiteralPath $pathFile -Raw) -replace '^\uFEFF', '').Trim() }
@@ -58,6 +71,9 @@ function Start-Game {
 	$config = $fgModes[[math]::Max(0, $cmbFg.SelectedIndex)][1]
 	$psargs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $root 'run-windows.ps1'),
 	          '-Exe', (Join-Path $root $exeName), '-Config', (Join-Path $root "config\$config"), '-Fullscreen')
+	# HDR10 (solo si "Usar HDR" esta activado en la pantalla de Windows) y VSync (modo FIFO: sin tearing).
+	if ($chkHdr.Checked)   { $psargs += '-Hdr' }
+	if ($chkVsync.Checked) { $psargs += @('-PresentMode', 'Fifo') }
 	Start-Process -FilePath 'powershell' -ArgumentList $psargs -WorkingDirectory $root -WindowStyle Minimized | Out-Null
 	$form.WindowState = 'Minimized'
 }
@@ -138,6 +154,24 @@ foreach ($m in $fgModes) { [void]$cmbFg.Items.Add($m[0]) }
 $cmbFg.SelectedIndex = [math]::Min([math]::Max(0, (Get-FgIndex)), $fgModes.Count - 1)
 $cmbFg.Add_SelectedIndexChanged({ Set-FgIndex $cmbFg.SelectedIndex })
 $panel.Controls.Add($cmbFg)
+
+function New-Check([string]$text, $x, $y, $w, [string]$key) {
+	$c = New-Object System.Windows.Forms.CheckBox
+	$c.Text = $text; $c.Font = $smallFont; $c.ForeColor = $ink
+	$c.BackColor = [System.Drawing.Color]::Transparent
+	$c.Location = New-Object System.Drawing.Point($x, $y); $c.Size = New-Object System.Drawing.Size($w, 26)
+	$c.Checked = (Get-IniValue $key '0') -eq '1'
+	$c.Add_CheckedChanged({ param($sender, $e) Set-IniValue $sender.Tag $(if ($sender.Checked) { '1' } else { '0' }) })
+	$c.Tag = $key
+	return $c
+}
+$chkHdr   = New-Check 'HDR' 350 100 90 'hdr'
+$chkVsync = New-Check 'VSync' 450 100 100 'vsync'
+$tips = New-Object System.Windows.Forms.ToolTip
+$tips.SetToolTip($chkHdr, 'HDR10: activa antes "Usar HDR" en la configuracion de pantalla de Windows')
+$tips.SetToolTip($chkVsync, 'VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando')
+$panel.Controls.Add($chkHdr)
+$panel.Controls.Add($chkVsync)
 
 # Precompilar los shaders del juego (todos, de los archivos del juego): la primera vez puede tardar horas.
 $btnPre = New-Button 'Precompilar shaders' ($W - 610) 46 230 58 $false
