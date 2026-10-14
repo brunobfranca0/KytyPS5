@@ -1480,6 +1480,18 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
+			// KYTY_FREE_WRITEBACK=3: an image that stays alive but overlaps the new one with
+			// another layout (Wolverine: RGBA8 832x468 and R8 416x234 at one address) also hands
+			// its GPU-written bytes to the buffer cache, so the new image uploads them.
+			static auto& writeback = Common::LiveSwitches::Get("KYTY_FREE_WRITEBACK", 0);
+			if (writeback.load(std::memory_order_relaxed) == 3) {
+				for (const auto candidate: candidates) {
+					if (const auto* owner = m_slot_images.try_get(candidate);
+					    owner != nullptr && owner->IsGpuModified()) {
+						(void)WritebackToBufferCache(candidate);
+					}
+				}
+			}
 			result         = InsertImage(desc.info);
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
