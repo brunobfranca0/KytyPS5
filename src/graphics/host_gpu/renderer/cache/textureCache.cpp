@@ -27,6 +27,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <memory>
@@ -444,6 +445,9 @@ void TextureCache::FreeImage(ImageId id, std::source_location where) {
 	NoteImageFree(where, gpu_modified);
 	if (gpu_modified) {
 		DrawDiff::NoteGpuFree(image.info.data.address);
+	}
+	if (gpu_modified) {
+		DumpImage(id, "free");
 	}
 	if (gpu_modified) {
 		static auto& writeback = Common::LiveSwitches::Get("KYTY_FREE_WRITEBACK", 0);
@@ -1644,6 +1648,11 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			}
 		}
 	}
+	if (desc.type == BindingType::Texture) {
+		DumpImage(id, "read");
+	} else if (desc.type == BindingType::Storage) {
+		DumpImage(id, "storage-bind");
+	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
@@ -2096,6 +2105,99 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
 	return true;
+}
+
+// Diagnostic: KYTY_DUMP_IMAGE=<guest address> (live, default 0 = off). Saves the contents of the
+// image at exactly that address, in guest layout, to _TempData/dump/ at three points: when it is
+// freed holding GPU-written data ("free"), when a shader binds it to sample ("read", after the
+// upload that bind triggers, so what the shader will see) and when it is bound for writing
+// ("storage-bind", the contents before that write). KYTY_DUMP_IMAGE_COUNT (live, default 24) caps
+// the files per address. One "Image dump:" log line per file (frame, order, shader, state).
+// Comparing a "free" with the next "read" shows whether a frame gets what the last one wrote.
+void TextureCache::DumpImage(ImageId id, const char* kind) {
+	static auto& address_switch = Common::LiveSwitches::Get("KYTY_DUMP_IMAGE", 0);
+	const auto   wanted         = static_cast<uint64_t>(address_switch.load(std::memory_order_relaxed));
+	if (wanted == 0) {
+		return;
+	}
+	auto& image = m_slot_images[id];
+	if (image.info.data.address != wanted || image.info.data.Empty() || image.depth_id) {
+		return;
+	}
+	static auto&    count_switch = Common::LiveSwitches::Get("KYTY_DUMP_IMAGE_COUNT", 24);
+	static uint64_t last_address = 0;
+	static int64_t  written      = 0;
+	static uint64_t sequence     = 0;
+	if (last_address != wanted) {
+		last_address = wanted;
+		written      = 0;
+	}
+	if (written >= count_switch.load(std::memory_order_relaxed)) {
+		return;
+	}
+	const auto frame  = DrawDiff::Frame();
+	const auto shader = DrawDiff::t_shader;
+	const auto order  = sequence++;
+	char       name[256];
+	std::snprintf(name, sizeof(name), "_TempData/dump/f%06llu_%04llu_%s_%010llx_%s_%ux%u_t%u.bin",
+	              static_cast<unsigned long long>(frame), static_cast<unsigned long long>(order),
+	              kind, static_cast<unsigned long long>(wanted),
+	              vk::to_string(image.info.pixel_format).c_str(), image.info.extent.width,
+	              image.info.extent.height, static_cast<unsigned>(image.info.tile_mode));
+	const char* skipped = !m_scheduler.Active()    ? "no active command buffer"
+	                      : !image.SafeToDownload() ? "not safe to download"
+	                                                : nullptr;
+	ImageDownload transfer {};
+	if (skipped == nullptr) {
+		transfer = BuildDownload(image);
+		if (!transfer.valid) {
+			skipped = "no download transfer";
+		}
+	}
+	::printf("Image dump: %s frame=%llu order=%llu shader=%016llx created_frame=%llu gpu=%d buffer=%d%s%s\n",
+	         name, static_cast<unsigned long long>(frame), static_cast<unsigned long long>(order),
+	         static_cast<unsigned long long>(shader),
+	         static_cast<unsigned long long>(image.created_frame), image.IsGpuModified() ? 1 : 0,
+	         image.IsBufferModified() ? 1 : 0, skipped != nullptr ? " SKIPPED: " : "",
+	         skipped != nullptr ? skipped : "");
+	std::fflush(stdout);
+	if (skipped != nullptr) {
+		return;
+	}
+	written++;
+	const auto size     = image.info.data.size;
+	auto       download = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download,
+	                                               0, AllFlags, size);
+	auto*      mapped   = download->Mapped().data();
+	if (mapped == nullptr) {
+		return;
+	}
+	std::memset(mapped, 0, size);
+	download->Flush(0, size);
+	DownloadImage(image, *download, 0, size, std::move(transfer));
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
+	                        vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = download->Handle();
+	barrier.offset              = 0;
+	barrier.size                = size;
+	m_scheduler.EndRendering();
+	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                                 vk::PipelineStageFlagBits::eHost, {}, 0,
+	                                                 nullptr, 1, &barrier, 0, nullptr);
+	std::string path = name;
+	m_scheduler.DeferPriorityOperation([download, mapped, size, path] {
+		download->Invalidate(0, size);
+		std::error_code error;
+		std::filesystem::create_directories("_TempData/dump", error);
+		if (FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+			std::fwrite(mapped, 1, size, file);
+			std::fclose(file);
+		}
+	});
 }
 
 // KYTY_FREE_WRITEBACK=3 (see FreeImage).
