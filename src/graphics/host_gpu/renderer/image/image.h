@@ -260,13 +260,77 @@ public:
 	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
+	// Bytes GPU work wrote through a buffer: all of the image (where it is not known), or [begin, end) ranges of it, which
+	// TextureCache::InitializeImage uploads alone (BufferModifiedRanges: sorted, merged; empty when all of it).
 	void               MarkBufferModified() noexcept {
 		m_buffer_modified = true;
+		m_buffer_whole    = true;
+		m_buffer_ranges.clear();
+		m_buffer_fill     = BufferFill::Mixed;
 		++validity;
 		MoveImageStateEpoch();
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void MarkBufferModified(uint64_t begin, uint64_t end) {
+		AddBufferRange(begin, end);
+		m_buffer_fill = BufferFill::Mixed;
+	}
+	// The same from a compute fill of one 32-bit value: while every buffer write since the last upload was a fill of that
+	// value and they cover all of the image, BufferFilledWith gives the value (InitializeImage clears to it).
+	void MarkBufferFilled(uint64_t begin, uint64_t end, uint32_t value) {
+		const bool first = !m_buffer_modified;
+		AddBufferRange(begin, end);
+		if (first) {
+			m_buffer_fill       = BufferFill::Value;
+			m_buffer_fill_value = value;
+		} else if (m_buffer_fill != BufferFill::Value || m_buffer_fill_value != value) {
+			m_buffer_fill = BufferFill::Mixed;
+		}
+	}
+	[[nodiscard]] std::optional<uint32_t> BufferFilledWith() const noexcept {
+		if (!m_buffer_modified || m_buffer_fill != BufferFill::Value || m_buffer_whole || m_buffer_ranges.size() != 1 ||
+		    m_buffer_ranges.front().first > info.data.address || m_buffer_ranges.front().second < info.data.End())
+			return std::nullopt;
+		return m_buffer_fill_value;
+	}
+	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& BufferModifiedRanges() const noexcept {
+		return m_buffer_ranges;
+	}
+	void ClearBufferModified() noexcept {
+		m_buffer_modified = false;
+		m_buffer_whole    = false;
+		m_buffer_ranges.clear();
+		m_buffer_fill = BufferFill::None;
+	}
 
+private:
+	void AddBufferRange(uint64_t begin, uint64_t end) {
+		if (!m_buffer_modified) {
+			m_buffer_whole = false;
+			m_buffer_ranges.clear();
+		}
+		m_buffer_modified = true;
+		if (!m_buffer_whole && begin < end) {
+			auto at = std::lower_bound(m_buffer_ranges.begin(), m_buffer_ranges.end(), begin,
+			                           [](const auto& range, uint64_t value) { return range.second < value; });
+			auto last = at;
+			while (last != m_buffer_ranges.end() && last->first <= end) {
+				begin = std::min(begin, last->first);
+				end   = std::max(end, last->second);
+				++last;
+			}
+			at = m_buffer_ranges.erase(at, last);
+			m_buffer_ranges.insert(at, {begin, end});
+			// (Past a few, all of it: what a whole upload costs.)
+			if (m_buffer_ranges.size() > 16) {
+				m_buffer_whole = true;
+				m_buffer_ranges.clear();
+			}
+		}
+		++validity;
+		MoveImageStateEpoch();
+	}
+
+public:
 	[[nodiscard]] bool IsStencilModified() const noexcept { return m_stencil_modified; }
 	void               MarkStencilModified() noexcept {
 		m_stencil_modified = true;
@@ -362,6 +426,11 @@ private:
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
+	bool              m_buffer_whole     = false; // (with m_buffer_modified: where is not known)
+	std::vector<std::pair<uint64_t, uint64_t>> m_buffer_ranges;
+	enum class BufferFill : uint8_t { None, Value, Mixed };
+	BufferFill        m_buffer_fill       = BufferFill::None;
+	uint32_t          m_buffer_fill_value = 0;
 	bool              m_stencil_modified  = false;
 	bool              m_partial_dirty     = false;
 	std::vector<std::pair<uint64_t, uint64_t>> m_dirty_ranges;

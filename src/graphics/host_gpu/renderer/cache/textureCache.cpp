@@ -45,6 +45,15 @@
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_partial_row_bands_mode {0};
 // 0: a sampled view refreshes the whole texture, not only its levels (RefreshTextureLevels; on by default, 0 for an A/B).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_texture_levels_mode {1};
+// 0: an image GPU buffer writes covered parts of is uploaded whole, not only the subresources over them (InitializeImage;
+// on by default, 0 for an A/B).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_buffer_ranges_mode {1};
+// 0: a compute fill over images it does not match runs as the dispatch, and the images are uploaded after it, not cleared
+// (TryConsumeComputeImageClear, InitializeImage; on by default, 0 for an A/B; KYTY_FILL_CLEAR=0 from the start).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_fill_clear_mode {[] {
+	const char* value = std::getenv("KYTY_FILL_CLEAR");
+	return value != nullptr && value[0] == '0' ? 0u : 1u;
+}()};
 
 namespace Libs::Graphics {
 
@@ -1955,6 +1964,47 @@ void TextureCache::InitializeImage(ImageId id) {
 				image.staged_ring = nullptr;
 			}
 		}
+		// GPU buffer writes that only filled all of it with one 32-bit value since its last upload (compute fills over
+		// it, TryConsumeComputeImageClear): a clear to that value, as an upload of those bytes would leave it. The game
+		// clears render targets that way in 4 MiB pieces: at Stonefang every frame four 720p RGBA16F, a 1440p R32 array
+		// of 4 and a 1440p target - 105 MiB of detiles of zeros a frame (10-14).
+		if (!uploaded && image.IsBufferModified() && !image.IsCpuDirty() && !image.info.IsDepth() && !image.depth_id &&
+		    !image.info.IsVolume() && image.backing.image != nullptr &&
+		    kyty_local_fill_clear_mode.load(std::memory_order_relaxed) != 0) {
+			vk::ClearValue clear {};
+			if (const auto value = image.BufferFilledWith();
+			    value.has_value() && DecodeFilledColorClear(image.info.pixel_format, *value, clear.color)) {
+				m_scheduler.EndRendering();
+				const auto command = m_scheduler.Current().Handle();
+				image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+				const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, VK_REMAINING_MIP_LEVELS, 0,
+				                                       VK_REMAINING_ARRAY_LAYERS};
+				command.clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear.color, 1, &range);
+				image.Transit(vk::ImageLayout::eGeneral,
+				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+				uploaded          = true;
+				image.staged_ring = nullptr;
+				static std::atomic<uint32_t> reports {0};
+				if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::printf("TextureCache: image filled by compute fills cleared to 0x%08x instead of uploaded: addr=0x%llx "
+					            "size=0x%llx fmt=%u %ux%u layers=%u\n",
+					            *value, static_cast<unsigned long long>(image.info.data.address),
+					            static_cast<unsigned long long>(image.info.data.size),
+					            static_cast<uint32_t>(image.info.guest_format), image.info.extent.width,
+					            image.info.extent.height, image.info.resources.layers);
+				}
+			}
+		}
+		// GPU buffer writes over known parts of it and no CPU write: the subresources over those parts alone, from the
+		// buffers holding them. At Boletaria every frame a compute shader writes two 15 MiB buffers in memory shared with
+		// render targets - a 1440p R32 array, 720p RGBA16F ones - and each of them was uploaded whole again: 105 MiB of
+		// detiles a frame for 30 MiB written (10-13).
+		if (!uploaded && image.IsBufferModified() && !image.IsCpuDirty() && !image.BufferModifiedRanges().empty() &&
+		    kyty_local_buffer_ranges_mode.load(std::memory_order_relaxed) != 0) {
+			const auto ranges = image.BufferModifiedRanges();
+			uploaded          = UploadImageChunked(image, &ranges);
+			if (uploaded) image.staged_ring = nullptr;
+		}
 		if (!uploaded && UploadImageChunked(image)) {
 			uploaded            = true;
 			image.staged_ring   = nullptr;
@@ -2214,21 +2264,27 @@ bool TextureCache::UploadDepthPartial(Image& image, uint32_t first_layer, uint32
 	return true;
 }
 
-// A whole upload of a large image no cached buffer holds whole, a piece of guest memory at a time, each piece from the
-// source ObtainBufferForImage picks for it: staged guest bytes, the buffer holding it, or (a subresource with
-// GPU-written bytes, a piece of its own) a buffer over that subresource. The whole range at once took a buffer over
-// all of it: a texture-pool view at Shrine of Storms 4-2 (1568 1 MiB layers) joined the 103 small buffers inside it
-// into one 1.57 GB buffer (3.2 s), and with the image and its detiling scratch (2 GiB) an 8 GB laptop paged for seconds;
-// its shadow-map pool, inside that buffer, then took whole 320 MiB uploads at every layer the game streamed. The
-// pieces detile into one reused scratch buffer: one each lived until the submission completed, as much again.
-bool TextureCache::UploadImageChunked(Image& image) {
+// A whole upload of a large image, a piece of guest memory at a time, each piece from the source ObtainBufferForImage
+// picks for it: staged guest bytes, the buffer holding it, or (a subresource with GPU-written bytes, a piece of its
+// own) a buffer over that subresource. The whole range at once took a buffer over all of it: a texture-pool view at
+// Shrine of Storms 4-2 (1568 1 MiB layers) joined the 103 small buffers inside it into one 1.57 GB buffer (3.2 s), and
+// with the image and its detiling scratch (2 GiB) an 8 GB laptop paged for seconds; its shadow-map pool, inside that
+// buffer, then took whole 320 MiB uploads at every layer the game streamed. The pieces detile into one reused scratch
+// buffer: one each lived until the submission completed, as much again. (An image a cached buffer holds whole too: its
+// pieces copy from that buffer, where its whole detile asked for a scratch buffer of the image's size - a user's 8 GB
+// GPU had neither the video nor the system memory for one of 2 GiB, and the emulator exited, 10-13.)
+bool TextureCache::UploadImageChunked(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>* only) {
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
 	const auto  base    = info.data.address;
-	if (binding == BindingType::DepthTarget || info.data.size < ChunkedUploadMin || info.IsVolume() || base % 256 != 0 ||
-	    m_buffer_cache.BufferHoldsRange(base, info.data.size)) {
+	if (binding == BindingType::DepthTarget || (only == nullptr && info.data.size < ChunkedUploadMin) ||
+	    info.IsVolume() || base % 256 != 0) {
 		return false;
 	}
+	// (`only`: of an image of any size, the subresources over those ranges alone.)
+	const auto selected = [&](uint64_t begin, uint64_t end) {
+		return only == nullptr || IntersectsRanges(*only, begin, end);
+	};
 	auto& cached = m_partial_plans[image.serial];
 	if (cached.plan == nullptr || cached.binding != binding) {
 		cached.plan    = std::make_shared<TextureTransferPlan>(
@@ -2253,17 +2309,22 @@ bool TextureCache::UploadImageChunked(Image& image) {
 	std::vector<vk::BufferImageCopy> regions;
 	uint64_t                         pieces     = 0;
 	uint64_t                         gpu_pieces = 0;
+	uint64_t                         uploaded   = 0;
 	for (size_t at = 0; at < order.size();) {
 		const auto& first   = plan.tiles[order[at]];
 		uint64_t    begin   = base + first.tiled_offset;
 		uint64_t    end     = begin + first.tiled_size;
+		if (!selected(begin, end)) {
+			at++;
+			continue;
+		}
 		size_t      next    = at + 1;
 		const bool  written = m_buffer_cache.IsRegionGpuModified(begin, end - begin);
 		while (!written && next < order.size()) {
 			const auto&    tile       = plan.tiles[order[next]];
 			const uint64_t tile_begin = base + tile.tiled_offset;
 			const uint64_t tile_end   = tile_begin + tile.tiled_size;
-			if (std::max(end, tile_end) - begin > ChunkedUploadPiece ||
+			if (std::max(end, tile_end) - begin > ChunkedUploadPiece || !selected(tile_begin, tile_end) ||
 			    m_buffer_cache.IsRegionGpuModified(tile_begin, tile.tiled_size)) {
 				break;
 			}
@@ -2298,7 +2359,24 @@ bool TextureCache::UploadImageChunked(Image& image) {
 		image.Upload(regions, linear.buffer, linear.offset, linear.size);
 		pieces++;
 		gpu_pieces += written ? 1 : 0;
+		uploaded += end - begin;
 		at = next;
+	}
+	if (only != nullptr) {
+		LiveCounters::Add(LiveCounters::PartialUploads);
+		LiveCounters::Add(LiveCounters::PartialUploadBytes, uploaded);
+		static const bool log_uploads = std::getenv("KYTY_UPLOAD_LOG") != nullptr;
+		if (log_uploads) {
+			std::printf("[tsc %llu] UPLOAD-RANGES addr=0x%llx size=0x%llx fmt=%u %ux%u layers=%u levels=%u tile=%u ranges=%zu "
+			            "pieces=%llu gpu=%llu bytes=0x%llx serial=%llu\n",
+			            static_cast<unsigned long long>(__rdtsc()), static_cast<unsigned long long>(base),
+			            static_cast<unsigned long long>(info.data.size), static_cast<uint32_t>(info.guest_format),
+			            info.extent.width, info.extent.height, info.resources.layers, info.resources.levels,
+			            static_cast<uint32_t>(info.tile_mode), only->size(), static_cast<unsigned long long>(pieces),
+			            static_cast<unsigned long long>(gpu_pieces), static_cast<unsigned long long>(uploaded),
+			            static_cast<unsigned long long>(image.serial));
+		}
+		return true;
 	}
 	LiveCounters::Add(LiveCounters::FullUploads);
 	LiveCounters::Add(LiveCounters::FullUploadBytes, info.data.size);
@@ -3612,7 +3690,7 @@ void TextureCache::TouchSpeculated(Image& image, uint64_t serial) {
 	TouchImage(image);
 }
 
-void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source) {
+void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source, const uint32_t* fill) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
@@ -3648,7 +3726,13 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, cons
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
 		}
-		image.MarkBufferModified();
+		// (The written bytes of it: InitializeImage uploads only the subresources over them.)
+		const auto begin = std::max(address, image.info.data.address), end = std::min(address + size, image.info.data.End());
+		if (fill != nullptr) {
+			image.MarkBufferFilled(begin, end, *fill);
+		} else {
+			image.MarkBufferModified(begin, end);
+		}
 	}
 }
 
@@ -3989,6 +4073,7 @@ void TextureCache::EraseRetired() {
 	std::erase_if(m_retired, [&](const auto& retired) {
 		if (!Spec::PacketsPassed(retired.second)) return false;
 		m_slot_images.erase(retired.first);
+		m_erase_epoch.fetch_add(1, std::memory_order_release);
 		return true;
 	});
 }
@@ -4076,15 +4161,21 @@ void TextureCache::RunGarbageCollector() {
 			m_trigger_gc_memory = trigger;
 		}
 	}
-	// A GPU short of video memory: a log line on where it goes when its use moved by 256 MiB (checked every 60 flips).
-	if (uint64_t video = 0, budget = 0; m_graphics.small_video_memory && tick % 60 == 0 &&
-	                                    m_graphics.QueryLocalVideoMemory(&video, &budget) &&
-	                                    (video > m_logged_video_memory + (uint64_t {256} << 20u) ||
-	                                     video + (uint64_t {256} << 20u) < m_logged_video_memory)) {
-		m_logged_video_memory = video;
-		char label[32];
-		std::snprintf(label, sizeof(label), "flip %llu", static_cast<unsigned long long>(tick));
-		m_graphics.LogVideoMemory(label);
+	// A log line on where the GPU's memory goes when its use moved (checked every 60 flips): on a GPU short of video
+	// memory by 256 MiB of video memory, on others by 1 GiB of video or GPU system memory (issue #14: an RX 9070 XT held
+	// 16 GB of the game's GPU memory in system memory with video memory to spare, and nothing in its log said when).
+	if (uint64_t video = 0, budget = 0, shared = 0; tick % 60 == 0 && m_graphics.QueryLocalVideoMemory(&video, &budget) &&
+	                                                LocalPlatform::QuerySharedGpuMemory(&shared)) {
+		const bool     short_of_video = m_graphics.small_video_memory;
+		const uint64_t step           = short_of_video ? uint64_t {256} << 20u : uint64_t {1} << 30u;
+		const auto moved = [&](uint64_t now, uint64_t logged) { return now > logged + step || now + step < logged; };
+		if (moved(video, m_logged_video_memory) || (!short_of_video && moved(shared, m_logged_shared_memory))) {
+			m_logged_video_memory  = video;
+			m_logged_shared_memory = shared;
+			char label[32];
+			std::snprintf(label, sizeof(label), "flip %llu", static_cast<unsigned long long>(tick));
+			m_graphics.LogVideoMemory(label);
+		}
 	}
 	// Over the budget: the images no draw or dispatch used for StaleTicks flips (~10 s), least recently used first, at
 	// most MaxDeletions a flip. What the game stops drawing it stops binding: 1-1 standing, 3.2 GiB of images were used

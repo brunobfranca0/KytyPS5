@@ -71,6 +71,9 @@ public:
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
+	// Moves whenever an image's slot is erased (EraseRetired, the only place): an id allocated when it was E is still
+	// allocated while it is E.
+	[[nodiscard]] uint64_t EraseEpoch() const { return m_erase_epoch.load(std::memory_order_acquire); }
 	// Only reuses discovery. FindTexture still refreshes contents and selects the current view.
 	[[nodiscard]] bool TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t& epoch);
 	// TryReuseSampledImage without the resolution-epoch proof, for caches that must
@@ -117,7 +120,10 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source = "");
+	// `fill`: the GPU wrote the range with that one 32-bit value (a compute fill): the images over it note it
+	// (Image::MarkBufferFilled).
+	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source = "",
+	                                           const uint32_t* fill = nullptr);
 	[[nodiscard]] bool HasTrackedDataOverlap(uint64_t address, uint64_t size);
 	// An image over the range holds data the GPU wrote to it (a download of the range must come
 	// from the image, not from the buffer).
@@ -246,7 +252,8 @@ private:
 	// The dirty subresources over [window_begin, window_end) only (a whole one where it crosses an end).
 	[[nodiscard]] bool UploadImagePartial(Image& image, uint64_t window_begin = 0, uint64_t window_end = UINT64_MAX);
 	// A whole upload of a large image a piece of guest memory at a time; false: not such an image (ObtainBufferForImage's).
-	[[nodiscard]] bool UploadImageChunked(Image& image);
+	// `only`: the subresources over those [begin, end) ranges alone, of an image of any size.
+	[[nodiscard]] bool UploadImageChunked(Image& image, const std::vector<std::pair<uint64_t, uint64_t>>* only = nullptr);
 	// The dirty layers in [first_layer, last_layer) only.
 	[[nodiscard]] bool UploadDepthPartial(Image& image, uint32_t first_layer = 0,
 	                                      uint32_t last_layer = UINT32_MAX);
@@ -340,6 +347,7 @@ private:
 	std::atomic<uint64_t>                             m_start_epoch {1};
 	std::vector<std::pair<uint64_t, uint64_t>>        m_start_log; // (epoch, address)
 	std::atomic<uint64_t>                             m_resolution_epoch {1};
+	std::atomic<uint64_t>                             m_erase_epoch {1};
 	// Null textures: a 1x1 image per format and type (1D, 2D or 3D).
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
@@ -372,6 +380,7 @@ private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_logged_video_memory = 0; // RunGarbageCollector's log line
+	uint64_t                                          m_logged_shared_memory = 0;
 	uint64_t         m_gc_tick                = 0;
 	std::atomic<uint64_t> m_frame {0};
 	struct PendingDownload {

@@ -102,8 +102,6 @@ public:
 	// again while the upload is unsubmitted).
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size,
 	                                                               bool* refillable = nullptr);
-	// A cached buffer holds all of [vaddr, vaddr + size) (ObtainBufferForImage then reads that buffer).
-	[[nodiscard]] bool BufferHoldsRange(uint64_t vaddr, uint64_t size);
 	// KYTY_ASYNC_REPROTECT: the write protection of the pages an image starts watching again (TextureCache's
 	// DeferredImageProtects sets the page manager's deferred write-protect sink to this list around TrackImage), applied
 	// by the upload worker ahead of an upload copy that reads those pages whole (the whole image: PushImageStagingCopies;
@@ -359,6 +357,18 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	std::shared_mutex                                 m_gpu_modified_mutex; // (its changes: HasGpuDirtyBytes)
 	std::atomic<uint64_t>                             m_written_obtain_epoch {1};
+	// Moves whenever m_gpu_modified_ranges loses bytes (readbacks, copy feedback, downloads, discards: CPU writes and
+	// unmaps go through those first). GPU thread.
+	uint64_t m_gpu_coverage_epoch = 1;
+	// The ranges ObtainBuffer made GPU-written lately (GPU thread): one written again while no buffer was registered
+	// or unregistered and no GPU-written byte was given back since is the same buffer's, its pages still GPU-owned
+	// and its bytes still in m_gpu_modified_ranges (what SynchronizeBuffer and the Add would find).
+	struct WriteMemo {
+		uint64_t vaddr = 0, size = 0, registration = 0, coverage = 0;
+		BufferId id;
+		bool     texel = false;
+	};
+	std::array<WriteMemo, 4096> m_write_memo {};
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	// ObtainBufferForImage (KYTY_ASYNC_UPLOAD=2): the backing pieces of an image upload.

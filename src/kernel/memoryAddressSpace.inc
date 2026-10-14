@@ -358,13 +358,13 @@ public:
 		    data && size && size <= 0x10000 && UINT64_MAX - vaddr >= size) {
 			BackingReadTransaction read(*this);
 			if (read.Acquired()) {
-				auto& cached = HostReadTranslationOf(vaddr);
-				MapEntry entry {};
-				if (cached.epoch == m_mapping_epoch &&
-				    GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
+				auto&      cached = HostReadTranslationOf(vaddr);
+				const auto epoch  = RegionEpoch(vaddr);
+				MapEntry   entry {};
+				if (cached.epoch == epoch && GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
 					entry = cached.entry;
 				} else if (FindContainingUnlocked(vaddr, size, &entry)) {
-					cached = {entry, m_mapping_epoch};
+					cached = {entry, epoch};
 				}
 				if (entry.size && RangeOk(entry.backing_offset + vaddr - entry.vaddr, size)) {
 					const auto offset = entry.backing_offset + vaddr - entry.vaddr;
@@ -390,12 +390,12 @@ public:
 		{
 			BackingReadTransaction read(*this);
 			if (read.Acquired()) {
-				auto& cached = HostReadTranslationOf(vaddr);
-				if (cached.epoch == m_mapping_epoch &&
-				    GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
+				auto&      cached = HostReadTranslationOf(vaddr);
+				const auto epoch  = RegionEpoch(vaddr);
+				if (cached.epoch == epoch && GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, size)) {
 					entry = cached.entry;
 				} else if (FindContainingUnlocked(vaddr, size, &entry)) {
-					cached = {entry, m_mapping_epoch};
+					cached = {entry, epoch};
 				}
 			}
 		}
@@ -407,6 +407,31 @@ public:
 		}
 		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
 		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
+	}
+
+	// The end of the mapping `vaddr` is in (0: none), through this thread's host read translations (BackingPointer's
+	// lookups of the same mappings then find them there).
+	uint64_t MappingEndOf(uint64_t vaddr) {
+		if (!IsAvailable()) {
+			return 0;
+		}
+		{
+			BackingReadTransaction read(*this);
+			if (read.Acquired()) {
+				auto&      cached = HostReadTranslationOf(vaddr);
+				const auto epoch  = RegionEpoch(vaddr);
+				if (cached.epoch == epoch && GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, vaddr, 1)) {
+					return cached.entry.vaddr + cached.entry.size;
+				}
+				MapEntry entry {};
+				if (!FindContainingUnlocked(vaddr, 1, &entry)) return 0;
+				cached = {entry, epoch};
+				return entry.vaddr + entry.size;
+			}
+		}
+		auto     lock = MapReadLock();
+		MapEntry entry {};
+		return FindContainingUnlocked(vaddr, 1, &entry) ? entry.vaddr + entry.size : 0;
 	}
 
 	// The backing bytes of [vaddr, vaddr + size) as one piece per guest mapping it spans, in
@@ -764,29 +789,59 @@ public:
 		return true;
 	}
 
+	// The same over consecutive mappings (the game maps its heaps a few hundred KiB at a time: a 4 MiB copy of its
+	// constants spans ten): unique when each mapping's part of the range is (no byte of it mapped twice), and no
+	// address of it is unmapped. (Its callers read and write the range through its guest addresses only.)
+	bool IsUniqueRangeAcrossMappings(uint64_t vaddr, uint64_t size) {
+		if (size == 0 || UINT64_MAX - vaddr < size) return false;
+		auto           lock = MapReadLock();
+		const uint64_t end  = vaddr + size;
+		for (uint64_t at = vaddr; at < end;) {
+			// (Each mapping through this thread's translations, held under the lock: a search of m_maps per mapping, ten
+			// of them for the 4 MiB copies, was 0.9% of the render thread at Latria.)
+			auto&      cached = HostReadTranslationOf(at);
+			const auto epoch  = RegionEpoch(at);
+			MapEntry   entry {};
+			if (cached.epoch == epoch && GuestFreeRangeContains(cached.entry.vaddr, cached.entry.size, at, 1)) {
+				entry = cached.entry;
+			} else if (FindContainingUnlocked(at, 1, &entry)) {
+				cached = {entry, epoch};
+			} else {
+				return false;
+			}
+			const uint64_t piece    = std::min(end, entry.vaddr + entry.size) - at;
+			const uint64_t physical = entry.backing_offset + at - entry.vaddr;
+			if (!CoverageUnique(physical, physical + piece)) return false;
+			at += piece;
+		}
+		return true;
+	}
+
 	bool IsUniqueRange(uint64_t vaddr, uint64_t size) {
 		// KYTY_ALIAS_VERIFY: every answer is compared with the full rebuild it replaces.
 		static const bool verify = std::getenv("KYTY_ALIAS_VERIFY") != nullptr;
 		if (!verify) {
 			if (size == 0 || UINT64_MAX - vaddr < size) return false; // (as FindContainingUnlocked)
 			auto lock = MapReadLock();
-			// The mapping over each 4 MiB of address and whether no byte of it is mapped twice (the usual case), kept until
-			// the mappings change (every change moves the epoch under the exclusive lock): any range in such a mapping is
-			// unique. The game asks about ~1000 ranges a frame, most of them new (ring buffers), in a few mappings: two cold
-			// tree lookups each.
+			// The mapping over each 256 KiB of address and whether no byte of it is mapped twice (the usual case), kept
+			// while its region's mappings (RegionEpoch) and the aliases anywhere (m_alias_epoch) stay the same: any range in
+			// such a mapping is unique. The game asks about ~1000 ranges a frame (and every write fault one), most of them
+			// new (ring buffers), in a few mappings: two cold tree lookups each. (By 4 MiB and one epoch for every mapping
+			// change, the game's ever finer mappings evicted each other and its streaming invalidated them all.)
 			struct Owner {
 				const GuestBackingStore* store;
-				uint64_t                 epoch;
+				uint64_t                 epoch, alias_epoch;
 				MapEntry                 entry;
 				bool                     unique;
 			};
-			thread_local std::array<Owner, 256> owners {};
-			auto& owner = owners[(vaddr >> 22u) % owners.size()];
-			if (owner.store != this || owner.epoch != m_mapping_epoch ||
+			thread_local std::array<Owner, 1024> owners {};
+			auto&      owner = owners[(vaddr >> 18u) % owners.size()];
+			const auto epoch = RegionEpoch(vaddr);
+			if (owner.store != this || owner.epoch != epoch || owner.alias_epoch != m_alias_epoch ||
 			    !GuestFreeRangeContains(owner.entry.vaddr, owner.entry.size, vaddr, size)) {
 				MapEntry entry {};
 				if (!FindContainingUnlocked(vaddr, size, &entry)) return false;
-				owner = {this, m_mapping_epoch, entry, CoverageUnique(entry.backing_offset, entry.backing_offset + entry.size)};
+				owner = {this, epoch, m_alias_epoch, entry, CoverageUnique(entry.backing_offset, entry.backing_offset + entry.size)};
 			}
 			if (owner.unique) return true;
 			const auto physical = owner.entry.backing_offset + vaddr - owner.entry.vaddr;
@@ -1069,7 +1124,9 @@ private:
 		auto last  = CoverageSplit(end);
 		for (auto it = first; it != last; ++it) {
 			EXIT_IF(delta < 0 && it->second == 0);
-			it->second = static_cast<uint32_t>(static_cast<int>(it->second) + delta);
+			const bool aliased = it->second > 1;
+			it->second         = static_cast<uint32_t>(static_cast<int>(it->second) + delta);
+			if ((it->second > 1) != aliased) ++m_alias_epoch; // (a byte gained or lost its second mapping)
 		}
 		// Merge keys that no longer start a different count.
 		for (auto it: {first, last}) {
@@ -1079,15 +1136,41 @@ private:
 		}
 	}
 
-	// Every m_maps change goes through these two (they keep m_coverage in step).
+	// Every m_maps change goes through these two (they keep m_coverage and the region epochs in step).
 	bool MapsEmplace(const MapEntry& entry) {
 		if (!m_maps.emplace(entry.vaddr, entry).second) return false;
 		AddCoverage(entry.backing_offset, entry.backing_offset + entry.size, 1);
+		TouchRegions(entry.vaddr, entry.size);
 		return true;
 	}
 	void MapsErase(std::map<uint64_t, MapEntry>::iterator entry) {
 		AddCoverage(entry->second.backing_offset, entry->second.backing_offset + entry->second.size, -1);
+		TouchRegions(entry->second.vaddr, entry->second.size);
 		m_maps.erase(entry);
+	}
+
+	// The mappings' change count of each 64 MiB of guest address (MapsEmplace and MapsErase move the ones a mapping
+	// spans; under the mapping mutation, which readers' transactions exclude), each region's counts its own (its index in
+	// the high bits): a translation cached for an address holds while its region's count is the same, whatever was mapped
+	// or unmapped elsewhere. (With one count for all mappings, the game's streaming invalidated every cached translation
+	// several times a frame.) Past the regions' 2 TiB, the global epoch.
+	static constexpr uint64_t RegionEpochBits = 26;
+	static constexpr uint64_t RegionEpochCount = uint64_t {1} << (41u - RegionEpochBits);
+	std::unique_ptr<std::atomic<uint64_t>[]> m_region_epochs = [] {
+		auto epochs = std::make_unique<std::atomic<uint64_t>[]>(RegionEpochCount);
+		for (uint64_t region = 0; region < RegionEpochCount; ++region)
+			epochs[region].store((region + 1) << 32u, std::memory_order_relaxed);
+		return epochs;
+	}();
+	void TouchRegions(uint64_t vaddr, uint64_t size) {
+		if (size == 0) return;
+		for (uint64_t region = vaddr >> RegionEpochBits, last = (vaddr + size - 1) >> RegionEpochBits;
+		     region <= last && region < RegionEpochCount; ++region)
+			m_region_epochs[region].fetch_add(1, std::memory_order_relaxed);
+	}
+	[[nodiscard]] uint64_t RegionEpoch(uint64_t vaddr) const {
+		const auto region = vaddr >> RegionEpochBits;
+		return region < RegionEpochCount ? m_region_epochs[region].load(std::memory_order_relaxed) : m_mapping_epoch;
 	}
 
 	// True when no physical byte of [begin, end) is mapped by more than one guest mapping.
@@ -1108,20 +1191,22 @@ private:
 	}
 
 	struct HostReadTranslation { MapEntry entry; uint64_t epoch = 0; };
-	// The host read translation of `vaddr`'s 4 MiB granule, this thread's (readers of different slots fill them at
-	// once): 1024 cover 4 GiB without two granules sharing one (with 64, granules 256 MiB apart evicted each other
-	// and their reads searched m_maps). An entry holds while its epoch is the mappings' (read under a read slot).
+	// The host read translation of `vaddr`'s 256 KiB granule, this thread's (readers of different slots fill them at
+	// once): 4096 cover 1 GiB without two granules sharing one. An entry holds while its epoch is its region's
+	// (RegionEpoch, read under a read slot). (By 4 MiB granule, the mappings of the game's heaps - 43 to 208 of 192-512
+	// KiB in each of its 120 MiB heaps, more as its direct memory gets cut finer - evicted each other, and their reads
+	// searched m_maps.)
 	HostReadTranslation& HostReadTranslationOf(uint64_t vaddr) {
 		struct Translations {
 			const GuestBackingStore*               store = nullptr;
-			std::array<HostReadTranslation, 1024> entries {};
+			std::array<HostReadTranslation, 4096> entries {};
 		};
 		thread_local Translations translations;
 		if (translations.store != this) {
 			translations.store = this;
 			translations.entries.fill({});
 		}
-		return translations.entries[(vaddr >> 22) % translations.entries.size()];
+		return translations.entries[(vaddr >> 18) % translations.entries.size()];
 	}
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
@@ -1297,6 +1382,9 @@ private:
 	static constexpr size_t                    HostReadSlots = 8;
 	std::array<HostReadSlot, HostReadSlots> m_host_read_slots {};
 	uint64_t m_mapping_epoch = 1;
+	// Moves when some physical byte gains or loses its second guest mapping (AddCoverage): uniqueness proven before holds
+	// while it stays (and the mapping's region epoch, RegionEpoch).
+	uint64_t m_alias_epoch = 1;
 };
 
 class GuestAddressSpace {
@@ -1406,6 +1494,7 @@ public:
 	}
 
 	const uint8_t* BackingPointer(uint64_t vaddr, uint64_t size) { return m_backing->BackingPointer(vaddr, size); }
+	uint64_t       BackingMappingEnd(uint64_t vaddr) { return m_backing->MappingEndOf(vaddr); }
 	bool BackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
 		return m_backing->BackingPieces(vaddr, size, pieces);
 	}
@@ -1417,6 +1506,9 @@ public:
 	bool IsUniqueBackingRange(uint64_t vaddr, uint64_t size) { return m_backing->IsUniqueRange(vaddr, size); }
 	bool BackingAliases(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* aliases) {
 		return m_backing->Aliases(vaddr, size, aliases);
+	}
+	bool IsUniqueBackingRangeAcrossMappings(uint64_t vaddr, uint64_t size) {
+		return m_backing->IsUniqueRangeAcrossMappings(vaddr, size);
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }

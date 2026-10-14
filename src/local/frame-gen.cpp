@@ -229,6 +229,7 @@ uint32_t         g_frame_index = 0;
 bool             g_options_set = false;
 vk::Extent2D     g_options_backbuffer {};
 vk::Extent2D     g_options_render {};
+vk::Format       g_options_format = vk::Format::eUndefined; // SDR or HDR10 swapchain
 uint64_t         g_presents = 0;
 int              g_mode_set = -1; // the DLSS-G mode last set (1 on, 0 off)
 std::chrono::steady_clock::time_point g_stat_start {};
@@ -655,7 +656,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		}
 	}
 	// DLSS-G options: on while frames carry inputs; sizes are hints for its allocations.
-	if (!g_options_set || g_mode_set != (usable ? 1 : 0) ||
+	if (!g_options_set || g_mode_set != (usable ? 1 : 0) || g_options_format != format ||
 	    (usable && (g_options_backbuffer != backbuffer || g_options_render != inputs->render_extent))) {
 		sl::DLSSGOptions options {};
 		options.mode                = usable ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
@@ -688,6 +689,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Rect2
 		}
 		g_options_set        = true;
 		g_options_backbuffer = backbuffer;
+		g_options_format     = format;
 	}
 
 	++g_frame_index;

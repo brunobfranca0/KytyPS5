@@ -87,6 +87,14 @@ extern "C" {
 // 1: a table set's image uses proven once are checked again only when their image or the registrations over their
 // pages changed (TableValidateSet); 2: all of them checked, those a proof held for that failed counted.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_table_set_proofs {1};
+// 1: NativeXprStateKey hashes the context and the user configuration again only after a change of their registers;
+// 0: at every call; 2: as 1, each key checked against the full hash (STATE-KEY MISMATCH lines, counter
+// shortcut_mismatches).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_state_key_cache {1};
+// 1: NativeXprTargetsCurrent looks up no target slot while no image was erased, and proves the targets from the
+// registration log over their span; 0: every target looked up and proven again after each resolution epoch move; 2: as
+// 1, each shortcut checked against the full lookups (TARGETS-SHORTCUT MISMATCH lines, counter shortcut_mismatches).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_targets_shortcut {1};
 }
 // Keys that are XXH3 hashes already: their own bucket index (std::hash<uint64_t> is FNV-1a over the bytes on MSVC).
 struct HashedKey {
@@ -233,9 +241,15 @@ struct RenderExecutor::NativeXprDrawState {
 	// The resolution epoch NativeXprTargetsCurrent last found the targets current at (0: not yet): images are made and
 	// deleted (a slot reused) only with a registration change, which moves it.
 	mutable uint64_t                 targets_checked = 0;
+	// TextureCache::EraseEpoch then, and the memory from the lowest target's first byte to the highest's (0, 0: not yet).
+	mutable uint64_t                 targets_erased = 0, targets_span_begin = 0, targets_span_end = 0;
 	// TextureCache::ImagesEpoch after the main executor's last table draw emitted the targets (UINT64_MAX: none): they
 	// stay in place while it does not move (RenderExecutor::TableDraw).
 	mutable uint64_t                 emitted_epoch = UINT64_MAX;
+	// The frame a draw last used it (NativeXprCollect lets one go that none used for NativeXprCache::StateKeepFrames).
+	mutable uint64_t                 used_frame = 0;
+	void Use(uint64_t frame) const { std::atomic_ref<uint64_t>(used_frame).store(frame, std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t UsedFrame() const { return std::atomic_ref<uint64_t>(used_frame).load(std::memory_order_relaxed); }
 };
 
 // One object: its resources under the compiled programs it was translated with.
@@ -783,6 +797,12 @@ struct RenderExecutor::NativeXprCache {
 	std::vector<uint32_t> use_key;
 	size_t                suffix_at = 0; // where the words the try added start (tried_suffix)
 	uint64_t                                swept_frame = UINT64_MAX;
+	// Draw states leave when no draw used them for StateKeepFrames (NativeXprCollect: every StateSweepFrames, past
+	// StatesKept): their keys hold the render targets' addresses, and entering an area made a few thousand that were
+	// never used again (~3 KB each, ~25 MB a world change with what they hold).
+	static constexpr uint64_t StateSweepFrames = 600, StateKeepFrames = 3600;
+	static constexpr size_t   StatesKept       = 2048;
+	uint64_t                  states_swept_frame = UINT64_MAX;
 	// Draw-state key of the latest draw (native or normal), for clean draws.
 	uint64_t state_key       = 0;
 	bool     state_key_valid = false;
@@ -866,13 +886,48 @@ void RenderExecutor::NativeXprKey(CommandBuffer& buffer, std::vector<uint32_t>& 
 // Draw-state identity: the whole graphics context, the user configuration and
 // the graphics shader stage registers with the user-data layout (types and
 // counts) but not the user-data values, which identify the object instead.
+// The context (KBs) and the user configuration are hashed again only after the draw state observer saw a register of
+// theirs change (DrawStateObserver::Shadow::key_changes; the observer sees every packet this thread runs): the draws
+// that change state mostly change the shaders only. (Hashing both at every such draw was ~1.3% of the render thread at
+// Latria standing, ~2000 a frame.) The same key as hashing all of it.
 uint64_t RenderExecutor::NativeXprStateKey(CommandBuffer& buffer) const {
 	const auto& ctx = buffer.GetRegisters();
 	const auto& cfg = buffer.GetUserConfig();
 	const auto& vs  = buffer.GetShaders().GetVs();
 	const auto& ps  = buffer.GetShaders().GetPs();
-	auto hash = XXH3_64bits(&ctx, sizeof(ctx));
-	hash      = XXH3_64bits_withSeed(&cfg, sizeof(cfg), hash);
+	struct Held {
+		const void* ctx = nullptr;
+		const void* cfg = nullptr;
+		uint64_t    ctx_hash = 0, cfg_hash = 0;
+	};
+	thread_local Held held;
+	auto&      shadow  = DrawStateObserver::g_shadow;
+	const auto changes = std::exchange(shadow.key_changes, 0u);
+	const auto mode    = kyty_local_state_key_cache.load(std::memory_order_relaxed);
+	if (mode == 0) held = {};
+	if (held.ctx != &ctx || (changes & 1u) != 0) {
+		held.ctx      = &ctx;
+		held.ctx_hash = XXH3_64bits(&ctx, sizeof(ctx));
+		held.cfg      = nullptr; // (its hash starts from the context's)
+	}
+	if (held.cfg != &cfg || (changes & 4u) != 0) {
+		held.cfg      = &cfg;
+		held.cfg_hash = XXH3_64bits_withSeed(&cfg, sizeof(cfg), held.ctx_hash);
+	}
+	if (mode == 2) {
+		// (Verification: the context and the configuration hashed in full.)
+		if (const auto full = XXH3_64bits_withSeed(&cfg, sizeof(cfg), XXH3_64bits(&ctx, sizeof(ctx)));
+		    full != held.cfg_hash) {
+			static std::atomic<uint32_t> reports {0};
+			LiveCounters::Add(LiveCounters::ShortcutMismatches);
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 32)
+				std::printf("STATE-KEY MISMATCH: changes %u, context %s\n", changes,
+				            held.ctx_hash == XXH3_64bits(&ctx, sizeof(ctx)) ? "same (configuration differs)" : "differs");
+			held.ctx_hash = XXH3_64bits(&ctx, sizeof(ctx));
+			held.cfg_hash = full;
+		}
+	}
+	auto hash = held.cfg_hash;
 	hash      = XXH3_64bits_withSeed(&vs.es_regs, sizeof(vs.es_regs), hash);
 	hash      = XXH3_64bits_withSeed(&vs.ls_regs, sizeof(vs.ls_regs), hash);
 	hash      = XXH3_64bits_withSeed(&vs.hs_regs, sizeof(vs.hs_regs), hash);
@@ -989,6 +1044,29 @@ void RenderExecutor::ResolvePendingTicks(uint64_t pending, uint64_t tick) {
 		if (item.tick == pending) item.tick = tick;
 }
 
+// The draw states no draw used for StateKeepFrames leave. What holds one by its address forgets it: this executor's
+// emission and lookup, its table's last draw and its image sets' transits (TableXpr::epoch moves). Not while another
+// executor reads this catalog (a speculation's): it holds them across draws too.
+void RenderExecutor::NativeXprSweepStates(NativeXprCache& cache, uint64_t frame) {
+	if (Role() != 0 || m_catalog_readers.load(std::memory_order_relaxed) != 0 ||
+	    cache.states.size() <= NativeXprCache::StatesKept)
+		return;
+	const auto   write  = CatalogWrite();
+	const size_t before = cache.states.size();
+	std::erase_if(cache.states, [&](const auto& item) {
+		return item.second->UsedFrame() + NativeXprCache::StateKeepFrames < frame;
+	});
+	if (cache.states.size() == before) return;
+	cache.emit           = {};
+	cache.last_state     = nullptr;
+	cache.last_state_key = 0;
+	m_native_xpr_verify  = {};
+	TableForgetStates();
+	if (SlowLog::HitchThreshold() > 0.0)
+		std::printf("[tsc %llu] XPR draw states %zu -> %zu\n", static_cast<unsigned long long>(__rdtsc()), before,
+		            cache.states.size());
+}
+
 // Once per frame: the retired sets the GPU is done with are kept for reuse or freed, one call per
 // pool.
 void RenderExecutor::NativeXprCollect() {
@@ -1022,6 +1100,10 @@ void RenderExecutor::NativeXprCollect() {
 			NativeXprRetire(std::move(it->second), false);
 			it = cache.records.erase(it);
 		}
+	}
+	if (frame - cache.states_swept_frame >= NativeXprCache::StateSweepFrames) {
+		cache.states_swept_frame = frame;
+		NativeXprSweepStates(cache, frame);
 	}
 	if (cache.collected_frame == frame || cache.retired.empty()) return;
 	cache.collected_frame = frame;
@@ -1728,6 +1810,7 @@ void RenderExecutor::NativeXprCaptureState(CommandBuffer& buffer, const DrawRend
 	auto&      slot  = cache.states[state_key];
 	if (!slot) slot = std::make_unique<NativeXprDrawState>();
 	*slot = std::move(draw_state);
+	slot->Use(m_context.FrameNumber());
 	if (cache.emit.state == slot.get()) cache.emit.state = nullptr;
 }
 
@@ -3043,9 +3126,53 @@ bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_stat
 	// (Every table draw asked: a slot lookup and a cold image object per target, ~28K a frame at 1-1.)
 	if (draw_state.targets_checked == checked) return true;
 	// (A live id is the same object: an erase moves its slot's generation, which the id names. The image itself, a cold
-	// line per target, is not read.)
-	for (const auto& target: draw_state.targets)
-		if (!textures.m_slot_images.is_allocated(target.id)) return false;
+	// line per target, is not read; nor the slots while no image was erased since the last check.)
+	const auto mode     = kyty_local_targets_shortcut.load(std::memory_order_relaxed);
+	const bool shortcut = mode != 0;
+	const auto erased   = textures.EraseEpoch();
+	const auto mismatch = [&](const char* what) {
+		static std::atomic<uint32_t> reports {0};
+		LiveCounters::Add(LiveCounters::ShortcutMismatches);
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 32) std::printf("TARGETS-SHORTCUT MISMATCH: %s\n", what);
+	};
+	if (!shortcut || draw_state.targets_erased != erased) {
+		for (const auto& target: draw_state.targets)
+			if (!textures.m_slot_images.is_allocated(target.id)) return false;
+	} else if (mode == 2) {
+		for (const auto& target: draw_state.targets)
+			if (!textures.m_slot_images.is_allocated(target.id)) {
+				mismatch("an erased target with no erase since the last check");
+				return false;
+			}
+	}
+	// No registration over the targets' span since they were proven (the log's): each target's first page saw none,
+	// as IsTargetCurrent would find. (The epoch moves a few times a frame somewhere; each state used after it read its
+	// targets and their pages' stamps, ~1% of the render thread at Latria.)
+	if (shortcut && draw_state.targets_epoch != 0 && draw_state.targets_epoch != textures.ResolutionEpoch()) {
+		if (draw_state.targets_span_end == 0 && !draw_state.targets.empty()) {
+			draw_state.targets_span_begin = UINT64_MAX;
+			for (const auto& target: draw_state.targets) {
+				draw_state.targets_span_begin = std::min(draw_state.targets_span_begin, target.requested.data.address);
+				draw_state.targets_span_end   = std::max(draw_state.targets_span_end, target.requested.data.address + 1);
+			}
+		}
+		bool known = false;
+		if (draw_state.targets_span_end > draw_state.targets_span_begin &&
+		    !textures.RegistrationsOverlapSince(draw_state.targets_span_begin,
+		                                        draw_state.targets_span_end - draw_state.targets_span_begin,
+		                                        draw_state.targets_epoch, known) &&
+		    known) {
+			if (mode == 2)
+				for (const auto& target: draw_state.targets) {
+					auto epoch = draw_state.targets_epoch;
+					if (!textures.IsTargetCurrent(target.id, target.requested, epoch)) {
+						mismatch("a target not current with no registration over the span since");
+						return false;
+					}
+				}
+			draw_state.targets_epoch = checked;
+		}
+	}
 	if (draw_state.targets_epoch != textures.ResolutionEpoch()) {
 		uint64_t proven = UINT64_MAX;
 		for (const auto& target: draw_state.targets) {
@@ -3055,6 +3182,7 @@ bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_stat
 		}
 		draw_state.targets_epoch = proven != UINT64_MAX ? proven : textures.ResolutionEpoch();
 	}
+	draw_state.targets_erased  = erased;
 	draw_state.targets_checked = checked;
 	return true;
 }
@@ -3189,6 +3317,7 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	emit.generation  = buffer.GraphicsGeneration();
 	emit.state       = &draw_state;
 	emit.pipeline    = &pipeline;
+	draw_state.Use(m_context.FrameNumber());
 	emit.index_base  = index_base;
 	emit.index_bytes = index_bytes;
 	emit.index_type  = index_type;

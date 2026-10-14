@@ -28,6 +28,8 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 // 1: RangeSet fast paths (rangeSet.h) for the GPU-modified range set.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_range_set_fast_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_reprotect_mode {0};
+// Live switch (same-process A/B): ObtainBuffer's memo of repeated shader writes.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_write_memo_mode {1};
 // 1: a guest readback whose window meets an image falls back to the request's own pages.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_narrow_mode {0};
 // KYTY_READBACK_QUEUE (readback-queue.h): 1: readbacks whose bytes no in-flight GPU work writes
@@ -748,6 +750,7 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		m_gpu_modified_ranges.SubtractSorted(request->parts);
 		MoveWrittenObtainEpoch();
+		++m_gpu_coverage_epoch;
 	}
 	// The renderer may have dirtied other pages in the widened window since handoff.
 	for (const auto& page: request->pages)
@@ -957,6 +960,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		m_gpu_modified_ranges.SubtractSorted(copies);
 		MoveWrittenObtainEpoch();
+		++m_gpu_coverage_epoch;
 	}
 	// Only complete dirty-page coverage allows dropping protection. CPU-clean bytes
 	// are never published from the snapshot. Any later upload/GPU write invalidates it.
@@ -1258,6 +1262,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		m_gpu_modified_ranges.SubtractSorted(copies);
 		MoveWrittenObtainEpoch();
+		++m_gpu_coverage_epoch;
 	}
 }
 
@@ -1565,6 +1570,7 @@ void BufferCache::DiscardGpuWrites(uint64_t vaddr, uint64_t size) {
 		m_gpu_modified_ranges.ForEachIntersection(first, last - first, [&](RangeSet::Range range) { dropped += range.size; });
 		m_gpu_modified_ranges.Subtract(first, last - first);
 		MoveWrittenObtainEpoch();
+		++m_gpu_coverage_epoch;
 	}
 	LiveCounters::Add(LiveCounters::DiscardedGpuBytes, dropped);
 	InvalidateCopyFeedback(first, last - first);
@@ -1992,15 +1998,49 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	uint64_t                    last_dirty = 0;
 	vk::Buffer                  source;
 	const Buffer*               ring = nullptr; // (the staging ring the copies read)
+	// The backing mapping the last run piece was in, from its address to its end: runs mostly lie in one mapping, which
+	// nothing unmaps meanwhile (a guest unmap waits for this thread). Found through the backing store's translations, which
+	// TryGetBackingPointer then finds it in. (The guest ranges' MappingEnd for every run was 1.6% of the render thread at
+	// Latria, more as the game's direct memory gets cut finer at every level load.)
+	uint64_t mapping_from = 0, mapping_end = 0;
+	const auto mapping_end_of = [&](uint64_t address) {
+		if (address < mapping_from || address >= mapping_end) {
+			mapping_from = address;
+			mapping_end  = LibKernel::Memory::BackingMappingEnd(address);
+		}
+		return mapping_end;
+	};
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
+		    // A run over consecutive mappings (the game maps its heaps a few hundred KiB at a time) in a copy per
+		    // mapping: each has a backing pointer of its own, so the upload worker reads them and takes their write
+		    // protections (UploadCopies); one copy over a boundary had none, and all of the upload's bytes were read and
+		    // its pages protected on this thread (Latria standing: ReapplyProtection 6% of the render thread).
+		    for (uint64_t at = 0; at < bytes;) {
+			    const uint64_t end   = mapping_end_of(address + at);
+			    const uint64_t piece = end > address + at ? std::min(bytes - at, end - (address + at)) : bytes - at;
+			    copies.emplace_back(total_size, buffer.Offset(address + at), piece);
+			    total_size += piece;
+			    at += piece;
+		    }
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, &ring); }, &last_dirty);
 	if (total_size != 0) LaneSync::NoteRange(buffer.lane_marks, vaddr, size, true);
 	if (source) {
+		// The pieces of one run (split at mapping boundaries for the upload worker's reads, which UploadCopies pushed)
+		// are adjacent in the staging ring and in the buffer: one copy region each run from here on. (The game's
+		// mappings get finer at every level load: 434 -> 586 copies a frame at Stonefang over four rounds.)
+		size_t merged = 0;
+		for (const auto& copy: copies) {
+			if (merged != 0 && copies[merged - 1].srcOffset + copies[merged - 1].size == copy.srcOffset &&
+			    copies[merged - 1].dstOffset + copies[merged - 1].size == copy.dstOffset) {
+				copies[merged - 1].size += copy.size;
+			} else {
+				copies[merged++] = copy;
+			}
+		}
+		copies.resize(merged);
 		for (const auto& copy: copies) {
 			InvalidateCopyFeedback(buffer.CpuAddress() + copy.dstOffset, copy.size);
 			NoteGpuWrite(buffer.CpuAddress() + copy.dstOffset, copy.size);
@@ -2261,6 +2301,25 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
+	// A range written again with nothing changed since (m_write_memo): no lookup, synchronization or range Add. (The
+	// light-loop chains write the same few shared blocks in every dispatch: ~2100 of ~3200 shader-written ranges a frame
+	// at Latria were repeats, each a page-table lookup, a coverage query and a range Add; ~57% of them hit, Stonefang
+	// standing 9.11 -> 8.91 ms render in the same process.)
+	auto& memo = m_write_memo[((vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull >> 40u)) % m_write_memo.size()];
+	if (is_written && memo.vaddr == vaddr && memo.size == size && memo.texel == is_texel_buffer &&
+	    memo.registration == RegistrationEpoch() && memo.coverage == m_gpu_coverage_epoch &&
+	    kyty_local_write_memo_mode.load(std::memory_order_relaxed) != 0) {
+		if (auto* buffer = m_slot_buffers.try_get(memo.id); buffer != nullptr && !buffer->is_deleted && buffer->IsInBounds(vaddr, size)) {
+			TouchBuffer(*buffer);
+			InvalidateCopyFeedback(vaddr, size);
+			NoteGpuWrite(vaddr, size);
+			Spec::NoteGpuWrite(vaddr, size);
+			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
+			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
+			return {buffer, buffer->Offset(vaddr)};
+		}
+	}
+
 	auto* buffer = m_slot_buffers.try_get(id);
 	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) {
 		id     = FindBuffer(vaddr, size);
@@ -2281,6 +2340,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		Spec::NoteGpuWrite(vaddr, size);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
+		memo = {vaddr, size, RegistrationEpoch(), m_gpu_coverage_epoch, id, is_texel_buffer};
 	}
 	return {buffer, buffer->Offset(vaddr)};
 }
@@ -2357,11 +2417,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};
-}
-
-bool BufferCache::BufferHoldsRange(uint64_t vaddr, uint64_t size) {
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	return owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size);
 }
 
 void BufferCache::ApplyImageProtects() {

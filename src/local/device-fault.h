@@ -39,6 +39,11 @@ struct Registry {
 	PFN_vkGetDeviceFaultInfoEXT            get = nullptr;
 	std::mutex                             mutex;
 	std::multimap<uint64_t, BufferSpan>    buffers; // by device address (an address reused after a free: both)
+	// Past this many the older half of the destroyed ones leave (the limit then twice what is left, at least
+	// BufferHistory): a report wants the recent ones, and a world change destroys ~10000 (72 bytes each, kept by the
+	// million before).
+	static constexpr size_t                BufferHistory = size_t {1} << 16u;
+	size_t                                 buffer_limit  = BufferHistory;
 	std::atomic<int>                       report_state {0}; // 0 none, 1 being written, 2 written
 };
 inline Registry g_registry;
@@ -173,9 +178,21 @@ inline void NoteDiscard(VkCommandBuffer command) {
 inline void NoteCreated(uint64_t device, uint64_t size, uint64_t cpu) {
 	if (device == 0 || g_registry.device.load(std::memory_order_relaxed) == VK_NULL_HANDLE) return;
 	std::lock_guard lock(g_registry.mutex);
-	// (Bounded: the destroyed ones leave first.)
-	if (g_registry.buffers.size() >= (size_t {1} << 20u))
-		std::erase_if(g_registry.buffers, [](const auto& item) { return item.second.destroyed_ns != 0; });
+	if (g_registry.buffers.size() >= g_registry.buffer_limit) {
+		// The older half of the destroyed ones leave.
+		std::vector<uint64_t> destroyed;
+		for (const auto& [address, span]: g_registry.buffers)
+			if (span.destroyed_ns != 0) destroyed.push_back(span.destroyed_ns);
+		if (!destroyed.empty()) {
+			const auto middle = destroyed.begin() + static_cast<std::ptrdiff_t>(destroyed.size() / 2);
+			std::nth_element(destroyed.begin(), middle, destroyed.end());
+			const uint64_t cutoff = *middle;
+			std::erase_if(g_registry.buffers, [&](const auto& item) {
+				return item.second.destroyed_ns != 0 && item.second.destroyed_ns <= cutoff;
+			});
+		}
+		g_registry.buffer_limit = std::max(Registry::BufferHistory, g_registry.buffers.size() * 2);
+	}
 	g_registry.buffers.emplace(device, BufferSpan {size, cpu, NowNs(), 0});
 }
 
@@ -343,7 +360,11 @@ inline std::array<DispatchNote, 4096> g_dispatches;
 inline std::atomic<size_t>            g_dispatch_next {0};
 inline void NoteDispatch(uint64_t tick, uint64_t hash, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
 	if (!BreadcrumbsOn()) return;
-	const auto at = g_dispatch_next.fetch_add(1, std::memory_order_relaxed);
+	// (The render thread's: no locked add. A speculation's thread may note one too, which at worst overwrites an entry
+	// of this diagnostic. The add and the entry's store were ~0.6% of the render thread at Latria, ~1250 dispatches a
+	// frame.)
+	const auto at = g_dispatch_next.load(std::memory_order_relaxed);
+	g_dispatch_next.store(at + 1, std::memory_order_relaxed);
 	g_dispatches[at % g_dispatches.size()] = {.tick = tick, .hash = hash, .indirect = indirect, .x = x, .y = y, .z = z};
 }
 

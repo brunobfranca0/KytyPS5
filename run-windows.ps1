@@ -8,6 +8,8 @@
 #   .\run-windows.ps1 -NoRedZone             without guest red-zone protection
 #   .\run-windows.ps1 -Patch <cheat.json>    apply an etaHEN-style game patch
 #   .\run-windows.ps1 -Fullscreen -AspectFit keep the game's 16:9 (black bars) instead of stretching
+#   .\run-windows.ps1 -Hdr                   HDR10 output when Windows HDR is on for the display (the game is
+#                                            told the TV takes HDR and outputs it; SDR otherwise)
 #   .\run-windows.ps1 -Language 11           the console language (0-29 as the PS5 numbers them: 1 English (US),
 #                                            11 Chinese (Simplified); default: the config's)
 #   .\run-windows.ps1 -Set KEY=VALUE         override a switch of the config (KEY= removes it)
@@ -20,6 +22,8 @@
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)
 #   .\run-windows.ps1 -RenderHeight 1080     Demon's Souls renders its 3D at 1920x1080 instead of 2560x1440
 #                                            (720-1440; its 4K output and UI stay): faster where the GPU limits
+#   .\run-windows.ps1 -Quality low            Demon's Souls draws less (low / lowest: simpler shadows and
+#                                            distant detail): faster where the CPU limits
 #   .\run-windows.ps1 -Game <folder>         the game (the folder with eboot.bin); remembered in
 #                                            game-path.txt, a folder dialog when none is known
 #   .\run-windows.ps1 -Game <file.zar>       the game folder packed into a ZArchive (read without extracting it)
@@ -40,6 +44,7 @@ param(
 	[int]$Width = 0,
 	[int]$Height = 0,
 	[switch]$Fullscreen,
+	[switch]$Hdr,
 	[switch]$Baseline,
 	[switch]$Precompile,
 	[int]$Threads = 0,
@@ -49,6 +54,7 @@ param(
 	[int]$Vblank = 0,
 	[switch]$Fps120,
 	[int]$RenderHeight = 0,
+	[string]$Quality = '',
 	[string[]]$Set = @(),
 	[string]$Patch = '',
 	[switch]$AspectFit,
@@ -188,6 +194,7 @@ function Set-Option([string]$name, [string]$value) {
 if ($Width -gt 0) { Set-Option '--screen-width' "$Width" }
 if ($Height -gt 0) { Set-Option '--screen-height' "$Height" }
 if ($Fullscreen) { $options.Add('--fullscreen') }
+if ($Hdr) { $options.Add('--hdr') }
 if ($PresentMode) { Set-Option '--present-mode' $PresentMode }
 if ($Language -ge 0) { Set-Option '--console-language' "$Language" }
 # The flip queue, one flip per vblank, is what caps the game's frame rate: it never waits for a
@@ -340,6 +347,22 @@ if (!$environment.Contains('KYTY_GAME_CONVARS') -and !$Baseline -and $titleId -e
 # the game upscales it to its 3840x2160 output as it does 1440 (a laptop's RTX 3080 at Boletaria 1-1: standing
 # 20.7 -> 24.5 fps at 1080, walking 18.7 -> 22.2).
 if ($RenderHeight -gt 0 -and $RenderHeight -ne 1440) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
+# -Quality low|lowest: Demon's Souls engine settings that cut what a frame draws, for PCs whose CPU limits the frame
+# rate (each draw costs the emulator CPU time). low: shadows drawn from simpler meshes, levels of detail chosen as for
+# a 720-line picture (1080), sun shadows to 125 m (250); lowest: detail as for 480 lines, sun shadows to 60 m, no
+# ambient shadowing, no shadows from torches and other spot lights. A laptop Ryzen 9 5900HX + RTX 3080 standing, same
+# process (standard -> low / lowest): Boletaria 1-1 20.0 -> 22.6 / 24.0 fps, Latria 22.6 -> 25.5 / 25.8, Shrine of
+# Storms 25.0 -> 26.6 / 29.0; with -RenderHeight 1080 Latria 25.4 -> 27.8 / 28.8, the Shrine 30.7 -> 34.9 / 35.8.
+$qualityConvars = @{
+	low    = 'r_forceShadowLOD=true;r_forceViewportHeightForPixelSizeCalc=720;sunShadowMaxDistance=125'
+	lowest = 'r_forceShadowLOD=true;r_forceViewportHeightForPixelSizeCalc=480;sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false'
+}
+if ($Quality -and $Quality -ne 'standard') {
+	if (!$qualityConvars.Contains($Quality)) { throw "-Quality takes low or lowest (or standard), not '$Quality'" }
+	if ($titleId -match '^PPSA0134[0-2]$') {
+		$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars[$Quality]) | Where-Object { $_ }) -join ';'
+	}
+}
 # Memory the game releases (texture pool layers, 64 KiB mappings each) is not unprotected mapping
 # by mapping before its unmap: VirtualProtect was ~15% of the render thread in the open area.
 if (!$environment.Contains('KYTY_UNMAP_PROTECT_SKIP') -and !$Baseline) { $environment['KYTY_UNMAP_PROTECT_SKIP'] = '1' }
@@ -538,9 +561,10 @@ if ($Prompt -and ($offer -or !$tested)) {
 }
 # Memory: Windows ends a program that asks for more than RAM and the page file can hold. The emulator
 # commits about 34 GB (the game's 13.5 GiB of PS5 memory, about 11 GB Windows sets aside to back the
-# video memory in use, the emulator's own) and takes about 20 GB of RAM while a save loads, but uses
-# only about 4 GB of it in play (10-09: emptied after loading, the working set grew back to 3.5 GB in
-# a minute of play at 60 fps): with 16 GB Windows pages the rest out and loading is slower.
+# video memory in use, the emulator's own). Under 24 GB of RAM it compiles no shaders or pipelines at
+# start-up and keeps its pipeline caches small: about 14 GB in use after a save loads at 1-1 (most of it
+# the game's own memory), of which play keeps using only a few GB (10-09: emptied after loading, the
+# working set grew back to 3.5 GB in a minute of play at 60 fps): with 16 GB Windows pages the rest out.
 $os = Get-CimInstance Win32_OperatingSystem
 [double]$ram = $os.TotalVisibleMemorySize * 1KB
 [double]$commit = $os.FreeVirtualMemory * 1KB
@@ -553,8 +577,8 @@ if ((Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile) {
 }
 $memory = @()
 if ($ram -lt 24GB) {
-	$memory += ("This PC has {0:N0} GB of RAM: the game runs, but loading takes longer (the emulator takes about 20 GB " +
-		"while a save loads and uses about 4 GB in play; 32 GB recommended).") -f ($ram / 1GB)
+	$memory += ("This PC has {0:N0} GB of RAM: the game runs, but loading takes longer (the emulator takes about 14 GB " +
+		"while a save loads and keeps using a few GB in play; 32 GB recommended).") -f ($ram / 1GB)
 }
 if ($commit -lt 34GB) {
 	$memory += ("Windows can give programs only {0:N0} GB more memory (RAM plus page file) and the emulator needs about 34 GB: " +

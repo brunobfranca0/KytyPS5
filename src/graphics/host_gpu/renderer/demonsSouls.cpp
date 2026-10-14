@@ -8,12 +8,26 @@
 #include "sync-stats.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+
+// KYTY_COMPUTE_CHAIN=0: no chains (10-14, the 8 GB laptop's GPU hangs at 2-2, a TDR in ~half of the 10-minute tours
+// with chains: none in 8 tours without them, at ~25% less fps there). Fencing only the culling, list-building or atomic
+// programs, a chain length cap of 8, or barriers for every V#, image and BDA read overlap did not stop them.
+extern "C" {
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_compute_chain_mode {[] {
+	const char* value = std::getenv("KYTY_COMPUTE_CHAIN");
+	return value != nullptr && value[0] == '0' ? 0u : 1u;
+}()};
+}
 
 namespace Libs::Graphics::DemonsSouls {
 bool IsSupportedGame() {
@@ -23,6 +37,16 @@ bool IsSupportedGame() {
 		return Loader::SystemContentParamSfoGetString("TITLE_ID", &title) && IsSupportedTitle(title);
 	}();
 	return supported;
+}
+
+bool ComputeChains() {
+	static const bool reported = [] {
+		if (kyty_local_compute_chain_mode.load(std::memory_order_relaxed) == 0)
+			std::printf("Compute chains: off (KYTY_COMPUTE_CHAIN=0)\n");
+		return true;
+	}();
+	(void)reported;
+	return IsSupportedGame() && kyty_local_compute_chain_mode.load(std::memory_order_relaxed) != 0;
 }
 
 // The engine's cs_memset32 shader (coredata/enginesupport/shaders/_ps5/cs_memset32) as the builds seen have it:
@@ -109,10 +133,22 @@ bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint3
 	return true;
 }
 
+// (Diagnostic, KYTY_LINEAR_COPY_TRACE: why a dispatch of the copy shader took the shader path.)
+static void LinearCopyRefused(const char* reason, uint64_t dst = 0, uint64_t count = 0, uint64_t period = 0) {
+	static const bool           trace = std::getenv("KYTY_LINEAR_COPY_TRACE") != nullptr;
+	static std::atomic<uint32_t> printed {0};
+	if (trace && printed.fetch_add(1) < 300)
+		std::printf("LINEAR-COPY-REFUSED %s dst 0x%llx count %llu period %llu\n", reason,
+		            static_cast<unsigned long long>(dst), static_cast<unsigned long long>(count),
+		            static_cast<unsigned long long>(period));
+}
+
 std::optional<LinearCopy> LinearCopyOf(const LinearCopyDispatch& dispatch, uint32_t x, uint32_t y, uint32_t z, uint32_t mode,
                                        const char** reason, bool* aliased) {
-	const auto refuse = [&](const char* why) {
+	// (The reason for KYTY_SYNC_STATS' [memset] lines and KYTY_LINEAR_COPY_TRACE's LINEAR-COPY-REFUSED lines.)
+	const auto refuse = [&](const char* why, uint64_t dst = 0, uint64_t count = 0, uint64_t period = 0) {
 		if (reason != nullptr) *reason = why;
+		LinearCopyRefused(why, dst, count, period);
 		return std::nullopt;
 	};
 	const auto& data = dispatch.user_data;
@@ -138,24 +174,35 @@ std::optional<LinearCopy> LinearCopyOf(const LinearCopyDispatch& dispatch, uint3
 	std::array<uint32_t, 2> controls {};
 	if (!Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(parameters.Base48(), controls.data(),
 	                                                           sizeof(controls)))
-		return refuse("parameters GPU-written");
+		return refuse("parameters GPU-written", destination.Base48());
 	const uint64_t count = controls[0], period = controls[1], bytes = count * 4;
 	if (count == 0 || period < count || count > source.NumRecords() || count > destination.NumRecords())
-		return refuse("counts");
-	if (x != (count + 63) / 64 || bytes > 16 * 1024 * 1024) return refuse("groups or size");
+		return refuse("counts", destination.Base48(), count, period);
+	if (x != (count + 63) / 64 || bytes > 16 * 1024 * 1024) return refuse("groups or size", destination.Base48(), count, period);
 	const auto src = source.Base48(), dst = destination.Base48();
 	if ((src < dst + bytes && dst < src + bytes) ||
 	    (parameters.Base48() < dst + bytes && dst < parameters.Base48() + 16))
-		return refuse("overlap");
+		return refuse("overlap", dst, count, period);
 	// (The source and the parameters are only read: an alias of theirs changes nothing. The destination's aliases are the
 	// caller's to make coherent; without a caller that does, the shader runs.)
-	if (!LibKernel::Memory::IsUniqueGuestBackingRange(dst, bytes)) {
-		if (aliased == nullptr) return refuse("aliased destination");
+	// (Over consecutive mappings: the game's heaps are mapped a few hundred KiB at a time, and a 4 MiB copy of its
+	// constants spanned ten, which took the shader path every frame: its destination GPU-written, every table
+	// evaluation reading descriptors there waited for the GPU, ~2 drains a frame after the first area. A destination
+	// unique over each of its consecutive mappings is not aliased.)
+	if (!LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(dst, bytes)) {
+		static const bool trace = std::getenv("KYTY_LINEAR_COPY_TRACE") != nullptr;
+		if (trace)
+			std::printf("LINEAR-COPY-MAPPINGS src 0x%llx end 0x%llx dst 0x%llx end 0x%llx bytes 0x%llx\n",
+			            static_cast<unsigned long long>(src), static_cast<unsigned long long>(LibKernel::Memory::MappingEnd(src)),
+			            static_cast<unsigned long long>(dst), static_cast<unsigned long long>(LibKernel::Memory::MappingEnd(dst)),
+			            static_cast<unsigned long long>(bytes));
+		if (aliased == nullptr) return refuse("aliased backing (destination)", dst, count, period);
 		*aliased = true;
 	} else if (aliased != nullptr) {
 		*aliased = false;
 	}
-	if (!LibKernel::Memory::IsFullyMapped(src, bytes) || !LibKernel::Memory::IsFullyMapped(dst, bytes)) return refuse("unmapped");
+	if (!LibKernel::Memory::IsFullyMapped(src, bytes) || !LibKernel::Memory::IsFullyMapped(dst, bytes))
+		return refuse("unmapped", dst, count, period);
 	return LinearCopy {src, dst, bytes};
 }
 } // namespace Libs::Graphics::DemonsSouls

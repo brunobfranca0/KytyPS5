@@ -191,6 +191,10 @@ bool CreateFrameGeneration(GraphicContext& graphics, vk::Extent2D display, vk::E
 	const bool  normal  = depth != nullptr && std::string(depth) == "normal";
 	create.flags        = normal ? 0u : (FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED | FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE);
 	if (EnvOn("KYTY_FSR3_DEBUG", false)) create.flags |= FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING;
+	// --hdr: an HDR10 (PQ) swapchain's backbuffer holds high-dynamic-range color (the context is made again when the
+	// swapchain's format changes between SDR and HDR10).
+	if (format == vk::Format::eA2B10G10R10UnormPack32 || format == vk::Format::eA2R10G10B10UnormPack32)
+		create.flags |= FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE;
 	create.displaySize      = {display.width, display.height};
 	create.maxRenderSize    = {render.width, render.height};
 	create.backBufferFormat = ffxApiGetSurfaceFormatVK(static_cast<VkFormat>(format));

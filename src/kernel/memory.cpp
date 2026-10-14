@@ -1156,6 +1156,10 @@ const uint8_t* TryGetBackingPointer(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr ? g_guest_address_space->BackingPointer(vaddr, size) : nullptr;
 }
 
+uint64_t BackingMappingEnd(uint64_t vaddr) {
+	return g_guest_address_space != nullptr ? g_guest_address_space->BackingMappingEnd(vaddr) : 0;
+}
+
 bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
 	return g_guest_address_space != nullptr && g_guest_address_space->BackingPieces(vaddr, size, pieces);
 }
@@ -1193,6 +1197,10 @@ bool IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size) {
 
 bool GuestBackingAliases(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* aliases) {
 	return g_guest_address_space != nullptr && g_guest_address_space->BackingAliases(vaddr, size, aliases);
+}
+
+bool IsUniqueGuestBackingRangeAcrossMappings(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->IsUniqueBackingRangeAcrossMappings(vaddr, size);
 }
 
 // `data` is host memory (every caller reads into a local or a scratch vector): the lock-free

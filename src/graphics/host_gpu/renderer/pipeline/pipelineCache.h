@@ -160,7 +160,8 @@ public:
 	// The caches the shards of a precompile saved next to the static cache, merged into it. With
 	// pipeline binaries and `prune`, the store becomes the shards' pipelines only (a whole run's: what
 	// older runs left that no seed makes any more is dropped).
-	static bool MergePrecompileShards(GraphicContext& graphics, bool prune);
+	// `keep_shards`: the shard files stay (a merge in the middle of a run, which its final pruning merge counts).
+	static bool MergePrecompileShards(GraphicContext& graphics, bool prune, bool keep_shards = false);
 #endif
 
 	// A pipeline no cache holds, compiled without optimization so its draw or dispatch need not wait:
@@ -248,6 +249,8 @@ public:
 	// The optimized builds finished since replace their unoptimized pipelines (at each flip: the draws of native
 	// XPR records hold their pipelines and look nothing up). GPU thread.
 	void PromoteFinished();
+	// Live "objects": what the cache keeps, as counts (stdout).
+	void ReportObjects(uint64_t id) const;
 	// Native XPR records (src/local/native-xpr.inc): the SRT evaluation of a stage
 	// whose compiled permutation is already chosen, with the readers the normal
 	// path uses. False when the evaluation fails or would select another
@@ -423,7 +426,7 @@ private:
 	void WarmPipelines(uint64_t compute_video = UINT64_MAX);
 #ifdef KYTY_STATIC_PRECOMPILE
 	bool SaveStaticCache(vk::PipelineCache cache, const std::filesystem::path& path);
-	static bool MergeBinaryShards(GraphicContext& graphics, bool prune);
+	static bool MergeBinaryShards(GraphicContext& graphics, bool prune, bool keep_shards);
 	bool WarmSeeds(const PrecompileOptions& options, size_t& left_out);
 #endif
 };
@@ -451,6 +454,10 @@ void MaterializationReaders(ShaderRecompiler::IR::SrtRuntime& runtime);
 // hold (the precompile: of each it makes) and its modules' shader and SPIR-V hashes.
 bool PipelineKeyLog();
 void NotePipelineKeyModule(vk::ShaderModule module, uint64_t shader_hash, uint64_t spirv_hash, size_t spirv_bytes = 0);
+// (KYTY_INLINE_KEY_CHECK) Each module's SPIR-V kept, so that every pipeline key is compared with the key of the same
+// pipeline given its shaders' SPIR-V inline (VK_KHR_maintenance5): what a store keyed by the first needs of the second.
+bool InlineKeyCheck();
+void NoteInlineSpirv(vk::ShaderModule module, const std::vector<uint32_t>& spirv);
 // The descriptor set and pipeline layouts the pipelines share (one pair per binding set, shaders.cpp): destroyed after
 // every pipeline that uses them.
 void DestroySharedLayouts(vk::Device device);

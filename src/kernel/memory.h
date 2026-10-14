@@ -121,6 +121,8 @@ bool                   TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t
 // The backing bytes of a guest range inside one mapping (readable regardless of the guest
 // range's protection), or null.
 const uint8_t*         TryGetBackingPointer(uint64_t vaddr, uint64_t size);
+// The end of the backing mapping `vaddr` is in (0: none): a range up to it has one backing pointer.
+uint64_t               BackingMappingEnd(uint64_t vaddr);
 // The same for a range that spans mappings: one (pointer, bytes) piece per mapping, in order.
 bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
 bool                   TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size);
@@ -136,6 +138,9 @@ extern thread_local uint64_t g_srt_shader_hash;
 bool                   IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size);
 // The other virtual ranges mapping the same bytes ({vaddr, size} each), for a range IsUniqueGuestBackingRange refused.
 bool                   GuestBackingAliases(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* aliases);
+// The same over consecutive mappings (each mapping's part unique, none of it unmapped): for a caller that reads and
+// writes the range through its guest addresses only (not through one backing pointer).
+bool                   IsUniqueGuestBackingRangeAcrossMappings(uint64_t vaddr, uint64_t size);
 // On failure, optionally return a static diagnostic string (no allocation).
 // The mapped parts of a guest range as they are, unmapped parts as zeros (a texture pool span
 // whose memory the game released). False when the backing store is unavailable.

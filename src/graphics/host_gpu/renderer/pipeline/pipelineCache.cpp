@@ -11,12 +11,15 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
+#include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheBlobs.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
+#include "resource-plan-serial.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -159,11 +162,16 @@ const std::string& PipelineCacheGameId() {
 }
 
 // Reads through a null pointer (a draw the game leaves unset during loads): no guest memory is mapped
-// there, and the GPU reads zeros where the host would fault.
-constexpr uint64_t NullPageEnd = 0x10000;
+// there, and the GPU reads zeros where the host would fault. Likewise past the guest address space (1 TiB, the
+// trackers' range): an in-game world change (archstone travel to Latria) read an SRT pointer of -1.
+constexpr uint64_t NullPageEnd     = 0x10000;
+constexpr uint64_t GuestAddressEnd = uint64_t {1} << 40u;
+[[nodiscard]] constexpr bool NoGuestMemory(uint64_t address, uint64_t size) {
+	return address < NullPageEnd || address >= GuestAddressEnd || GuestAddressEnd - address < size;
+}
 
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
-	if (value != nullptr && address < NullPageEnd) {
+	if (value != nullptr && NoGuestMemory(address, sizeof(*value))) {
 		*value = 0;
 		return true;
 	}
@@ -179,7 +187,7 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	// A GPU-written neighbour may protect a clean descriptor on the same page.
 	// Reading its checked backing alias avoids an unnecessary GPU drain. Dirty,
 	// unmapped and untracked addresses retain the original load/fault behavior.
-	if (address < NullPageEnd) {
+	if (NoGuestMemory(address, sizeof(*value))) {
 		*value = 0;
 	} else if (Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value, sizeof(*value))) {
 		LiveCounters::Add(LiveCounters::SrtWatchedReads);
@@ -196,7 +204,7 @@ uint64_t ShaderMappingEnd(void*, uint64_t address) {
 bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
 	// Clean spans also read whole tables (resource materialization); raw spans are SRT groups. The
 	// null page goes word by word (the readers above).
-	return count >= 2 && count <= (clean ? 1024u : 16u) && address >= NullPageEnd &&
+	return count >= 2 && count <= (clean ? 1024u : 16u) && !NoGuestMemory(address, uint64_t {count} * 4u) &&
 	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
 }
 
@@ -440,7 +448,10 @@ struct PipelineCache::ProgramCache {
 	// (StaticInputsPath: every shader the game ships, with the resource specialization it most likely
 	// gets) are translated on low-priority threads while the game runs, largest first, so a program
 	// met for the first time after the warmup needs only its shader module (Get). Their SPIR-V
-	// (gigabytes for the whole game) waits in a temporary file, the plans and infos in memory.
+	// (gigabytes for the whole game) and resource plans wait in a temporary file, the infos in memory.
+	// Heap bytes of a prefetched group by part (AddGroupMemory).
+	enum PrefetchMemoryPart : size_t { MemPlanValues, MemPlanMemoryInfo, MemPlanOther, MemPlanInfo, MemModuleInfo,
+		MemModuleTable, MemModuleBda, MemModuleBindings, MemModuleSpecialization, MemGroup, PrefetchMemoryParts };
 	struct Prefetch {
 		enum State : uint8_t { Pending, Running, Done, Taken };
 		struct Group { // the inputs of one program
@@ -451,6 +462,12 @@ struct PipelineCache::ProgramCache {
 			std::atomic<uint8_t>                              state {Pending};
 			std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 			std::vector<PrefetchedModule>                     modules;
+			// The plan in the scratch file instead (zstd-compressed ResourcePlanSerial bytes): `plan` stays empty until
+			// the game takes the group over (LoadSpilledPlan). Its linear SRT plan stays here: rebuilding it (its code
+			// generated, its AOT function looked up) took ~1 ms of the render thread's per plan; the plan's values ~0.2.
+			uint64_t                                                          plan_offset = 0;
+			uint32_t                                                          plan_bytes = 0, plan_raw = 0;
+			std::shared_ptr<const ShaderRecompiler::IR::LinearSrtPlan>       plan_linear;
 		};
 		~Prefetch() {
 			stop.store(true, std::memory_order_relaxed);
@@ -471,8 +488,62 @@ struct PipelineCache::ProgramCache {
 		std::vector<std::thread>                               threads;
 		// Render thread: programs and modules taken over, programs translated there while pending.
 		size_t adopted = 0, adopted_modules = 0, claimed = 0;
+		// Render thread: spilled plans loaded back, and the time it took (LoadSpilledPlan).
+		size_t plans_loaded = 0;
+		double plan_load_ms = 0.0, plan_load_max_ms = 0.0, plan_read_ms = 0.0, plan_values_ms = 0.0, plan_linear_ms = 0.0;
+		// What the translated groups held in memory before their plans were spilled (AddGroupMemory), summed by the
+		// workers as they finish them.
+		std::array<std::atomic<uint64_t>, PrefetchMemoryParts> memory {};
+		// Plans written to the scratch file (SpillPlan) and their bytes there; KYTY_PLAN_SPILL_VERIFY: reloads that saved
+		// differently.
+		std::atomic<uint64_t> spilled_plans {0}, spilled_plan_bytes {0}, spill_verify_failures {0};
 	};
 	std::unique_ptr<Prefetch> prefetch;
+
+	// Heap bytes of a prefetched group by part (container capacities, list and string nodes; allocator headers left
+	// out): what keeping every program's plan and infos costs.
+	template <typename T> static uint64_t Capacity(const std::vector<T>& v) { return v.capacity() * sizeof(T); }
+	static uint64_t InfoBytes(const ShaderRecompiler::IR::ShaderInfo& info) {
+		uint64_t n = Capacity(info.buffers) + Capacity(info.images) + Capacity(info.samplers) + Capacity(info.sampled_pairs) +
+		             Capacity(info.inputs) + Capacity(info.outputs);
+		for (const auto& image: info.images) n += Capacity(image.indirect_resources);
+		for (const auto& input: info.inputs) n += input.debug_name.capacity() > 15 ? input.debug_name.capacity() + 1 : 0;
+		for (const auto& output: info.outputs) n += output.debug_name.capacity() > 15 ? output.debug_name.capacity() + 1 : 0;
+		return n;
+	}
+	static void AddGroupMemory(Prefetch& p, const Prefetch::Group& group) {
+		std::array<uint64_t, PrefetchMemoryParts> n {};
+		n[MemGroup] = sizeof(group) + Capacity(group.records) + Capacity(group.modules);
+		if (group.plan) {
+			const auto& plan = *group.plan;
+			for (const auto& inst: plan.value_storage)
+				n[MemPlanValues] += sizeof(inst) + 2 * sizeof(void*) + inst.NumArgs() * sizeof(ShaderRecompiler::IR::Value) +
+				                    inst.NumPhiBlocks() * sizeof(void*) + inst.Uses().capacity() * sizeof(ShaderRecompiler::IR::Use);
+			n[MemPlanMemoryInfo] = Capacity(plan.memory_info);
+			n[MemPlanOther]      = Capacity(plan.descriptor_sources) + Capacity(plan.control_flow) +
+			                       Capacity(plan.materialization_sources) + Capacity(plan.srt_reads) + Capacity(plan.clean_flat_slots);
+			for (const auto& block: plan.control_flow) n[MemPlanOther] += Capacity(block.successors) + Capacity(block.sources);
+			if (plan.linear_srt) {
+				const auto& linear = *plan.linear_srt;
+				n[MemPlanOther] += sizeof(linear) + Capacity(linear.nodes) + Capacity(linear.read_groups) +
+				                   Capacity(linear.descriptor_words) + Capacity(linear.flat_words) + Capacity(linear.sources) +
+				                   Capacity(linear.clean_slots) + Capacity(linear.descriptor_sizes) + Capacity(linear.active_sources);
+			}
+			n[MemPlanInfo] = InfoBytes(plan.info);
+		}
+		for (const auto& module: group.modules) {
+			const auto& info = module.program;
+			n[MemModuleInfo] += InfoBytes(info.info);
+			n[MemModuleTable] += Capacity(info.table_plan.slots) + Capacity(info.table_plan.buffers) +
+			                     Capacity(info.table_plan.images) + Capacity(info.table_plan.samplers) +
+			                     Capacity(info.table_plan.gpu) + Capacity(info.table_plan.cpu) + Capacity(info.table_plan.indirect);
+			n[MemModuleBda] += Capacity(info.bda_read_plan.spans);
+			n[MemModuleBindings] += Capacity(info.bindings.user_data_registers) + Capacity(info.bindings.descriptors);
+			for (const auto& binding: info.bindings.descriptors) n[MemModuleBindings] += Capacity(binding.resources);
+			n[MemModuleSpecialization] += Capacity(module.specialization.buffers) + Capacity(module.specialization.images);
+		}
+		for (size_t i = 0; i < PrefetchMemoryParts; ++i) p.memory[i].fetch_add(n[i], std::memory_order_relaxed);
+	}
 
 	static uint64_t SourceDigest(std::span<const uint32_t> code, std::span<const uint32_t> back_code) {
 		return XXH3_64bits_withSeed(back_code.data(), back_code.size_bytes(), XXH3_64bits(code.data(), code.size_bytes()));
@@ -543,6 +614,8 @@ struct PipelineCache::ProgramCache {
 			auto  expected = static_cast<uint8_t>(Prefetch::Pending);
 			if (group.state.compare_exchange_strong(expected, Prefetch::Running, std::memory_order_acq_rel)) {
 				PrefetchTranslate(group);
+				AddGroupMemory(p, group);
+				SpillPlan(p, group);
 				group.state.store(Prefetch::Done, std::memory_order_release);
 				group.state.notify_all();
 			}
@@ -551,8 +624,90 @@ struct PipelineCache::ProgramCache {
 				                 p.groups.size(), p.spirv_bytes.load(std::memory_order_relaxed) >> 20u,
 				                 p.spill_end.load(std::memory_order_relaxed) >> 20u);
 				std::vector<std::vector<uint32_t>>().swap(p.inputs.records); // no longer read
+				const auto mib = [&](PrefetchMemoryPart part) { return p.memory[part].load(std::memory_order_relaxed) >> 20u; };
+				PipelineCacheLog("Shader prefetch memory (MiB): plan values {} memory infos {} other {} info {}, modules info {} "
+				                 "table plans {} read plans {} bindings {} specializations {}, groups {}",
+				                 mib(MemPlanValues), mib(MemPlanMemoryInfo), mib(MemPlanOther), mib(MemPlanInfo), mib(MemModuleInfo),
+				                 mib(MemModuleTable), mib(MemModuleBda), mib(MemModuleBindings), mib(MemModuleSpecialization),
+				                 mib(MemGroup));
+				PipelineCacheLog("Shader prefetch: {} plans in the temporary file ({} MiB compressed), {} reloaded differently",
+				                 p.spilled_plans.load(std::memory_order_relaxed),
+				                 p.spilled_plan_bytes.load(std::memory_order_relaxed) >> 20u,
+				                 p.spill_verify_failures.load(std::memory_order_relaxed));
 			}
 		}
+	}
+
+	// The group's plan to the scratch file (KYTY_PLAN_SPILL=0 keeps it in memory): 20K plans were ~2.5 GB of RAM.
+	static bool PlanSpillEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_PLAN_SPILL");
+			return value == nullptr || std::string_view(value) != "0";
+		}();
+		return enabled;
+	}
+	void SpillPlan(Prefetch& p, Prefetch::Group& group) {
+		if (!group.plan || !PlanSpillEnabled()) return;
+		std::vector<uint8_t> bytes;
+		if (!ResourcePlanSerial::Save(*group.plan, bytes) || bytes.size() > UINT32_MAX) return;
+		static const bool verify = std::getenv("KYTY_PLAN_SPILL_VERIFY") != nullptr;
+		if (verify) {
+			ShaderRecompiler::IR::ResourcePlan loaded;
+			std::vector<uint8_t>               again;
+			bool                               linear = false;
+			const bool                         reloaded = ResourcePlanSerial::Load(bytes, loaded, &linear);
+			loaded.linear_srt                           = group.plan->linear_srt;
+			if (!reloaded || linear != (group.plan->linear_srt != nullptr) || !ResourcePlanSerial::Save(loaded, again) ||
+			    again != bytes) {
+				if (p.spill_verify_failures.fetch_add(1, std::memory_order_relaxed) < 20)
+					PipelineCacheLog("Shader prefetch: plan of 0x{:016x} reloads differently", group.plan->shader_hash);
+				return;
+			}
+		}
+		std::vector<char> packed(ZSTD_compressBound(bytes.size()));
+		const auto        packed_size = ZSTD_compress(packed.data(), packed.size(), bytes.data(), bytes.size(), 1);
+		if (ZSTD_isError(packed_size)) return;
+		const auto offset = p.spill_end.fetch_add(packed_size, std::memory_order_relaxed);
+		if (!LocalPlatform::WriteScratchFile(p.spill, offset, packed.data(), packed_size)) return;
+		group.plan_offset = offset;
+		group.plan_bytes  = static_cast<uint32_t>(packed_size);
+		group.plan_raw    = static_cast<uint32_t>(bytes.size());
+		group.plan_linear = std::move(group.plan->linear_srt); // (made from the plan alone: no reference into it)
+		group.plan.reset();
+		p.spilled_plans.fetch_add(1, std::memory_order_relaxed);
+		p.spilled_plan_bytes.fetch_add(packed_size, std::memory_order_relaxed);
+	}
+	// The plan SpillPlan wrote, back in the group (render thread, the group taken over); false when it cannot be read.
+	bool LoadSpilledPlan(Prefetch::Group& group) {
+		if (group.plan || group.plan_bytes == 0) return group.plan.has_value();
+		const auto begin = std::chrono::steady_clock::now();
+		std::vector<char>    packed(group.plan_bytes);
+		std::vector<uint8_t> bytes(group.plan_raw);
+		if (!LocalPlatform::ReadScratchFile(prefetch->spill, group.plan_offset, packed.data(), packed.size()) ||
+		    ZSTD_decompress(bytes.data(), bytes.size(), packed.data(), packed.size()) != bytes.size())
+			return false;
+		const auto read = std::chrono::steady_clock::now();
+		ShaderRecompiler::IR::ResourcePlan plan;
+		bool                               linear = false;
+		if (!ResourcePlanSerial::Load(bytes, plan, &linear)) return false;
+		const auto values = std::chrono::steady_clock::now();
+		if (linear != (group.plan_linear != nullptr)) return false;
+		plan.linear_srt = std::move(group.plan_linear);
+		group.plan.emplace(std::move(plan));
+		const auto end = std::chrono::steady_clock::now();
+		prefetch->plan_read_ms += std::chrono::duration<double, std::milli>(read - begin).count();
+		prefetch->plan_values_ms += std::chrono::duration<double, std::milli>(values - read).count();
+		prefetch->plan_linear_ms += std::chrono::duration<double, std::milli>(end - values).count();
+		const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
+		prefetch->plans_loaded++;
+		prefetch->plan_load_ms += ms;
+		prefetch->plan_load_max_ms = std::max(prefetch->plan_load_max_ms, ms);
+		if (std::has_single_bit(prefetch->plans_loaded) && prefetch->plans_loaded >= 64)
+			PipelineCacheLog("Shader prefetch: {} plans loaded back from the temporary file in {:.1f} ms (at most {:.2f} ms; "
+			                 "read {:.1f}, values {:.1f}, linear SRT {:.1f})",
+			                 prefetch->plans_loaded, prefetch->plan_load_ms, prefetch->plan_load_max_ms, prefetch->plan_read_ms,
+			                 prefetch->plan_values_ms, prefetch->plan_linear_ms);
+		return true;
 	}
 
 	// What PrepareWarmJob does for a recorded input, for each of the program's.
@@ -605,7 +760,7 @@ struct PipelineCache::ProgramCache {
 		}
 		for (; state == Prefetch::Running; state = group.state.load(std::memory_order_acquire))
 			group.state.wait(Prefetch::Running, std::memory_order_acquire);
-		if (state != Prefetch::Done || !group.plan || group.source != SourceDigest(params.code, params.back_code))
+		if (state != Prefetch::Done || group.source != SourceDigest(params.code, params.back_code) || !LoadSpilledPlan(group))
 			return nullptr;
 		group.state.store(Prefetch::Taken, std::memory_order_relaxed);
 		prefetch->adopted++;
@@ -722,19 +877,24 @@ struct PipelineCache::ProgramCache {
 			            static_cast<unsigned long long>(XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t))));
 		}
 
-		vk::ShaderModuleCreateInfo create_info {};
-		create_info.codeSize    = spirv.size() * sizeof(uint32_t);
-		create_info.pCode       = spirv.data();
-		vk::ShaderModule module = nullptr;
-		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
-		                     "create recompiled shader module");
-		EXIT_IF(module == nullptr);
+		// (The store's, where pipelines take SPIR-V inline: moduleStore.h.)
+		vk::ShaderModule module = ModuleStore::Add(spirv);
+		const bool       stored = module != nullptr;
+		if (!stored) {
+			vk::ShaderModuleCreateInfo create_info {};
+			create_info.codeSize = spirv.size() * sizeof(uint32_t);
+			create_info.pCode    = spirv.data();
+			RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
+			                     "create recompiled shader module");
+			EXIT_IF(module == nullptr);
+		}
+		LiveCounters::g_shader_modules.fetch_add(1, std::memory_order_relaxed);
+		if (InlineKeyCheck()) NoteInlineSpirv(module, spirv);
 		if (ModuleSpirvHashesRecorded()) {
 			NotePipelineKeyModule(module, options.shader_hash, XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t)),
 			                      spirv.size() * sizeof(uint32_t));
 		}
-		SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
-		                     options.shader_hash);
+		if (!stored) SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name, options.shader_hash);
 		return module;
 	}
 
@@ -786,7 +946,8 @@ struct PipelineCache::ProgramCache {
 			if (!std::ranges::equal(params.code, entry->second.warm_code) ||
 			    !std::ranges::equal(params.back_code, entry->second.warm_back_code)) {
 				for (const auto& p : entry->second.permutations) {
-					device.destroyShaderModule(p.handle.module, nullptr);
+					DestroyShaderModule(device, p.handle.module);
+					if (p.handle.module) LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
 				}
 				std::erase_if(by_program, [&](const auto& item) { return item.second.first == &entry->second; });
 				programs.erase(entry);
@@ -1286,7 +1447,8 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
-				device.destroyShaderModule(permutation.handle.module, nullptr);
+				DestroyShaderModule(device, permutation.handle.module);
+				if (permutation.handle.module) LiveCounters::g_shader_modules.fetch_sub(1, std::memory_order_relaxed);
 			}
 		}
 	}
@@ -1483,11 +1645,14 @@ void PipelineCache::MainPipelineDone() {
 void PipelineCache::FinishCompileWorkers() {
 	m_table_cache_saver = {}; // (stops and joins it)
 	if (auto& prefetch = m_program_cache->prefetch; prefetch != nullptr) {
-		if (prefetch->ready.load(std::memory_order_acquire))
+		if (prefetch->ready.load(std::memory_order_acquire)) {
+			PipelineCacheLog("Shader prefetch: {} plans loaded back from the temporary file in {:.1f} ms (at most {:.2f} ms)",
+			                 prefetch->plans_loaded, prefetch->plan_load_ms, prefetch->plan_load_max_ms);
 			PipelineCacheLog("Shader prefetch: {} of {} programs translated; the game took over {} of them ({} modules) "
 			                 "and translated {} itself",
 			                 prefetch->finished.load(), prefetch->groups.size(), prefetch->adopted,
 			                 prefetch->adopted_modules, prefetch->claimed);
+		}
 		prefetch.reset();
 	}
 	m_stopping.store(true, std::memory_order_relaxed);
@@ -1512,9 +1677,28 @@ static std::filesystem::path StaticInputsPath() {
 	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".shaders");
 }
 
+// Live "objects" (live-counters.h): container sizes read from the live thread (counts only, no iteration).
+static PipelineCache* g_live_pipeline_cache = nullptr;
+
+void PipelineCache::ReportObjects(uint64_t id) const {
+	const auto store = ModuleStore::Stats();
+	std::printf("LIVE_PIPELINE_OBJECTS id=%llu graphics_pipelines=%zu compute_pipelines=%zu pending_graphics=%zu pending_compute=%zu "
+	            "replaced_unoptimized=%zu optimizing=%zu programs=%zu jit_bytes=%zu stored_modules=%llu stored_spirv_mib=%llu "
+	            "store_file_mib=%llu store_loads=%llu store_load_misses=%llu\n",
+	            static_cast<unsigned long long>(id), m_graphics_pipelines.size(), m_compute_pipelines.size(), m_pending_graphics_pipelines.size(),
+	            m_pending_compute_pipelines.size(), m_replaced_pipelines.size(), m_optimizing.size(),
+	            m_program_cache->programs.size(), JitArena::Used(), static_cast<unsigned long long>(store.modules),
+	            static_cast<unsigned long long>(store.spirv_bytes >> 20u), static_cast<unsigned long long>(store.stored_bytes >> 20u),
+	            static_cast<unsigned long long>(store.loads), static_cast<unsigned long long>(store.load_misses));
+}
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	g_live_pipeline_cache          = this;
+	LiveCounters::g_objects_report = [](uint64_t id) {
+		if (g_live_pipeline_cache != nullptr) g_live_pipeline_cache->ReportObjects(id);
+	};
 	m_program_cache->push_job = [this](std::function<void()> job) { TableWorkers().Push(std::move(job)); };
 	InitializeDriverCache();
 	StartupProgress::Report("Loading the pipeline cache", 0, 0);
@@ -1743,6 +1927,8 @@ void PipelineCache::WarmPipelines(uint64_t compute_video) {
 }
 
 PipelineCache::~PipelineCache() {
+	LiveCounters::g_objects_report = nullptr;
+	g_live_pipeline_cache          = nullptr;
 	FinishCompileWorkers();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
@@ -1965,15 +2151,22 @@ void PipelineCache::InitializeDriverCache() {
 		                      m_driver_cache_key / (title_id + ".bin");
 	}
 	// The launcher keeps one cache across emulator builds: pipelines of changed shaders pile up in it, so past
-	// 1 GiB (one build's warmup is ~130 MB) it starts over.
-	m_driver_cache = LoadDriverCache(m_driver_cache_path, uint64_t {1} << 30u, m_driver_cache_saved_size);
+	// 1 GiB (one build's warmup is ~130 MB) it starts over. The driver copies a loaded cache whole into the process's
+	// memory (a 0.94 GB and a 0.6 GB one: 1.5 GB of RAM at 1-1): at most 1/64 of the PC's RAM each, but not under
+	// 512 MiB: ordinary play passes 1/64 of 16 GB (256 MiB; 265 MiB after 30 minutes of 1-1, issue #14), and a cache
+	// that starts over at every launch compiles its pipelines in play again.
+	const uint64_t ram       = LocalPlatform::PhysicalMemory();
+	const auto     ram_limit = [ram](uint64_t limit) {
+		return ram != 0 ? std::min(limit, std::max(uint64_t {512} << 20u, ram / 64u)) : limit;
+	};
+	m_driver_cache = LoadDriverCache(m_driver_cache_path, ram_limit(uint64_t {1} << 30u), m_driver_cache_saved_size);
 	if (m_driver_cache == nullptr) return;
 	// Table mode pipelines (src/local/table-xpr.inc) in a cache of their own: the static precompile holds none of
 	// them (each compiles in ~0.1-4 s), they are saved once their compiles settle (not only at a clean exit), and
 	// they do not push the main cache past its limit.
 	m_table_cache_path = m_driver_cache_path;
 	m_table_cache_path.replace_extension(".table.bin");
-	m_table_cache = LoadDriverCache(m_table_cache_path, uint64_t {2} << 30u, m_table_cache_saved_size);
+	m_table_cache = LoadDriverCache(m_table_cache_path, ram_limit(uint64_t {2} << 30u), m_table_cache_saved_size);
 	if (m_table_cache == nullptr) return;
 	m_table_cache_saver = std::jthread([this](std::stop_token stop) {
 		LocalPlatform::SetThreadName("Kyty.TableCache");
@@ -2027,7 +2220,7 @@ vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& fi
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_driver_cache_key);
 		if (file_size > limit) {
 			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: starting {} over ({} bytes)", path, file_size);
+			PipelineCacheLog("Vulkan pipeline cache: starting {} over ({} bytes, limit {})", path, file_size, limit);
 		} else if (file_size >= signature.size() + sizeof(uint64_t) &&
 		           file_size <= std::numeric_limits<uint32_t>::max()) {
 			std::string cached_signature(signature.size(), '\0');
