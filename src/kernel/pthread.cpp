@@ -16,6 +16,8 @@
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
 #include "loader/timer.h"
+#include "graphics/guest_gpu/threadSampler.h"
+#include <cstdlib>
 
 #include <algorithm>
 #include <array>
@@ -3214,6 +3216,13 @@ static void* RunThread(void* arg) {
 		wchar_t wide[64] {};
 		MultiByteToWideChar(CP_UTF8, 0, thread->name.c_str(), -1, wide, 63);
 		SetThreadDescription(GetCurrentThread(), wide);
+		// KYTY_PROF also samples the guest thread named by the KYTY_PROF_GUEST environment
+		// variable (default "Render Thread"): host code it runs (HLE calls, fault handlers) shows
+		// up by first exe caller; guest code shows as outside:<no module>.
+		const char* prof_guest = std::getenv("KYTY_PROF_GUEST");
+		if (thread->name == (prof_guest != nullptr ? prof_guest : "Render Thread")) {
+			Libs::Graphics::ThreadSampler::RegisterCurrentThread("Guest_RenderThread");
+		}
 	}
 #endif
 
