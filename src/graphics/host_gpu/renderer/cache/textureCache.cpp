@@ -447,7 +447,28 @@ void TextureCache::FreeImage(ImageId id, std::source_location where) {
 	if (gpu_modified) {
 		static auto& writeback = Common::LiveSwitches::Get("KYTY_FREE_WRITEBACK", 0);
 		const auto   mode      = writeback.load(std::memory_order_relaxed);
-		if (mode != 0 && m_scheduler.Active() && DownloadImageMemory(id)) {
+		// 3: copy the contents into the buffer cache's GPU copy of the range, on the GPU and in
+		// stream order, and mark those bytes GPU-written: an image created over the range next
+		// (FindImage: HasGpuDirtyBytes -> MarkBufferModified) uploads them from that buffer, as
+		// the console's next pass would read the memory. No CPU round trip, no wait.
+		if (mode == 3 && m_scheduler.Active() && image.SafeToDownload() && !image.info.data.Empty()) {
+			auto transfer = BuildDownload(image);
+			if (transfer.valid && !transfer.depth_target) {
+				const auto [buffer, offset] = m_buffer_cache.ObtainBuffer(
+				    image.info.data.address, image.info.data.size, true, false, BufferId {}, false);
+				if (buffer != nullptr) {
+					DownloadImage(image, *buffer, offset, image.info.data.size, std::move(transfer));
+					buffer->last_gpu_write_tick = m_scheduler.CurrentTick();
+					vk::MemoryBarrier after {};
+					after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+					after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+					m_scheduler.EndRendering();
+					m_scheduler.Current().Recorder().pipelineBarrier(
+					    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+					    &after, 0, nullptr, 0, nullptr);
+				}
+			}
+		} else if (mode != 0 && mode != 3 && m_scheduler.Active() && DownloadImageMemory(id)) {
 			if (mode >= 2) {
 				const auto tick = m_scheduler.CurrentTick();
 				m_scheduler.Flush();
