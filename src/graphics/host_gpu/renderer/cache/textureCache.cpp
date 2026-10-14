@@ -943,6 +943,37 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
 		     requested.mip_layout != cached.info.mip_layout)) {
+			// Research: KYTY_ALIAS_TILE_COPY (live, default 0). Wolverine renders its quarter-
+			// resolution buffers (416x234 R32Sfloat / R16G16Sfloat at one address) with two tile
+			// modes alternately, every frame. Freeing the cached image dropped what the GPU had
+			// just drawn and the new one started from stale guest memory (ground and shadow
+			// flicker suspect). With the switch on, an image of the same extent, levels, block
+			// size and a view-compatible format is replaced by a copy of its texels instead.
+			static auto& alias_copy = Common::LiveSwitches::Get("KYTY_ALIAS_TILE_COPY", 0);
+			if (alias_copy.load(std::memory_order_relaxed) != 0 && !merged_id &&
+			    requested.tile_mode != cached.info.tile_mode && cached.IsGpuModified() &&
+			    !requested.IsDepth() && !cached.info.IsDepth() && requested.samples == 1 &&
+			    cached.info.samples == 1 && cached.backing.samples == 1 &&
+			    requested.extent == cached.info.extent &&
+			    requested.resources == cached.info.resources && requested.type == cached.info.type &&
+			    !requested.HasMetadata() && !cached.info.HasMetadata()) {
+				RefreshImage(cached_id);
+				auto       info           = requested;
+				info.htile_clear_mask     = 0;
+				const auto replacement_id = InsertImage(info);
+				auto&      replacement    = m_slot_images[replacement_id];
+				auto&      source         = m_slot_images[cached_id];
+				if (ImageViewOps::FormatsCompatible(source.backing.format, replacement.backing.format)) {
+					replacement.usage = source.usage;
+					if (source.binding.is_bound || source.binding.is_target) {
+						source.binding.needs_rebind = true;
+					}
+					CopyImage(replacement_id, cached_id);
+					FreeImage(cached_id);
+					return {replacement_id};
+				}
+				FreeImage(replacement_id);
+			}
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}
