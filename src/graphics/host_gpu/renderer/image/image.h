@@ -157,6 +157,7 @@ public:
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
 	uint64_t         tick_accessed_last = 0;
+	uint64_t         created_frame      = 0; // DrawDiff::Frame() at creation (KYTY_DRAW_DIFF)
 	size_t           lru_id             = 0;
 
 private:

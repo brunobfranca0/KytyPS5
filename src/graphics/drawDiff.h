@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +26,12 @@
 namespace Libs::Graphics::DrawDiff {
 
 inline constexpr int kFrames = 8;
+
+// Guest flips so far (always counted) and the shader whose resources are being looked up on this
+// thread (set by the program cache, used by the fresh-read report).
+inline std::atomic<uint64_t> g_frame {0};
+inline thread_local uint64_t t_shader = 0;
+inline uint64_t              Frame() { return g_frame.load(std::memory_order_relaxed); }
 
 struct Key {
 	uint64_t a        = 0; // vertex-stage (or compute) hash
@@ -43,6 +50,8 @@ struct State {
 	int                                              cooldown = 0;
 	std::map<Key, std::array<uint32_t, kFrames>>     keys;
 	std::map<std::pair<uint64_t, std::string>, uint64_t> skips;
+	std::map<uint64_t, uint64_t>                         gpu_freed; // address -> frame freed with GPU contents
+	std::map<std::string, uint64_t>                      fresh;     // fresh-read description -> count
 };
 
 inline State& Get() {
@@ -85,8 +94,39 @@ inline const char* KindName(uint32_t kind) {
 	}
 }
 
+// An image freed while it held GPU-written contents.
+inline void NoteGpuFree(uint64_t address) {
+	if (!Enabled()) {
+		return;
+	}
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	s.gpu_freed[address] = Frame();
+}
+
+// A sampled read of an image created this frame that the GPU has not written yet: whatever it
+// holds came from guest memory (or nothing). If the game expects last frame's contents there
+// (a temporal history), this is the flicker.
+inline void NoteFreshRead(uint64_t address, const char* format, uint32_t width, uint32_t height,
+                          bool buffer_modified) {
+	if (!Enabled()) {
+		return;
+	}
+	auto&           s = Get();
+	std::lock_guard lock(s.mutex);
+	const auto      freed  = s.gpu_freed.find(address);
+	const bool      lost   = freed != s.gpu_freed.end() && Frame() - freed->second <= 2;
+	char            buf[256];
+	std::snprintf(buf, sizeof(buf), "shader %016llx reads 0x%010llx %ux%u %s%s%s",
+	              static_cast<unsigned long long>(t_shader), static_cast<unsigned long long>(address),
+	              width, height, format, buffer_modified ? " (from GPU buffer copy)" : "",
+	              lost ? " <- GPU contents dropped here 0-2 frames ago" : "");
+	s.fresh[buf]++;
+}
+
 // Called once per guest flip.
 inline void EndFrame() {
+	g_frame.fetch_add(1, std::memory_order_relaxed);
 	if (!Enabled()) {
 		return;
 	}
@@ -131,6 +171,21 @@ inline void EndFrame() {
 			::printf(" %u", c);
 		}
 		::printf("\n");
+	}
+	if (!s.fresh.empty()) {
+		std::vector<std::pair<uint64_t, std::string>> rows;
+		for (const auto& [k, n]: s.fresh) {
+			rows.emplace_back(n, k);
+		}
+		std::sort(rows.rbegin(), rows.rend());
+		::printf("Fresh image reads (since last report):\n");
+		for (size_t i = 0; i < rows.size() && i < 25; i++) {
+			::printf("  %6" PRIu64 "  %s\n", rows[i].first, rows[i].second.c_str());
+		}
+		s.fresh.clear();
+	}
+	if (s.gpu_freed.size() > 4096) {
+		s.gpu_freed.clear();
 	}
 	if (!s.skips.empty()) {
 		::printf("Draw skips (since last report):\n");

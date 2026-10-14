@@ -1,3 +1,4 @@
+#include "graphics/drawDiff.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/alignment.h"
@@ -302,6 +303,7 @@ ImageChurnStats g_image_churn_stats;
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	g_image_churn_stats.Note(info, true);
+	m_slot_images[id].created_frame = DrawDiff::Frame();
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -439,6 +441,9 @@ void TextureCache::FreeImage(ImageId id, std::source_location where) {
 	auto& image = m_slot_images[id];
 	const bool gpu_modified = image.IsGpuModified();
 	NoteImageFree(where, gpu_modified);
+	if (gpu_modified) {
+		DrawDiff::NoteGpuFree(image.info.data.address);
+	}
 	if (gpu_modified) {
 		static auto& writeback = Common::LiveSwitches::Get("KYTY_FREE_WRITEBACK", 0);
 		const auto   mode      = writeback.load(std::memory_order_relaxed);
@@ -1485,6 +1490,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		if (desc.type == BindingType::Texture && DrawDiff::Enabled() &&
+		    image.created_frame == DrawDiff::Frame() && !image.IsGpuModified()) {
+			DrawDiff::NoteFreshRead(image.info.data.address,
+			                        vk::to_string(image.info.pixel_format).c_str(),
+			                        image.info.extent.width, image.info.extent.height,
+			                        image.IsBufferModified());
+		}
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
