@@ -610,6 +610,15 @@ bool CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR&
 		g_requested         = false;
 		return false;
 	}
+	{
+		// x3 (KYTY_FSR3_FG_FRAMES=2): read by the patched amd_fidelityfx_vk.dll (fg/x3 builds, see
+		// tools/local/fsr3-mfg) when it creates the swapchain; AMD's signed DLL ignores it and stays at x2.
+		const char* frames = std::getenv("KYTY_FSR3_FG_FRAMES");
+		if (frames != nullptr && std::atoi(frames) >= 2) {
+			std::printf("FSR3 FG: KYTY_FSR3_FG_FRAMES=%s: 2 generated frames per real frame (x3, patched DLL only)\n", frames);
+			std::fflush(stdout);
+		}
+	}
 	g_functions.header.type = FFX_API_QUERY_DESC_TYPE_FGSWAPCHAIN_FUNCTIONS_VK;
 	g_ffx.Query(&g_swapchain_context, &g_functions.header);
 	if (g_functions.pOutAcquireNextImageKHR == nullptr || g_functions.pOutQueuePresentKHR == nullptr ||
