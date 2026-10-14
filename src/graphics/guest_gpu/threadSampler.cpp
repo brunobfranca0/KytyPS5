@@ -108,6 +108,19 @@ DWORD64* IntReg(CONTEXT& c, unsigned reg) {
 	return regs[reg & 15u];
 }
 
+// The unwinder reads the target's saved registers through pointers the sampled thread held; a
+// sample taken mid-prologue/epilogue or in code using a frame register as a scratch register can
+// make it read garbage. A fault there must end the walk, not the process.
+bool SafeVirtualUnwind(DWORD64 image_base, PRUNTIME_FUNCTION fn, CONTEXT* ctx, PVOID* handler_data,
+                       DWORD64* establisher) {
+	__try {
+		RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx->Rip, fn, ctx, handler_data, establisher, nullptr);
+		return true;
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
 // Walks the copied stack from ctx (registers of the sampled thread at the sample) and returns the
 // exe offset of the first frame inside the exe image, or kNoCaller.
 uint64_t FirstExeCaller(const CONTEXT& sampled, uintptr_t orig_rsp, size_t copied, uint64_t* chain = nullptr,
@@ -158,7 +171,9 @@ uint64_t FirstExeCaller(const CONTEXT& sampled, uintptr_t orig_rsp, size_t copie
 			}
 			PVOID   handler_data = nullptr;
 			DWORD64 establisher  = 0;
-			RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
+			if (!SafeVirtualUnwind(image_base, fn, &ctx, &handler_data, &establisher)) {
+				break;
+			}
 		}
 		if (ctx.Rip == 0 || ctx.Rsp <= rsp) {
 			break;
@@ -294,7 +309,10 @@ void SamplerThread() {
 				const auto   rip    = static_cast<uintptr_t>(ctx.Rip);
 				const bool   in_exe = rip >= g_image_base && rip < g_image_end;
 				// While suspended: only syscalls and memcpy, no heap or loader locks.
-				const size_t copied = ok != 0 ? CopyStack(static_cast<uintptr_t>(ctx.Rsp)) : 0;
+				// Unwinding from an arbitrary exe instruction crashed the process (build 1108695):
+				// only samples outside the exe (waits, driver, CRT), which sit at call sites, are
+				// walked.
+				const size_t copied = (ok != 0 && !in_exe) ? CopyStack(static_cast<uintptr_t>(ctx.Rsp)) : 0;
 				ResumeThread(t.handle);
 				if (ok == 0) {
 					continue;
