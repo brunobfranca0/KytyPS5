@@ -451,23 +451,8 @@ void TextureCache::FreeImage(ImageId id, std::source_location where) {
 		// stream order, and mark those bytes GPU-written: an image created over the range next
 		// (FindImage: HasGpuDirtyBytes -> MarkBufferModified) uploads them from that buffer, as
 		// the console's next pass would read the memory. No CPU round trip, no wait.
-		if (mode == 3 && m_scheduler.Active() && image.SafeToDownload() && !image.info.data.Empty()) {
-			auto transfer = BuildDownload(image);
-			if (transfer.valid && !transfer.depth_target) {
-				const auto [buffer, offset] = m_buffer_cache.ObtainBuffer(
-				    image.info.data.address, image.info.data.size, true, false, BufferId {}, false);
-				if (buffer != nullptr) {
-					DownloadImage(image, *buffer, offset, image.info.data.size, std::move(transfer));
-					buffer->last_gpu_write_tick = m_scheduler.CurrentTick();
-					vk::MemoryBarrier after {};
-					after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-					after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-					m_scheduler.EndRendering();
-					m_scheduler.Current().Recorder().pipelineBarrier(
-					    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 1,
-					    &after, 0, nullptr, 0, nullptr);
-				}
-			}
+		if (mode == 3) {
+			(void)WritebackToBufferCache(id);
 		} else if (mode != 0 && mode != 3 && m_scheduler.Active() && DownloadImageMemory(id)) {
 			if (mode >= 2) {
 				const auto tick = m_scheduler.CurrentTick();
@@ -2063,6 +2048,33 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		download->Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
+	return true;
+}
+
+// KYTY_FREE_WRITEBACK=3 (see FreeImage).
+bool TextureCache::WritebackToBufferCache(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (!m_scheduler.Active() || !image.SafeToDownload() || image.info.data.Empty()) {
+		return false;
+	}
+	auto transfer = BuildDownload(image);
+	if (!transfer.valid || transfer.depth_target) {
+		return false;
+	}
+	const auto [buffer, offset] = m_buffer_cache.ObtainBuffer(
+	    image.info.data.address, image.info.data.size, true, false, BufferId {}, false);
+	if (buffer == nullptr) {
+		return false;
+	}
+	DownloadImage(image, *buffer, offset, image.info.data.size, std::move(transfer));
+	buffer->last_gpu_write_tick = m_scheduler.CurrentTick();
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	m_scheduler.EndRendering();
+	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                                                 vk::PipelineStageFlagBits::eAllCommands, {}, 1,
+	                                                 &after, 0, nullptr, 0, nullptr);
 	return true;
 }
 

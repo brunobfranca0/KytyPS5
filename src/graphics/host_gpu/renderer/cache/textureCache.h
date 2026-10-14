@@ -163,6 +163,7 @@ private:
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
+	bool WritebackToBufferCache(ImageId id);
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, ImageDownload transfer);
