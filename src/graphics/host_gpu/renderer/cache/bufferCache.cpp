@@ -1593,6 +1593,18 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	return address + m_slot_buffers[id].Size() > vaddr;
 }
 
+bool BufferCache::MayReferenceRange(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return true;
+	}
+	if (IsRegionRegistered(vaddr, size) || OverlapsPendingWriteReadback(vaddr, vaddr + size)) {
+		return true;
+	}
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	return m_downloading_ranges.Intersects(vaddr, size) ||
+	       m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }

@@ -180,7 +180,33 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
+		static auto&               skip_idle = Common::LiveSwitches::Get("KYTY_UNMAP_SKIP_IDLE", 0);
+		static uint64_t            unmaps_total   = 0;
+		static uint64_t            unmaps_skipped = 0;
+		static auto                stats_begin    = std::chrono::steady_clock::now();
+		unmaps_total++;
+		// With KYTY_UNMAP_SKIP_IDLE, the drain is skipped when no cached buffer or image, pending
+		// readback or in-flight download shares bytes with the range: nothing the GPU still
+		// runs can then read or write it.
+		bool drain = true;
+		if (skip_idle.load(std::memory_order_relaxed) != 0 &&
+		    !m_buffer_cache.MayReferenceRange(vaddr, size) &&
+		    !m_texture_cache.HasImagesInRegion(vaddr, size)) {
+			drain = false;
+			unmaps_skipped++;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - stats_begin >= std::chrono::seconds(5)) {
+			char line[128];
+			std::snprintf(line, sizeof(line),
+			              "Unmaps (5 s): %" PRIu64 " total, %" PRIu64 " skipped the GPU drain\n",
+			              unmaps_total, unmaps_skipped);
+			Log::WriteToConsoleAndLog(line);
+			unmaps_total   = 0;
+			unmaps_skipped = 0;
+			stats_begin    = now;
+		}
+		if (drain && m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);

@@ -101,6 +101,9 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool              IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// GPU thread: a cached buffer, a pending asynchronous readback or an in-flight download
+	// shares bytes with [vaddr, vaddr + size) (KYTY_UNMAP_SKIP_IDLE). Conservative.
+	[[nodiscard]] bool              MayReferenceRange(uint64_t vaddr, uint64_t size);
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
 	// memory holds their current value even when their page is protected.
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
