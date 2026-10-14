@@ -2069,6 +2069,16 @@ bool TextureCache::WritebackToBufferCache(ImageId id) {
 	if (!m_scheduler.Active() || !image.SafeToDownload() || image.info.data.Empty()) {
 		return false;
 	}
+	// Only plain committed guest memory: marking other ranges GPU-written made a later readback
+	// write into memory without direct backing (build 7557eb1, fatal during loading).
+	// Readbacks download aligned 2 MiB windows around a fault, so the whole window must be backed.
+	constexpr uint64_t Window = 2ull * 1024 * 1024;
+	const uint64_t     window_begin = image.info.data.address & ~(Window - 1);
+	const uint64_t     window_end =
+	    (image.info.data.address + image.info.data.size + Window - 1) & ~(Window - 1);
+	if (!LibKernel::Memory::IsCommittedRange(window_begin, window_end - window_begin)) {
+		return false;
+	}
 	auto transfer = BuildDownload(image);
 	if (!transfer.valid || transfer.depth_target) {
 		return false;
